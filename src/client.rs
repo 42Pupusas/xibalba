@@ -34,11 +34,16 @@ pub struct Response {
 
 impl Client {
     #[must_use]
+    #[allow(clippy::missing_panics_doc)]
     pub fn new() -> Self {
+        let provider = crypto_provider();
+
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = ClientConfig::builder()
+        let config = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .expect("TLS protocol versions")
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
@@ -212,4 +217,14 @@ impl Drop for Response {
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(feature = "ring")]
+fn crypto_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+#[cfg(feature = "aws-lc-rs")]
+fn crypto_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
 }
