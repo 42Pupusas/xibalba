@@ -1,10 +1,24 @@
 use core::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IoError {
+    pub kind: std::io::ErrorKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsError {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Url(UrlError),
     Parse(ParseError),
     Serialize(SerializeError),
+    Io(IoError),
+    Tls(TlsError),
+    Connection(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,12 +67,27 @@ pub enum SerializeError {
     BufferTooSmall,
 }
 
+impl fmt::Display for IoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.message, self.kind)
+    }
+}
+
+impl fmt::Display for TlsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Url(e) => write!(f, "url error: {e}"),
             Self::Parse(e) => write!(f, "parse error: {e}"),
             Self::Serialize(e) => write!(f, "serialize error: {e}"),
+            Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Tls(e) => write!(f, "tls error: {e}"),
+            Self::Connection(msg) => write!(f, "connection error: {msg}"),
         }
     }
 }
@@ -120,6 +149,35 @@ impl From<SerializeError> for Error {
     }
 }
 
+impl From<IoError> for Error {
+    fn from(e: IoError) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<TlsError> for Error {
+    fn from(e: TlsError) -> Self {
+        Self::Tls(e)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(IoError {
+            kind: e.kind(),
+            message: e.to_string(),
+        })
+    }
+}
+
+impl From<rustls::Error> for Error {
+    fn from(e: rustls::Error) -> Self {
+        Self::Tls(TlsError {
+            message: e.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +210,41 @@ mod tests {
 
         let e: Error = SerializeError::BufferTooSmall.into();
         assert_eq!(e, Error::Serialize(SerializeError::BufferTooSmall));
+    }
+
+    #[test]
+    fn io_error_display() {
+        let e = IoError {
+            kind: std::io::ErrorKind::ConnectionRefused,
+            message: "connection refused".into(),
+        };
+        assert_eq!(e.to_string(), "connection refused: connection refused");
+    }
+
+    #[test]
+    fn tls_error_display() {
+        let e = TlsError {
+            message: "bad certificate".into(),
+        };
+        assert_eq!(e.to_string(), "bad certificate");
+    }
+
+    #[test]
+    fn from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broke");
+        let e: Error = io_err.into();
+        match &e {
+            Error::Io(inner) => {
+                assert_eq!(inner.kind, std::io::ErrorKind::BrokenPipe);
+                assert!(inner.message.contains("pipe broke"));
+            }
+            other => panic!("expected Io variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_error_display() {
+        let e = Error::Connection("DNS failed".into());
+        assert_eq!(e.to_string(), "connection error: DNS failed");
     }
 }
