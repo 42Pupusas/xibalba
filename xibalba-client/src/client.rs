@@ -80,13 +80,18 @@ impl<C: Connector> Client<C> {
         })
     }
 
-    /// Send a request over the persistent connection.
+    /// Serialize `method`/`path`/`query` and push the request onto the io-thread
+    /// ring without blocking.  Returns immediately after the slot is committed.
     ///
     /// # Errors
     ///
-    /// Returns `Error` on serialization failure or if the io thread reports
-    /// a connection error.
-    pub fn request(&mut self, method: Method, path: &[u8], query: Option<&[u8]>) -> Result<Response, Error> {
+    /// Returns `Err` if the request ring is full, the request is too large to
+    /// serialize, or if a previous response has not yet been reclaimed.
+    pub fn send_request(&mut self, method: Method, path: &[u8], query: Option<&[u8]>) -> Result<(), Error> {
+        if self.rx_resp.is_none() {
+            return Err(Error::Connection("previous response not fully consumed".into()));
+        }
+
         let headers = [
             Header { name: HeaderName::Connection, value: b"keep-alive" },
             Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" },
@@ -109,26 +114,57 @@ impl<C: Connector> Client<C> {
         let mut io_req = IoRequest { buf: [0u8; MAX_REQ_SIZE], len };
         io_req.buf[..len].copy_from_slice(&self.write_buf[..len]);
         self.tx_req
-            .reserve_block()
-            .ok_or_else(|| Error::Connection("io thread closed".into()))?
-            .write(io_req)
-            .commit();
+            .push_block(io_req)
+            .map_err(|_| Error::Connection("request ring full".into()))
+    }
 
-        let mut rx = self.rx_resp.take()
-            .ok_or_else(|| Error::Connection("previous response not fully consumed".into()))?;
+    /// Poll for a response without blocking.
+    ///
+    /// Returns `Ok(Some(_))` when the response head has arrived, `Ok(None)`
+    /// when the io thread has not yet produced one, or `Err` on a connection
+    /// error reported by the io thread.
+    ///
+    /// The returned [`Response`] holds the `rx` consumer; call [`reclaim`](Self::reclaim)
+    /// after the body is fully drained to ready the client for the next request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `send_request` was never called (no pending request),
+    /// or if the io thread reported a connection error.
+    #[allow(clippy::missing_panics_doc)] // expect() is unreachable: just matched Some above
+    pub fn poll_response(&mut self) -> Result<Option<Response>, Error> {
+        let rx = self.rx_resp.as_mut()
+            .ok_or_else(|| Error::Connection("no pending request".into()))?;
 
         match rx.pop_block() {
-            Some(IoResponse::Head(head)) => Ok(Response {
-                version: head.version,
-                status: head.status,
-                head,
-                body: BodyReader::new(rx),
-            }),
-            Some(IoResponse::Error(e)) => {
-                self.rx_resp = Some(rx);
-                Err(e)
+            None => Ok(None),
+            Some(IoResponse::Head(head)) => {
+                let rx = self.rx_resp.take().expect("just checked");
+                Ok(Some(Response {
+                    version: head.version,
+                    status: head.status,
+                    head,
+                    body: BodyReader::new(rx),
+                }))
             }
-            _ => Err(Error::Connection("io thread closed unexpectedly".into())),
+            Some(IoResponse::Error(e)) => Err(e),
+            Some(_) => Err(Error::Connection("unexpected message from io thread".into())),
+        }
+    }
+
+    /// Send a request and block until the response head arrives.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` on serialization failure or if the io thread reports
+    /// a connection error.
+    pub fn request(&mut self, method: Method, path: &[u8], query: Option<&[u8]>) -> Result<Response, Error> {
+        self.send_request(method, path, query)?;
+        loop {
+            match self.poll_response()? {
+                Some(resp) => return Ok(resp),
+                None => std::hint::spin_loop(),
+            }
         }
     }
 

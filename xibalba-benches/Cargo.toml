@@ -13,6 +13,7 @@ dhat-heap = ["dep:dhat"]
 [dependencies]
 xibalba-proto = { path = "../xibalba-proto" }
 xibalba-client = { path = "../xibalba-client" }
+io-uring-driver = { path = "../examples/io-uring", package = "io-uring" }
 divan = "0.1"
 httparse = "1"
 http = "1"

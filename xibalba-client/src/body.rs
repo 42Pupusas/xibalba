@@ -12,6 +12,9 @@ pub const BLOCK_SIZE: usize = 8192;
 pub const MAX_REQ_SIZE: usize = 8192;
 pub const HEAD_BUF_SIZE: usize = 8192;
 pub const MAX_HEADERS: usize = 64;
+// Kernel read buffer — 8× BLOCK_SIZE so one syscall can fill multiple ring
+// slots without re-entering the kernel. Lives on the io thread's stack.
+const RAW_BUF_SIZE: usize = BLOCK_SIZE * 8;
 
 // ── Wire messages ─────────────────────────────────────────────────────────────
 
@@ -74,6 +77,20 @@ impl BodyReader {
     }
 }
 
+fn append_chunk(
+    msg: IoResponse,
+    buf: &mut Vec<u8>,
+    done: &mut bool,
+    error: &mut Option<std::io::Error>,
+) {
+    match msg {
+        IoResponse::BodyChunk(data, len) => buf.extend_from_slice(&data[..len]),
+        IoResponse::BodyDone => *done = true,
+        IoResponse::Head(_) => *error = Some(std::io::Error::other("unexpected Head during body read")),
+        IoResponse::Error(e) => *error = Some(std::io::Error::other(e.to_string())),
+    }
+}
+
 impl Read for BodyReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.done || buf.is_empty() {
@@ -100,12 +117,55 @@ impl Read for BodyReader {
                 }
                 Ok(n)
             }
-            Some(IoResponse::BodyDone | IoResponse::Head(_)) | None => {
+            Some(IoResponse::BodyDone) | None => {
                 self.done = true;
                 Ok(0)
             }
+            Some(IoResponse::Head(_)) => {
+                Err(std::io::Error::other("unexpected Head during body read"))
+            }
             Some(IoResponse::Error(e)) => Err(std::io::Error::other(e.to_string())),
         }
+    }
+
+    /// Drains the entire body into `buf`.
+    ///
+    /// Uses `pop_block` to wait for the next item, then `drain` to
+    /// batch-consume everything already queued in the same burst —
+    /// amortising the head.store to one per burst rather than one per chunk.
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+
+        // Flush any leftover bytes from a prior partial read first.
+        if let Some((data, len, pos)) = self.leftover.take() {
+            buf.extend_from_slice(&data[pos..len]);
+        }
+
+        let start_len = buf.len();
+        let mut error: Option<std::io::Error> = None;
+        let mut done = false;
+
+        loop {
+            // Block until at least one item is available.
+            let Some(first) = self.rx.pop_block() else { break };
+            append_chunk(first, buf, &mut done, &mut error);
+            if done || error.is_some() {
+                break;
+            }
+            // Batch-consume everything already queued — single head.store.
+            self.rx.drain(|msg| append_chunk(msg, buf, &mut done, &mut error));
+            if done || error.is_some() {
+                break;
+            }
+        }
+
+        self.done = true;
+        if let Some(e) = error {
+            return Err(e);
+        }
+        Ok(buf.len() - start_len)
     }
 }
 
@@ -121,11 +181,11 @@ enum IoState {
 #[allow(clippy::large_enum_variant)]
 enum BodyFraming {
     ContentLength { remaining: u64 },
-    Chunked { decoder: xibalba_proto::response::ChunkedDecoder, leftover: [u8; BLOCK_SIZE], leftover_len: usize },
+    Chunked { decoder: xibalba_proto::response::ChunkedDecoder, leftover: [u8; RAW_BUF_SIZE], leftover_len: usize },
     UntilClose,
 }
 
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::large_stack_frames, clippy::large_stack_arrays)]
 pub(crate) fn io_thread<S: Read + std::io::Write>(
     mut stream: S,
     rx_req: &mut Consumer<IoRequest>,
@@ -140,7 +200,7 @@ pub(crate) fn io_thread<S: Read + std::io::Write>(
     let mut state = IoState::Idle;
     // Persistent head read buffer — cleared per request, never reallocated.
     let mut head_buf: Vec<u8> = Vec::with_capacity(HEAD_BUF_SIZE);
-    let mut raw_buf = [0u8; BLOCK_SIZE];
+    let mut raw_buf = [0u8; RAW_BUF_SIZE];
 
     'io: loop {
         match state {
@@ -219,8 +279,8 @@ pub(crate) fn io_thread<S: Read + std::io::Write>(
                 // Carry leftover bytes (past the head) into the body framing inline —
                 // no Vec allocation.
                 let tail = &head_buf[consumed..];
-                let mut lo_buf = [0u8; BLOCK_SIZE];
-                let lo_len = tail.len().min(BLOCK_SIZE);
+                let mut lo_buf = [0u8; RAW_BUF_SIZE];
+                let lo_len = tail.len().min(RAW_BUF_SIZE);
                 lo_buf[..lo_len].copy_from_slice(&tail[..lo_len]);
 
                 state = IoState::ReadingBody {
@@ -392,9 +452,12 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn push_chunk(tx: &Producer<IoResponse>, data: &[u8]) -> Result<(), ()> {
-    let mut chunk = [0u8; BLOCK_SIZE];
-    chunk[..data.len()].copy_from_slice(data);
-    tx.push_block(IoResponse::BodyChunk(chunk, data.len())).map_err(|_| ())
+    for slice in data.chunks(BLOCK_SIZE) {
+        let mut chunk = [0u8; BLOCK_SIZE];
+        chunk[..slice.len()].copy_from_slice(slice);
+        tx.push_block(IoResponse::BodyChunk(chunk, slice.len())).map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {

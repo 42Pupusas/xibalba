@@ -1,0 +1,21 @@
+[package]
+name = "io-uring"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "io_uring_driver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "io-uring"
+path = "src/main.rs"
+
+[dependencies]
+xibalba-proto = { path = "../../xibalba-proto" }
+ququmatz = { path = "../../../ququmatz" }
+quetzalcoatl = { path = "../../../quetzalcoatl" }
+libc = "0.2"
+
+[lints]
+workspace = true

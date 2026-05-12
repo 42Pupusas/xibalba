@@ -337,6 +337,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "quetzalcoatl",
+ "ququmatz",
+ "xibalba-proto",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -477,6 +487,10 @@ checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "ququmatz"
+version = "0.11.2"
 
 [[package]]
 name = "redox_syscall"
@@ -886,6 +900,7 @@ dependencies = [
  "divan",
  "http",
  "httparse",
+ "io-uring",
  "ureq",
  "url",
  "xibalba-client",

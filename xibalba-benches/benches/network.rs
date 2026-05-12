@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use io_uring_driver::driver::{ConnHandle, ConnResult, Pool};
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_proto::error::Error;
@@ -142,38 +143,106 @@ fn spawn_echo_server_owned(response: Vec<u8>) -> u16 {
 }
 
 // ── Per-scenario server ports (lazily started once) ──────────────────────────
+//
+// Each driver under test gets its own port so their keep-alive connections
+// don't interleave.
 
-static PORT_SMALL: OnceLock<u16> = OnceLock::new();
-static PORT_LARGE_RESP: OnceLock<u16> = OnceLock::new();
-static PORT_LARGE_REQ: OnceLock<u16> = OnceLock::new();
+static PORT_SMALL_XIBALBA: OnceLock<u16> = OnceLock::new();
+static PORT_SMALL_URING: OnceLock<u16> = OnceLock::new();
+static PORT_SMALL_UREQ: OnceLock<u16> = OnceLock::new();
+static PORT_LARGE_RESP_XIBALBA: OnceLock<u16> = OnceLock::new();
+static PORT_LARGE_RESP_URING: OnceLock<u16> = OnceLock::new();
+static PORT_LARGE_RESP_UREQ: OnceLock<u16> = OnceLock::new();
+static PORT_LARGE_REQ_XIBALBA: OnceLock<u16> = OnceLock::new();
+static PORT_LARGE_REQ_URING: OnceLock<u16> = OnceLock::new();
+static PORT_LARGE_REQ_UREQ: OnceLock<u16> = OnceLock::new();
+static PORT_STRESS_XIBALBA: OnceLock<u16> = OnceLock::new();
+static PORT_STRESS_URING: OnceLock<u16> = OnceLock::new();
+static PORT_STRESS_UREQ: OnceLock<u16> = OnceLock::new();
+static PORT_CONCURRENT_URING: OnceLock<u16> = OnceLock::new();
+static PORT_CONCURRENT_UREQ: OnceLock<u16> = OnceLock::new();
 
-fn port_small() -> u16 {
-    *PORT_SMALL.get_or_init(|| {
-        spawn_echo_server(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
-        )
-    })
+fn port_small_xibalba() -> u16 {
+    *PORT_SMALL_XIBALBA.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
+}
+fn port_small_uring() -> u16 {
+    *PORT_SMALL_URING.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
+}
+fn port_small_ureq() -> u16 {
+    *PORT_SMALL_UREQ.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
 }
 
-fn port_large_resp() -> u16 {
-    *PORT_LARGE_RESP.get_or_init(|| {
-        const N: usize = 65536;
-        let mut resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {N}\r\nConnection: keep-alive\r\n\r\n"
-        )
-        .into_bytes();
-        resp.extend(std::iter::repeat_n(b'x', N));
-        spawn_echo_server_owned(resp)
-    })
+fn make_large_resp() -> Vec<u8> {
+    const N: usize = 65536;
+    let mut resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {N}\r\nConnection: keep-alive\r\n\r\n"
+    ).into_bytes();
+    resp.extend(std::iter::repeat_n(b'x', N));
+    resp
+}
+fn port_large_resp_xibalba() -> u16 {
+    *PORT_LARGE_RESP_XIBALBA.get_or_init(|| spawn_echo_server_owned(make_large_resp()))
+}
+fn port_large_resp_uring() -> u16 {
+    *PORT_LARGE_RESP_URING.get_or_init(|| spawn_echo_server_owned(make_large_resp()))
+}
+fn port_large_resp_ureq() -> u16 {
+    *PORT_LARGE_RESP_UREQ.get_or_init(|| spawn_echo_server_owned(make_large_resp()))
 }
 
-fn port_large_req() -> u16 {
-    *PORT_LARGE_REQ.get_or_init(|| {
-        // Server echoes small response regardless of request size.
-        spawn_echo_server(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
-        )
-    })
+fn port_large_req_xibalba() -> u16 {
+    *PORT_LARGE_REQ_XIBALBA.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    ))
+}
+fn port_large_req_uring() -> u16 {
+    *PORT_LARGE_REQ_URING.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    ))
+}
+fn port_large_req_ureq() -> u16 {
+    *PORT_LARGE_REQ_UREQ.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    ))
+}
+
+fn port_stress_xibalba() -> u16 {
+    *PORT_STRESS_XIBALBA.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
+}
+fn port_stress_uring() -> u16 {
+    *PORT_STRESS_URING.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
+}
+fn port_stress_ureq() -> u16 {
+    *PORT_STRESS_UREQ.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
+}
+fn port_concurrent_uring() -> u16 {
+    *PORT_CONCURRENT_URING.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
+}
+fn port_concurrent_ureq() -> u16 {
+    *PORT_CONCURRENT_UREQ.get_or_init(|| spawn_echo_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!",
+    ))
+}
+
+fn io_uring_pool(port: u16) -> (Pool, ConnHandle) {
+    let url = format!("http://127.0.0.1:{port}");
+    let mut pool = Pool::new().unwrap();
+    let conn = pool.connect(url.as_bytes()).unwrap();
+    (pool, conn)
 }
 
 // 512-byte query string exercising large request serialization.
@@ -201,12 +270,16 @@ mod small {
 
     use divan::black_box;
 
-    use super::{Method, network_enabled, port_small, ureq_agent, xibalba_client};
+    use super::{
+        Method, io_uring_pool, network_enabled,
+        port_small_xibalba, port_small_uring, port_small_ureq,
+        ureq_agent, xibalba_client,
+    };
 
     #[divan::bench(skip_ext_time)]
     fn xibalba(bencher: divan::Bencher) {
         if !network_enabled() { return; }
-        let mut client = xibalba_client(port_small());
+        let mut client = xibalba_client(port_small_xibalba());
         bencher.bench_local(|| {
             let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
             let mut body = Vec::new();
@@ -217,10 +290,20 @@ mod small {
     }
 
     #[divan::bench(skip_ext_time)]
+    fn io_uring(bencher: divan::Bencher) {
+        if !network_enabled() { return; }
+        let (mut pool, conn) = io_uring_pool(port_small_uring());
+        bencher.bench_local(|| {
+            pool.get(conn, black_box(b"/")).unwrap();
+            if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+        });
+    }
+
+    #[divan::bench(skip_ext_time)]
     fn ureq(bencher: divan::Bencher) {
         if !network_enabled() { return; }
         let agent = ureq_agent();
-        let url = format!("http://127.0.0.1:{}/", port_small());
+        let url = format!("http://127.0.0.1:{}/", port_small_ureq());
         bencher.bench_local(|| {
             let _body = agent.get(black_box(&url)).call().unwrap()
                 .body_mut().read_to_string().unwrap();
@@ -235,12 +318,16 @@ mod large_resp {
 
     use divan::black_box;
 
-    use super::{Method, network_enabled, port_large_resp, ureq_agent, xibalba_client};
+    use super::{
+        Method, io_uring_pool, network_enabled,
+        port_large_resp_xibalba, port_large_resp_uring, port_large_resp_ureq,
+        ureq_agent, xibalba_client,
+    };
 
     #[divan::bench(skip_ext_time)]
     fn xibalba(bencher: divan::Bencher) {
         if !network_enabled() { return; }
-        let mut client = xibalba_client(port_large_resp());
+        let mut client = xibalba_client(port_large_resp_xibalba());
         bencher.bench_local(|| {
             let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
             let mut body = Vec::new();
@@ -251,10 +338,20 @@ mod large_resp {
     }
 
     #[divan::bench(skip_ext_time)]
+    fn io_uring(bencher: divan::Bencher) {
+        if !network_enabled() { return; }
+        let (mut pool, conn) = io_uring_pool(port_large_resp_uring());
+        bencher.bench_local(|| {
+            pool.get(conn, black_box(b"/")).unwrap();
+            if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+        });
+    }
+
+    #[divan::bench(skip_ext_time)]
     fn ureq(bencher: divan::Bencher) {
         if !network_enabled() { return; }
         let agent = ureq_agent();
-        let url = format!("http://127.0.0.1:{}/", port_large_resp());
+        let url = format!("http://127.0.0.1:{}/", port_large_resp_ureq());
         bencher.bench_local(|| {
             let _body = agent.get(black_box(&url)).call().unwrap()
                 .body_mut().read_to_string().unwrap();
@@ -269,12 +366,16 @@ mod large_req {
 
     use divan::black_box;
 
-    use super::{Method, network_enabled, port_large_req, ureq_agent, xibalba_client, LARGE_QUERY};
+    use super::{
+        Method, io_uring_pool, network_enabled,
+        port_large_req_xibalba, port_large_req_uring, port_large_req_ureq,
+        ureq_agent, xibalba_client, LARGE_QUERY,
+    };
 
     #[divan::bench(skip_ext_time)]
     fn xibalba(bencher: divan::Bencher) {
         if !network_enabled() { return; }
-        let mut client = xibalba_client(port_large_req());
+        let mut client = xibalba_client(port_large_req_xibalba());
         bencher.bench_local(|| {
             let mut resp = client
                 .request(black_box(Method::Get), b"/search", Some(black_box(LARGE_QUERY)))
@@ -287,11 +388,21 @@ mod large_req {
     }
 
     #[divan::bench(skip_ext_time)]
+    fn io_uring(bencher: divan::Bencher) {
+        if !network_enabled() { return; }
+        let (mut pool, conn) = io_uring_pool(port_large_req_uring());
+        bencher.bench_local(|| {
+            pool.request(conn, black_box(Method::Get), b"/search", Some(black_box(LARGE_QUERY))).unwrap();
+            if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+        });
+    }
+
+    #[divan::bench(skip_ext_time)]
     fn ureq(bencher: divan::Bencher) {
         if !network_enabled() { return; }
         let agent = ureq_agent();
         let query = std::str::from_utf8(LARGE_QUERY).unwrap();
-        let url = format!("http://127.0.0.1:{}//search?{query}", port_large_req());
+        let url = format!("http://127.0.0.1:{}//search?{query}", port_large_req_ureq());
         bencher.bench_local(|| {
             let _body = agent.get(black_box(&url)).call().unwrap()
                 .body_mut().read_to_string().unwrap();
@@ -306,12 +417,16 @@ mod stress {
 
     use divan::black_box;
 
-    use super::{Method, network_enabled, port_small, ureq_agent, xibalba_client};
+    use super::{
+        Method, io_uring_pool, network_enabled,
+        port_stress_xibalba, port_stress_uring, port_stress_ureq,
+        ureq_agent, xibalba_client,
+    };
 
     #[divan::bench(skip_ext_time, sample_count = 20)]
     fn xibalba(bencher: divan::Bencher) {
         if !network_enabled() { return; }
-        let mut client = xibalba_client(port_small());
+        let mut client = xibalba_client(port_stress_xibalba());
         bencher.bench_local(|| {
             for _ in 0..1000 {
                 let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
@@ -324,15 +439,98 @@ mod stress {
     }
 
     #[divan::bench(skip_ext_time, sample_count = 20)]
+    fn io_uring(bencher: divan::Bencher) {
+        if !network_enabled() { return; }
+        let (mut pool, conn) = io_uring_pool(port_stress_uring());
+        bencher.bench_local(|| {
+            for _ in 0..1000 {
+                pool.get(conn, black_box(b"/")).unwrap();
+                if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+            }
+        });
+    }
+
+    #[divan::bench(skip_ext_time, sample_count = 20)]
     fn ureq(bencher: divan::Bencher) {
         if !network_enabled() { return; }
         let agent = ureq_agent();
-        let url = format!("http://127.0.0.1:{}/", port_small());
+        let url = format!("http://127.0.0.1:{}/", port_stress_ureq());
         bencher.bench_local(|| {
             for _ in 0..1000 {
                 let _body = agent.get(black_box(&url)).call().unwrap()
                     .body_mut().read_to_string().unwrap();
             }
+        });
+    }
+}
+
+// ── Scenario: concurrent (4 connections × 250 requests = 1000 total) ─────────
+//
+// io_uring: all 1000 requests submitted across 4 connections before waiting,
+//   then all 1000 responses drained — one kernel submission burst.
+// ureq:     4 threads each doing 250 sequential requests on their own connection.
+//
+// This is the scenario where io_uring's batched submission should win:
+// the kernel sees all sends in one go and can pipeline them on the wire.
+
+const CONNS: usize = 4;
+const REQS_PER_CONN: usize = 250;
+const TOTAL_REQS: usize = CONNS * REQS_PER_CONN;
+
+mod concurrent {
+    use divan::black_box;
+
+    use super::{
+        CONNS, REQS_PER_CONN,
+        network_enabled,
+        port_concurrent_uring, port_concurrent_ureq,
+        ureq_agent,
+    };
+
+    #[divan::bench(skip_ext_time, sample_count = 20)]
+    fn io_uring(bencher: divan::Bencher) {
+        if !network_enabled() { return; }
+        let port = port_concurrent_uring();
+        let url = format!("http://127.0.0.1:{port}");
+        let mut pool = super::Pool::new().unwrap();
+        let conns: Vec<_> = (0..CONNS)
+            .map(|_| pool.connect(url.as_bytes()).unwrap())
+            .collect();
+
+        bencher.bench_local(|| {
+            // One round: submit one request per connection, then drain all
+            // CONNS responses.  Keeps one request in-flight per connection
+            // at a time while batching all CONNS sends into one submission burst.
+            for _ in 0..REQS_PER_CONN {
+                for &conn in &conns {
+                    pool.get(conn, black_box(b"/")).unwrap();
+                }
+                pool.recv_n(CONNS, |r| {
+                    if let super::ConnResult::Response(resp) = r { black_box(&resp.body); }
+                });
+            }
+        });
+    }
+
+    #[divan::bench(skip_ext_time, sample_count = 20)]
+    fn ureq(bencher: divan::Bencher) {
+        if !network_enabled() { return; }
+        let port = port_concurrent_ureq();
+
+        bencher.bench_local(|| {
+            let url = format!("http://127.0.0.1:{port}/");
+            let handles: Vec<_> = (0..CONNS).map(|_| {
+                let url = url.clone();
+                let agent = ureq_agent();
+                std::thread::spawn(move || {
+                    for _ in 0..REQS_PER_CONN {
+                        let _body = agent.get(black_box(&url)).call().unwrap()
+                            .body_mut().read_to_string().unwrap();
+                        black_box(&_body);
+                    }
+                })
+            }).collect();
+            for h in handles { h.join().unwrap(); }
         });
     }
 }

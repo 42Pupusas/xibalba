@@ -105,12 +105,12 @@ fn build_tls_config() -> Result<Arc<ClientConfig>, Error> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_config = build_tls_config()?;
-    let client = Client::<TcpConnector>::new(tls_config);
-    let mut response = client.get(b"https://httpbin.org/get")?;
+    let mut client = Client::<TcpConnector>::connect(b"https://httpbin.org/get", tls_config)?;
+    let response = client.get(b"/get")?;
 
     println!("Status: {}", response.status);
     println!("Headers:");
-    for (name, value) in &response.headers {
+    for (name, value) in response.headers() {
         println!(
             "  {}: {}",
             String::from_utf8_lossy(name),
