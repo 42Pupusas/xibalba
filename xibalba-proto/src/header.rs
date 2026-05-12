@@ -19,7 +19,8 @@ pub(crate) fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Trim optional whitespace (SP, HTAB) from both ends of a byte slice.
-pub(crate) fn trim_ows(bytes: &[u8]) -> &[u8] {
+#[must_use]
+pub fn trim_ows(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
         .position(|&b| b != b' ' && b != b'\t')
@@ -33,7 +34,8 @@ pub(crate) fn trim_ows(bytes: &[u8]) -> &[u8] {
 
 /// Parse a `u64` from ASCII digit bytes without going through str.
 /// Skips leading/trailing OWS.
-pub(crate) fn parse_u64_from_bytes(bytes: &[u8]) -> Option<u64> {
+#[must_use]
+pub fn parse_u64_from_bytes(bytes: &[u8]) -> Option<u64> {
     let bytes = trim_ows(bytes);
     if bytes.is_empty() {
         return None;
@@ -50,7 +52,8 @@ pub(crate) fn parse_u64_from_bytes(bytes: &[u8]) -> Option<u64> {
 }
 
 /// Check if a comma-separated header value contains a token (case-insensitive).
-pub(crate) fn contains_token_ignore_case(value: &[u8], token: &[u8]) -> bool {
+#[must_use]
+pub fn contains_token_ignore_case(value: &[u8], token: &[u8]) -> bool {
     value.split(|&b| b == b',').any(|part| {
         let trimmed = trim_ows(part);
         ascii_eq_ignore_case(trimmed, token)
@@ -58,30 +61,48 @@ pub(crate) fn contains_token_ignore_case(value: &[u8], token: &[u8]) -> bool {
 }
 
 /// RFC 7230 token character validation.
+///
+/// 256-byte lookup table: one byte per possible input value, non-zero = valid
+/// tchar. Compiles to a single indexed load + test — no shifts, no branches.
+const TCHAR_TABLE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut b: u8 = 0;
+    loop {
+        if matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+                | b'0'..=b'9'
+                | b'A'..=b'Z'
+                | b'a'..=b'z'
+        ) {
+            table[b as usize] = 1;
+        }
+        if b == 255 {
+            break;
+        }
+        b += 1;
+    }
+    table
+};
+
 pub(crate) const fn is_tchar(b: u8) -> bool {
-    matches!(
-        b,
-        b'!' | b'#'
-            | b'$'
-            | b'%'
-            | b'&'
-            | b'\''
-            | b'*'
-            | b'+'
-            | b'-'
-            | b'.'
-            | b'^'
-            | b'_'
-            | b'`'
-            | b'|'
-            | b'~'
-            | b'0'..=b'9'
-            | b'A'..=b'Z'
-            | b'a'..=b'z'
-    )
+    TCHAR_TABLE[b as usize] != 0
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum HeaderName<'a> {
     Host,
     ContentLength,
@@ -101,6 +122,45 @@ pub enum HeaderName<'a> {
     Authorization,
     /// A header name not in the well-known set.
     Unknown(&'a [u8]),
+    /// Raw unparsed bytes from the wire — compared case-insensitively.
+    /// Used by the parser to defer classification until the name is actually needed.
+    Raw(&'a [u8]),
+}
+
+impl PartialEq for HeaderName<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Raw participates in case-insensitive comparison against canonical bytes.
+            (Self::Raw(a), Self::Raw(b)) => ascii_eq_ignore_case(a, b),
+            (Self::Raw(raw), known) | (known, Self::Raw(raw)) => {
+                ascii_eq_ignore_case(raw, known.as_bytes())
+            }
+            // Unknown is exact-bytes equality (caller controls casing).
+            (Self::Unknown(a), Self::Unknown(b)) => a == b,
+            // Two known variants are equal iff they are the same variant.
+            _ => self.as_bytes() == other.as_bytes(),
+        }
+    }
+}
+
+impl Eq for HeaderName<'_> {}
+
+impl core::hash::Hash for HeaderName<'_> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        // Hash the lowercased canonical bytes so Raw and known variants hash the same.
+        match self {
+            Self::Raw(b) | Self::Unknown(b) => {
+                for byte in *b {
+                    state.write_u8(byte.to_ascii_lowercase());
+                }
+            }
+            known => {
+                for byte in known.as_bytes() {
+                    state.write_u8(byte.to_ascii_lowercase());
+                }
+            }
+        }
+    }
 }
 
 impl<'a> HeaderName<'a> {
@@ -124,7 +184,7 @@ impl<'a> HeaderName<'a> {
             Self::SetCookie => b"Set-Cookie",
             Self::Cookie => b"Cookie",
             Self::Authorization => b"Authorization",
-            Self::Unknown(raw) => raw,
+            Self::Unknown(raw) | Self::Raw(raw) => raw,
         }
     }
 
@@ -148,7 +208,9 @@ impl<'a> HeaderName<'a> {
             Self::SetCookie => "Set-Cookie",
             Self::Cookie => "Cookie",
             Self::Authorization => "Authorization",
-            Self::Unknown(raw) => core::str::from_utf8(raw).unwrap_or("<invalid>"),
+            Self::Unknown(raw) | Self::Raw(raw) => {
+                core::str::from_utf8(raw).unwrap_or("<invalid>")
+            }
         }
     }
 

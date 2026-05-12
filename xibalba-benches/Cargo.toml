@@ -1,0 +1,44 @@
+[package]
+name = "xibalba-benches"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+xibalba-proto = { path = "../xibalba-proto" }
+xibalba-client = { path = "../xibalba-client" }
+divan = "0.1"
+httparse = "1"
+http = "1"
+url = "2"
+ureq = "3"
+
+[[bench]]
+name = "response_parse"
+harness = false
+
+[[bench]]
+name = "request_serialize"
+harness = false
+
+[[bench]]
+name = "url_parse"
+harness = false
+
+[[bench]]
+name = "header_helpers"
+harness = false
+
+[[bench]]
+name = "network"
+harness = false
+
+[[bin]]
+name = "profile-response-parse"
+path = "src/bin/profile_response_parse.rs"
+
+[lints]
+workspace = true

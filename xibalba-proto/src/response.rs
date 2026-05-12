@@ -1,6 +1,6 @@
 use crate::error::{Error, ParseError};
 use crate::header::{
-    Header, HeaderName, contains_token_ignore_case, is_tchar, parse_u64_from_bytes, trim_ows,
+    Header, HeaderName, contains_token_ignore_case, is_tchar, parse_u64_from_bytes,
 };
 use crate::status::StatusCode;
 use crate::version::Version;
@@ -67,32 +67,26 @@ pub fn parse_response_head<'a>(
     let mut count = 0;
 
     loop {
+        if pos >= buf.len() {
+            return Err(ParseError::Incomplete.into());
+        }
+
         if pos + 1 < buf.len() && buf[pos] == b'\r' && buf[pos + 1] == b'\n' {
             pos += 2;
             break;
         }
 
-        let line_end = find_crlf_from(buf, pos).ok_or(ParseError::Incomplete)?;
-        let line = &buf[pos..line_end];
-
-        let colon_pos = line
-            .iter()
-            .position(|&b| b == b':')
-            .ok_or(ParseError::MissingColon)?;
-
-        let name_bytes = &line[..colon_pos];
-        validate_token(name_bytes)?;
-
-        let name = HeaderName::from_bytes(name_bytes);
-        let value = trim_ows(&line[colon_pos + 1..]);
+        // Single left-to-right scan: validate name tchar-by-tchar, find ':', then
+        // scan value bytes until \r\n — all in one pass with no restarts.
+        let (name_bytes, value, line_end) = parse_header_line(&buf[pos..])?;
 
         if count >= headers.len() {
             return Err(ParseError::TooManyHeaders.into());
         }
-        headers[count] = Header { name, value };
+        headers[count] = Header { name: HeaderName::Raw(name_bytes), value };
         count += 1;
 
-        pos = line_end + 2;
+        pos += line_end;
     }
 
     Ok((
@@ -363,26 +357,64 @@ const fn hex_digit(b: u8) -> Option<u8> {
 }
 
 fn find_crlf(buf: &[u8]) -> Option<usize> {
-    find_crlf_from(buf, 0)
+    buf.windows(2).position(|w| w == b"\r\n")
 }
 
-fn find_crlf_from(buf: &[u8], start: usize) -> Option<usize> {
-    buf[start..]
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .map(|p| p + start)
-}
-
-fn validate_token(bytes: &[u8]) -> Result<(), Error> {
-    if bytes.is_empty() {
+/// Single-pass header line parser.
+///
+/// Scans `line` left-to-right once: validates name tchars, finds ':', then
+/// finds the terminating CRLF, trimming OWS from the value along the way.
+/// Returns `(name_bytes, value, bytes_consumed_including_crlf)`.
+fn parse_header_line(line: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
+    if line.is_empty() {
         return Err(ParseError::InvalidHeaderName.into());
     }
-    for &b in bytes {
+
+    // Phase 1: scan name, validating tchars and stopping at ':'
+    let mut i = 0;
+    loop {
+        if i >= line.len() {
+            return Err(ParseError::MissingColon.into());
+        }
+        let b = line[i];
+        if b == b':' {
+            break;
+        }
         if !is_tchar(b) {
             return Err(ParseError::InvalidHeaderName.into());
         }
+        i += 1;
     }
-    Ok(())
+    if i == 0 {
+        return Err(ParseError::InvalidHeaderName.into());
+    }
+    let name_bytes = &line[..i];
+    i += 1; // skip ':'
+
+    // Phase 2: skip leading OWS
+    while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+        i += 1;
+    }
+    let value_start = i;
+
+    // Phase 3: use iterator position so LLVM can auto-vectorize the \r scan
+    let cr_pos = line[i..]
+        .iter()
+        .position(|&b| b == b'\r')
+        .ok_or(ParseError::Incomplete)?;
+    let crlf = i + cr_pos;
+    if crlf + 1 >= line.len() || line[crlf + 1] != b'\n' {
+        return Err(ParseError::Incomplete.into());
+    }
+
+    // Trim trailing OWS in one backward pass — only paid when OWS is present
+    let raw_value = &line[value_start..crlf];
+    let value_end = raw_value
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(0, |p| p + 1);
+
+    Ok((name_bytes, &raw_value[..value_end], crlf + 2))
 }
 
 #[cfg(test)]
