@@ -36,13 +36,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = spawn_server();
     let url = format!("http://127.0.0.1:{port}");
 
-    let mut pool = Pool::new()?;
+    let mut pool = Pool::<256, 64, 8192, 8192>::new()?;
     let conn = pool.connect(url.as_bytes())?;
 
     for i in 0..5 {
         eprintln!("request {i}");
         pool.get(conn, b"/")?;
-        let resp = match pool.recv() {
+        let resp = match pool.recv().unwrap_or_else(|e| panic!("recv: {e}")) {
             ConnResult::Response(r) => r,
             ConnResult::Error { request_id, errno, .. } =>
                 panic!("request {request_id} failed: errno {errno}"),

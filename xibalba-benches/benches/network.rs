@@ -295,7 +295,7 @@ mod small {
         let (mut pool, conn) = io_uring_pool(port_small_uring());
         bencher.bench_local(|| {
             pool.get(conn, black_box(b"/")).unwrap();
-            if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+            if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
         });
     }
 
@@ -343,7 +343,7 @@ mod large_resp {
         let (mut pool, conn) = io_uring_pool(port_large_resp_uring());
         bencher.bench_local(|| {
             pool.get(conn, black_box(b"/")).unwrap();
-            if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+            if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
         });
     }
 
@@ -393,7 +393,7 @@ mod large_req {
         let (mut pool, conn) = io_uring_pool(port_large_req_uring());
         bencher.bench_local(|| {
             pool.request(conn, black_box(Method::Get), b"/search", Some(black_box(LARGE_QUERY))).unwrap();
-            if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+            if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
         });
     }
 
@@ -445,7 +445,7 @@ mod stress {
         bencher.bench_local(|| {
             for _ in 0..1000 {
                 pool.get(conn, black_box(b"/")).unwrap();
-                if let super::ConnResult::Response(r) = pool.recv() { black_box(&r.body); }
+                if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
             }
         });
     }
@@ -493,7 +493,7 @@ mod concurrent {
         if !network_enabled() { return; }
         let port = port_concurrent_uring();
         let url = format!("http://127.0.0.1:{port}");
-        let mut pool = super::Pool::new().unwrap();
+        let mut pool = super::Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conns: Vec<_> = (0..CONNS)
             .map(|_| pool.connect(url.as_bytes()).unwrap())
             .collect();
@@ -508,7 +508,7 @@ mod concurrent {
                 }
                 pool.recv_n(CONNS, |r| {
                     if let super::ConnResult::Response(resp) = r { black_box(&resp.body); }
-                });
+                }).unwrap();
             }
         });
     }

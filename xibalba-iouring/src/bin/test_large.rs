@@ -29,12 +29,12 @@ fn main() {
     });
 
     let url = format!("http://127.0.0.1:{port}");
-    let mut pool = Pool::new().unwrap();
+    let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
     let conn = pool.connect(url.as_bytes()).unwrap();
 
     for i in 0..5 {
         let id = pool.get(conn, b"/").unwrap_or_else(|e| panic!("iter {i}: get: {e}"));
-        let resp = match pool.recv() {
+        let resp = match pool.recv().unwrap_or_else(|e| panic!("iter {i}: recv: {e}")) {
             xibalba_iouring::driver::ConnResult::Response(r) => r,
             xibalba_iouring::driver::ConnResult::Error { request_id, errno, .. } =>
                 panic!("iter {i}: request {request_id} failed: errno {errno}"),

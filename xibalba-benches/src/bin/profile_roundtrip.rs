@@ -219,13 +219,13 @@ fn run_io_uring(response: Vec<u8>) {
     let _profiler = dhat::Profiler::new_heap();
 
     let url = format!("http://127.0.0.1:{port}");
-    let mut pool = Pool::new().unwrap();
+    let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
     let conn = pool.connect(url.as_bytes()).unwrap();
 
     let t0 = std::time::Instant::now();
     for _i in 0..ITERATIONS {
         pool.get(conn, black_box(b"/")).unwrap();
-        let resp = match pool.recv() {
+        let resp = match pool.recv().unwrap_or_else(|e| panic!("io_uring recv: {e}")) {
             xibalba_iouring::driver::ConnResult::Response(r) => r,
             xibalba_iouring::driver::ConnResult::Error { errno, .. } =>
                 panic!("io_uring error: errno {errno}"),
