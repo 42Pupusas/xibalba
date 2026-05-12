@@ -1,191 +1,147 @@
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::spsc::RingBuffer;
+use quetzalcoatl::spsc::{Consumer, Producer, RingBuffer};
 
-use xibalba_proto::error::{Error, IoError};
+use xibalba_proto::error::Error;
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
-use xibalba_proto::response::{determine_body_framing, parse_response_head};
-use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
 use xibalba_proto::version::Version;
 
-use crate::body::{BodyReader, IoBlock, reader_thread};
-use crate::connector::{Connector, SetReadTimeout};
+use crate::body::{BodyReader, HeadData, IoRequest, IoResponse, MAX_REQ_SIZE, io_thread};
+use crate::connector::Connector;
 
 pub struct Client<C: Connector> {
-    tls_config: C::TlsConfig,
+    _tls_config: C::TlsConfig,
+    tx_req: Producer<IoRequest>,
+    _io_thread: JoinHandle<()>,
+    rx_resp: Option<Consumer<IoResponse>>,
+    write_buf: Vec<u8>,
 }
 
 pub struct Response {
     pub version: Version,
-    pub status: StatusCode,
-    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
-    body: BodyReader,
-    reader_handle: Option<JoinHandle<()>>,
-    stop: Arc<AtomicBool>,
-}
-
-impl<C: Connector> Client<C> {
-    pub const fn new(tls_config: C::TlsConfig) -> Self {
-        Self { tls_config }
-    }
-
-    /// Send a request to the given URL.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error` on connection failure, I/O errors, or malformed responses.
-    pub fn request(&self, method: Method, url_bytes: &[u8]) -> Result<Response, Error> {
-        let url = Url::parse(url_bytes)?;
-        let mut stream = C::connect(&url, &self.tls_config)?;
-
-        let host_str = std::str::from_utf8(url.host)
-            .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
-        let host_value: Vec<u8> = if url.port.is_some() {
-            format!("{}:{}", host_str, url.effective_port()).into_bytes()
-        } else {
-            url.host.to_vec()
-        };
-
-        let headers = [
-            Header {
-                name: HeaderName::Host,
-                value: &host_value,
-            },
-            Header {
-                name: HeaderName::UserAgent,
-                value: b"xibalba/0.1",
-            },
-            Header {
-                name: HeaderName::Connection,
-                value: b"close",
-            },
-        ];
-
-        let req = Request {
-            method,
-            path: url.request_path(),
-            query: url.query,
-            version: Version::Http11,
-            headers: &headers,
-        };
-
-        req.serialize_to_writer(&mut stream).map_err(Error::from)?;
-        stream.flush().map_err(Error::from)?;
-
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(Error::from)?;
-
-        let (producer, mut ringbuf_rx) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let error: Arc<Mutex<Option<IoError>>> = Arc::new(Mutex::new(None));
-
-        let stop_for_thread = Arc::clone(&stop);
-        let error_for_thread = Arc::clone(&error);
-        let handle = std::thread::spawn(move || {
-            reader_thread(stream, &producer, &stop_for_thread, &error_for_thread);
-        });
-
-        let mut head_buf = Vec::with_capacity(4096);
-        let head_end = loop {
-            if let Some(pos) = find_header_end(&head_buf) {
-                break pos;
-            }
-            match ringbuf_rx.pop() {
-                Some(block) => {
-                    if block.len == 0 {
-                        if let Ok(guard) = error.lock()
-                            && let Some(e) = guard.as_ref()
-                        {
-                            return Err(Error::Io(e.clone()));
-                        }
-                        return Err(Error::Connection(
-                            "connection closed before headers complete".into(),
-                        ));
-                    }
-                    head_buf.extend_from_slice(&block.data[..block.len]);
-                }
-                None => {
-                    std::thread::sleep(Duration::from_micros(50));
-                }
-            }
-        };
-
-        let mut resp_headers = vec![Header::empty(); 64];
-        let (head, head_len) = parse_response_head(&head_buf[..head_end + 4], &mut resp_headers)?;
-
-        let is_head = method == Method::Head;
-        let framing =
-            determine_body_framing(head.status, is_head, &resp_headers, head.header_count);
-
-        let owned_headers: Vec<(Vec<u8>, Vec<u8>)> = resp_headers[..head.header_count]
-            .iter()
-            .map(|h| (h.name.as_bytes().to_vec(), h.value.to_vec()))
-            .collect();
-
-        let leftover = head_buf[head_len..].to_vec();
-        let body = BodyReader::new(ringbuf_rx, framing, leftover, error, Arc::clone(&stop));
-
-        Ok(Response {
-            version: head.version,
-            status: head.status,
-            headers: owned_headers,
-            body,
-            reader_handle: Some(handle),
-            stop,
-        })
-    }
-
-    /// Send a GET request.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error` on connection failure, I/O errors, or malformed responses.
-    pub fn get(&self, url: &[u8]) -> Result<Response, Error> {
-        self.request(Method::Get, url)
-    }
+    pub status: xibalba_proto::status::StatusCode,
+    pub head: HeadData,
+    pub body: BodyReader,
 }
 
 impl Response {
-    /// Access the body reader.
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn body(&mut self) -> &mut BodyReader {
-        &mut self.body
+    /// Iterate over response headers as `(&[u8], &[u8])` pairs.
+    /// Borrows directly from the inline head buffer — zero allocations.
+    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.head.headers()
     }
 
     /// Read the entire body as a UTF-8 string.
     ///
     /// # Errors
     ///
-    /// Returns `Error::Io` on read failure, or `Error::Connection` if the body
-    /// is not valid UTF-8.
-    pub fn text(&mut self) -> Result<String, Error> {
+    /// Returns `Error::Io` on read failure, or `Error::Connection` if the
+    /// body is not valid UTF-8.
+    pub fn text(mut self) -> Result<String, Error> {
         use std::io::Read;
         let mut buf = Vec::new();
         self.body.read_to_end(&mut buf).map_err(Error::from)?;
         String::from_utf8(buf)
             .map_err(|e| Error::Connection(format!("response body is not valid UTF-8: {e}")))
     }
-}
 
-impl Drop for Response {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
-        }
+    pub(crate) fn into_consumer(self) -> Consumer<IoResponse> {
+        self.body.into_consumer()
     }
 }
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+impl<C: Connector> Client<C> {
+    /// Connect to `url` and start the io thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` on connection failure.
+    pub fn connect(url_bytes: &[u8], tls_config: C::TlsConfig) -> Result<Self, Error> {
+        let url = Url::parse(url_bytes)?;
+        let stream = C::connect(&url, &tls_config)?;
+
+        let (tx_req, mut rx_req) = RingBuffer::<IoRequest>::new(Capacity::exact(16)).split();
+        let (tx_resp, rx_resp) = RingBuffer::<IoResponse>::new(Capacity::exact(64)).split();
+
+        let handle = std::thread::spawn(move || {
+            io_thread(stream, &mut rx_req, &tx_resp);
+        });
+
+        Ok(Self {
+            _tls_config: tls_config,
+            tx_req,
+            rx_resp: Some(rx_resp),
+            _io_thread: handle,
+            write_buf: Vec::with_capacity(512),
+        })
+    }
+
+    /// Send a request over the persistent connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` on serialization failure or if the io thread reports
+    /// a connection error.
+    pub fn request(&mut self, method: Method, path: &[u8], query: Option<&[u8]>) -> Result<Response, Error> {
+        let headers = [
+            Header { name: HeaderName::Connection, value: b"keep-alive" },
+            Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" },
+        ];
+        let req = Request {
+            method,
+            path,
+            query,
+            version: Version::Http11,
+            headers: &headers,
+        };
+
+        self.write_buf.clear();
+        req.serialize_to_writer(&mut self.write_buf)?;
+        let len = self.write_buf.len();
+        if len > MAX_REQ_SIZE {
+            return Err(Error::Connection(format!("request too large: {len} > {MAX_REQ_SIZE}")));
+        }
+
+        let mut io_req = IoRequest { buf: [0u8; MAX_REQ_SIZE], len };
+        io_req.buf[..len].copy_from_slice(&self.write_buf[..len]);
+        self.tx_req
+            .reserve_block()
+            .ok_or_else(|| Error::Connection("io thread closed".into()))?
+            .write(io_req)
+            .commit();
+
+        let mut rx = self.rx_resp.take()
+            .ok_or_else(|| Error::Connection("previous response not fully consumed".into()))?;
+
+        match rx.pop_block() {
+            Some(IoResponse::Head(head)) => Ok(Response {
+                version: head.version,
+                status: head.status,
+                head,
+                body: BodyReader::new(rx),
+            }),
+            Some(IoResponse::Error(e)) => {
+                self.rx_resp = Some(rx);
+                Err(e)
+            }
+            _ => Err(Error::Connection("io thread closed unexpectedly".into())),
+        }
+    }
+
+    /// Reclaim the consumer from a completed response, readying the client
+    /// for the next request.
+    pub fn reclaim(&mut self, resp: Response) {
+        self.rx_resp = Some(resp.into_consumer());
+    }
+
+    /// # Errors
+    ///
+    /// See [`request`](Self::request).
+    pub fn get(&mut self, path: &[u8]) -> Result<Response, Error> {
+        self.request(Method::Get, path, None)
+    }
 }

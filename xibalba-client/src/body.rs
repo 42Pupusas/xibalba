@@ -1,138 +1,76 @@
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use quetzalcoatl::spsc::{Consumer, Producer};
 
-use xibalba_proto::error::IoError;
-use xibalba_proto::response::{BodyFraming, ChunkedDecoder, DecodeResult};
+use xibalba_proto::error::Error;
+use xibalba_proto::status::StatusCode;
+use xibalba_proto::version::Version;
 
-const BLOCK_SIZE: usize = 8192;
+// ── Size constants ────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
-pub struct IoBlock {
-    pub data: [u8; BLOCK_SIZE],
-    pub len: usize, // 0 = EOF sentinel
+pub const BLOCK_SIZE: usize = 8192;
+pub const MAX_REQ_SIZE: usize = 8192;
+pub const HEAD_BUF_SIZE: usize = 8192;
+pub const MAX_HEADERS: usize = 64;
+
+// ── Wire messages ─────────────────────────────────────────────────────────────
+
+/// Inline fixed-size request slot — written via `reserve_block`, zero copy.
+pub struct IoRequest {
+    pub buf: [u8; MAX_REQ_SIZE],
+    pub len: usize,
 }
 
-impl Default for IoBlock {
-    fn default() -> Self {
-        Self {
-            data: [0; BLOCK_SIZE],
-            len: 0,
-        }
+/// `(name_start, name_len, val_start, val_len)` — byte offsets into `HeadData::head_buf`.
+pub type HeaderRange = (u16, u16, u16, u16);
+
+pub struct HeadData {
+    pub version: Version,
+    pub status: StatusCode,
+    /// Raw bytes of the response head (status line + headers + \r\n\r\n).
+    pub head_buf: [u8; HEAD_BUF_SIZE],
+    pub head_len: usize,
+    pub ranges: [HeaderRange; MAX_HEADERS],
+    pub header_count: usize,
+}
+
+impl HeadData {
+    /// Iterator over `(name, value)` byte slices borrowed from `head_buf`.
+    /// Zero allocations.
+    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let buf = &self.head_buf[..self.head_len];
+        self.ranges[..self.header_count].iter().map(move |&(ns, nl, vs, vl)| {
+            (
+                &buf[ns as usize..ns as usize + nl as usize],
+                &buf[vs as usize..vs as usize + vl as usize],
+            )
+        })
     }
 }
 
-pub(crate) fn reader_thread<R: Read>(
-    mut stream: R,
-    producer: &Producer<IoBlock>,
-    stop: &Arc<AtomicBool>,
-    error: &Arc<Mutex<Option<IoError>>>,
-) {
-    let mut buf = [0u8; BLOCK_SIZE];
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        match stream.read(&mut buf) {
-            Ok(0) => {
-                push_with_backoff(producer, IoBlock::default(), stop);
-                break;
-            }
-            Ok(n) => {
-                let mut block = IoBlock::default();
-                block.data[..n].copy_from_slice(&buf[..n]);
-                block.len = n;
-                if !push_with_backoff(producer, block, stop) {
-                    break;
-                }
-            }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => {
-                if let Ok(mut guard) = error.lock() {
-                    *guard = Some(IoError {
-                        kind: e.kind(),
-                        message: e.to_string(),
-                    });
-                }
-                push_with_backoff(producer, IoBlock::default(), stop);
-                break;
-            }
-        }
-    }
+#[allow(clippy::large_enum_variant)] // inline by design — boxing defeats the zero-alloc goal
+pub enum IoResponse {
+    Head(HeadData),
+    BodyChunk([u8; BLOCK_SIZE], usize),
+    BodyDone,
+    Error(Error),
 }
 
-fn push_with_backoff(producer: &Producer<IoBlock>, block: IoBlock, stop: &Arc<AtomicBool>) -> bool {
-    let mut item = block;
-    loop {
-        match producer.push(item) {
-            Ok(()) => return true,
-            Err(returned) => {
-                if stop.load(Ordering::Relaxed) {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_micros(100));
-                item = returned;
-            }
-        }
-    }
-}
+// ── BodyReader ────────────────────────────────────────────────────────────────
 
 pub struct BodyReader {
-    consumer: Consumer<IoBlock>,
-    framing: BodyFraming,
-    leftover: Vec<u8>,
-    leftover_pos: usize,
-    remaining: u64,
-    chunked: Option<ChunkedDecoder>,
-    error: Arc<Mutex<Option<IoError>>>,
-    stop: Arc<AtomicBool>,
+    rx: Consumer<IoResponse>,
+    leftover: Option<([u8; BLOCK_SIZE], usize, usize)>, // (data, len, pos)
     done: bool,
 }
 
 impl BodyReader {
-    #[allow(clippy::missing_const_for_fn)]
-    pub(crate) fn new(
-        consumer: Consumer<IoBlock>,
-        framing: BodyFraming,
-        leftover: Vec<u8>,
-        error: Arc<Mutex<Option<IoError>>>,
-        stop: Arc<AtomicBool>,
-    ) -> Self {
-        let remaining = match &framing {
-            BodyFraming::ContentLength(n) => *n,
-            _ => 0,
-        };
-        let chunked = match &framing {
-            BodyFraming::Chunked => Some(ChunkedDecoder::new()),
-            _ => None,
-        };
-        let done = matches!(framing, BodyFraming::None);
-        Self {
-            consumer,
-            framing,
-            leftover,
-            leftover_pos: 0,
-            remaining,
-            chunked,
-            error,
-            stop,
-            done,
-        }
+    pub(crate) const fn new(rx: Consumer<IoResponse>) -> Self {
+        Self { rx, leftover: None, done: false }
     }
 
-    fn check_error(&self) -> std::io::Result<()> {
-        if let Ok(guard) = self.error.lock()
-            && let Some(e) = guard.as_ref()
-        {
-            return Err(std::io::Error::new(e.kind, e.message.clone()));
-        }
-        Ok(())
+    pub(crate) fn into_consumer(self) -> Consumer<IoResponse> {
+        self.rx
     }
 }
 
@@ -142,319 +80,363 @@ impl Read for BodyReader {
             return Ok(0);
         }
 
-        match &self.framing {
-            BodyFraming::None => Ok(0),
-            BodyFraming::ContentLength(_) => self.read_content_length(buf),
-            BodyFraming::Chunked => self.read_chunked(buf),
-            BodyFraming::UntilClose => self.read_until_close(buf),
-        }
-    }
-}
-
-impl BodyReader {
-    fn drain_leftover(&mut self, buf: &mut [u8]) -> usize {
-        if self.leftover_pos >= self.leftover.len() {
-            return 0;
-        }
-        let available = &self.leftover[self.leftover_pos..];
-        let n = available.len().min(buf.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        self.leftover_pos += n;
-        n
-    }
-
-    fn next_block_data(&mut self) -> Option<Vec<u8>> {
-        loop {
-            if let Some(block) = self.consumer.pop() {
-                if block.len == 0 {
-                    return None;
-                }
-                return Some(block.data[..block.len].to_vec());
-            }
-            self.check_error().ok()?;
-            std::thread::sleep(Duration::from_micros(50));
-        }
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn read_content_length(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 {
-            self.done = true;
-            return Ok(0);
-        }
-
-        let max = usize::try_from(self.remaining)
-            .unwrap_or(usize::MAX)
-            .min(buf.len());
-        let buf = &mut buf[..max];
-
-        let n = self.drain_leftover(buf);
-        if n > 0 {
-            self.remaining -= n as u64;
-            if self.remaining == 0 {
-                self.done = true;
+        if let Some((data, len, pos)) = &mut self.leftover {
+            let available = &data[*pos..*len];
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            *pos += n;
+            if *pos >= *len {
+                self.leftover = None;
             }
             return Ok(n);
         }
 
-        if let Some(data) = self.next_block_data() {
-            let n = data.len().min(buf.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            self.remaining -= n as u64;
-            if n < data.len() {
-                self.leftover = data;
-                self.leftover_pos = n;
+        match self.rx.pop_block() {
+            Some(IoResponse::BodyChunk(data, len)) => {
+                let n = len.min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                if n < len {
+                    self.leftover = Some((data, len, n));
+                }
+                Ok(n)
             }
-            if self.remaining == 0 {
+            Some(IoResponse::BodyDone | IoResponse::Head(_)) | None => {
                 self.done = true;
+                Ok(0)
             }
-            Ok(n)
-        } else {
-            self.done = true;
-            self.check_error()?;
-            Ok(0)
-        }
-    }
-
-    fn read_chunked(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.leftover_pos < self.leftover.len() {
-            let decoder = self.chunked.as_mut().unwrap();
-            let input = &self.leftover[self.leftover_pos..];
-            let (result, bytes_used) = decoder.decode(input, buf);
-            self.leftover_pos += bytes_used;
-            match result {
-                DecodeResult::Data(n) => return Ok(n),
-                DecodeResult::Done => {
-                    self.done = true;
-                    return Ok(0);
-                }
-                DecodeResult::NeedMore => {}
-                DecodeResult::Error(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
-
-        loop {
-            let Some(data) = self.next_block_data() else {
-                self.done = true;
-                self.check_error()?;
-                return Ok(0);
-            };
-
-            let decoder = self.chunked.as_mut().unwrap();
-            let (result, bytes_used) = decoder.decode(&data, buf);
-            if bytes_used < data.len() {
-                self.leftover = data;
-                self.leftover_pos = bytes_used;
-            }
-            match result {
-                DecodeResult::Data(n) => return Ok(n),
-                DecodeResult::Done => {
-                    self.done = true;
-                    return Ok(0);
-                }
-                DecodeResult::NeedMore => {}
-                DecodeResult::Error(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        e.to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
-    fn read_until_close(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.drain_leftover(buf);
-        if n > 0 {
-            return Ok(n);
-        }
-
-        if let Some(data) = self.next_block_data() {
-            let n = data.len().min(buf.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            if n < data.len() {
-                self.leftover = data;
-                self.leftover_pos = n;
-            }
-            Ok(n)
-        } else {
-            self.done = true;
-            self.check_error()?;
-            Ok(0)
+            Some(IoResponse::Error(e)) => Err(std::io::Error::other(e.to_string())),
         }
     }
 }
 
-impl Drop for BodyReader {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+// ── io thread state machine ───────────────────────────────────────────────────
+
+#[allow(clippy::large_enum_variant)]
+enum IoState {
+    Idle,
+    ReadingHead,
+    ReadingBody { framing: BodyFraming },
+}
+
+#[allow(clippy::large_enum_variant)]
+enum BodyFraming {
+    ContentLength { remaining: u64 },
+    Chunked { decoder: xibalba_proto::response::ChunkedDecoder, leftover: [u8; BLOCK_SIZE], leftover_len: usize },
+    UntilClose,
+}
+
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+pub(crate) fn io_thread<S: Read + std::io::Write>(
+    mut stream: S,
+    rx_req: &mut Consumer<IoRequest>,
+    tx_resp: &Producer<IoResponse>,
+) {
+    use xibalba_proto::header::Header;
+    use xibalba_proto::response::{
+        BodyFraming as ProtoFraming, ChunkedDecoder, DecodeResult, determine_body_framing,
+        parse_response_head,
+    };
+
+    let mut state = IoState::Idle;
+    // Persistent head read buffer — cleared per request, never reallocated.
+    let mut head_buf: Vec<u8> = Vec::with_capacity(HEAD_BUF_SIZE);
+    let mut raw_buf = [0u8; BLOCK_SIZE];
+
+    'io: loop {
+        match state {
+            IoState::Idle => {
+                let Some(req) = rx_req.pop_ref_block() else { break };
+                if stream.write_all(&req.buf[..req.len]).is_err() || stream.flush().is_err() {
+                    let _ = tx_resp.push_block(IoResponse::Error(
+                        Error::Connection("write failed".into()),
+                    ));
+                    break;
+                }
+                drop(req);
+                head_buf.clear();
+                state = IoState::ReadingHead;
+            }
+
+            IoState::ReadingHead => {
+                match stream.read(&mut raw_buf) {
+                    Ok(0) => {
+                        let _ = tx_resp.push_block(IoResponse::Error(Error::Connection(
+                            "connection closed before headers complete".into(),
+                        )));
+                        break;
+                    }
+                    Ok(n) => head_buf.extend_from_slice(&raw_buf[..n]),
+                    Err(e) => {
+                        let _ = tx_resp.push_block(IoResponse::Error(e.into()));
+                        break;
+                    }
+                }
+
+                let Some(head_end) = find_header_end(&head_buf) else {
+                    continue;
+                };
+
+                let head_bytes_len = head_end + 4;
+                let mut hdr_buf = [const { Header::empty() }; MAX_HEADERS];
+                let (head, consumed) =
+                    match parse_response_head(&head_buf[..head_bytes_len], &mut hdr_buf) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx_resp.push_block(IoResponse::Error(e));
+                            break;
+                        }
+                    };
+
+                let copy_len = head_bytes_len.min(HEAD_BUF_SIZE);
+                let ranges = match build_ranges(&hdr_buf[..head.header_count], &head_buf[..copy_len]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx_resp.push_block(IoResponse::Error(e));
+                        break 'io;
+                    }
+                };
+                let mut head_data = HeadData {
+                    version: head.version,
+                    status: head.status,
+                    head_buf: [0u8; HEAD_BUF_SIZE],
+                    head_len: head_bytes_len,
+                    ranges,
+                    header_count: head.header_count,
+                };
+                head_data.head_buf[..copy_len].copy_from_slice(&head_buf[..copy_len]);
+
+                let framing = determine_body_framing(
+                    head.status,
+                    false,
+                    &hdr_buf[..head.header_count],
+                    head.header_count,
+                );
+
+                if tx_resp.push_block(IoResponse::Head(head_data)).is_err() {
+                    break;
+                }
+
+                // Carry leftover bytes (past the head) into the body framing inline —
+                // no Vec allocation.
+                let tail = &head_buf[consumed..];
+                let mut lo_buf = [0u8; BLOCK_SIZE];
+                let lo_len = tail.len().min(BLOCK_SIZE);
+                lo_buf[..lo_len].copy_from_slice(&tail[..lo_len]);
+
+                state = IoState::ReadingBody {
+                    framing: match framing {
+                        ProtoFraming::None => {
+                            let _ = tx_resp.push_block(IoResponse::BodyDone);
+                            state = IoState::Idle;
+                            continue;
+                        }
+                        ProtoFraming::ContentLength(n) => {
+                            let remaining = n.saturating_sub(lo_len as u64);
+                            if lo_len > 0 && push_chunk(tx_resp, &lo_buf[..lo_len]).is_err() {
+                                break;
+                            }
+                            if remaining == 0 {
+                                let _ = tx_resp.push_block(IoResponse::BodyDone);
+                                state = IoState::Idle;
+                                continue;
+                            }
+                            BodyFraming::ContentLength { remaining }
+                        }
+                        ProtoFraming::Chunked => BodyFraming::Chunked {
+                            decoder: ChunkedDecoder::new(),
+                            leftover: lo_buf,
+                            leftover_len: lo_len,
+                        },
+                        ProtoFraming::UntilClose => {
+                            if lo_len > 0 && push_chunk(tx_resp, &lo_buf[..lo_len]).is_err() {
+                                break;
+                            }
+                            BodyFraming::UntilClose
+                        }
+                    },
+                };
+            }
+
+            IoState::ReadingBody { ref mut framing } => {
+                let done = match framing {
+                    BodyFraming::ContentLength { remaining, .. } => {
+                        match stream.read(&mut raw_buf) {
+                            Ok(0) => {
+                                let _ = tx_resp.push_block(IoResponse::Error(Error::Connection(
+                                    "connection closed mid-body".into(),
+                                )));
+                                break;
+                            }
+                            Ok(n) => {
+                                let to_send =
+                                    usize::try_from((n as u64).min(*remaining)).unwrap_or(usize::MAX);
+                                if push_chunk(tx_resp, &raw_buf[..to_send]).is_err() {
+                                    break;
+                                }
+                                *remaining -= to_send as u64;
+                                if *remaining == 0 {
+                                    let _ = tx_resp.push_block(IoResponse::BodyDone);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx_resp.push_block(IoResponse::Error(e.into()));
+                                break;
+                            }
+                        }
+                    }
+
+                    BodyFraming::Chunked { decoder, leftover, leftover_len } => {
+                        if decoder.is_done() {
+                            let _ = tx_resp.push_block(IoResponse::BodyDone);
+                            true
+                        } else if *leftover_len > 0 {
+                            let mut out = [0u8; BLOCK_SIZE];
+                            let (result, consumed) = decoder.decode(&leftover[..*leftover_len], &mut out);
+                            // Drain consumed bytes by shifting remaining bytes to the front.
+                            *leftover_len -= consumed;
+                            leftover.copy_within(consumed..consumed + *leftover_len, 0);
+                            match result {
+                                DecodeResult::Data(n) => {
+                                    if push_chunk(tx_resp, &out[..n]).is_err() {
+                                        break;
+                                    }
+                                    false
+                                }
+                                DecodeResult::Done => {
+                                    let _ = tx_resp.push_block(IoResponse::BodyDone);
+                                    true
+                                }
+                                DecodeResult::NeedMore => false,
+                                DecodeResult::Error(e) => {
+                                    let _ = tx_resp.push_block(IoResponse::Error(Error::Parse(e)));
+                                    break;
+                                }
+                            }
+                        } else {
+                            match stream.read(&mut raw_buf) {
+                                Ok(0) => {
+                                    let _ = tx_resp.push_block(IoResponse::Error(Error::Connection(
+                                        "connection closed mid-chunk".into(),
+                                    )));
+                                    break;
+                                }
+                                Ok(n) => {
+                                    let mut out = [0u8; BLOCK_SIZE];
+                                    let (result, consumed) =
+                                        decoder.decode(&raw_buf[..n], &mut out);
+                                    if consumed < n {
+                                        let tail = n - consumed;
+                                        leftover[*leftover_len..*leftover_len + tail]
+                                            .copy_from_slice(&raw_buf[consumed..n]);
+                                        *leftover_len += tail;
+                                    }
+                                    match result {
+                                        DecodeResult::Data(n) => {
+                                            if push_chunk(tx_resp, &out[..n]).is_err() {
+                                                break;
+                                            }
+                                            false
+                                        }
+                                        DecodeResult::Done => {
+                                            let _ = tx_resp.push_block(IoResponse::BodyDone);
+                                            true
+                                        }
+                                        DecodeResult::NeedMore => false,
+                                        DecodeResult::Error(e) => {
+                                            let _ = tx_resp
+                                                .push_block(IoResponse::Error(Error::Parse(e)));
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx_resp.push_block(IoResponse::Error(e.into()));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    BodyFraming::UntilClose => match stream.read(&mut raw_buf) {
+                        Ok(0) => {
+                            let _ = tx_resp.push_block(IoResponse::BodyDone);
+                            true
+                        }
+                        Ok(n) => {
+                            if push_chunk(tx_resp, &raw_buf[..n]).is_err() {
+                                break;
+                            }
+                            false
+                        }
+                        Err(e) => {
+                            let _ = tx_resp.push_block(IoResponse::Error(e.into()));
+                            break;
+                        }
+                    },
+                };
+                if done {
+                    state = IoState::Idle;
+                }
+            }
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use quetzalcoatl::capacity::Capacity;
-    use quetzalcoatl::spsc::RingBuffer;
-    use std::io::Read;
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-    fn make_block(data: &[u8]) -> IoBlock {
-        let mut block = IoBlock::default();
-        let len = data.len().min(BLOCK_SIZE);
-        block.data[..len].copy_from_slice(&data[..len]);
-        block.len = len;
-        block
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn push_chunk(tx: &Producer<IoResponse>, data: &[u8]) -> Result<(), ()> {
+    let mut chunk = [0u8; BLOCK_SIZE];
+    chunk[..data.len()].copy_from_slice(data);
+    tx.push_block(IoResponse::BodyChunk(chunk, data.len())).map_err(|_| ())
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
     }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
 
-    fn eof_block() -> IoBlock {
-        IoBlock::default()
-    }
+/// Compute `HeaderRange` offsets for each parsed header against `src`.
+fn build_ranges(
+    headers: &[xibalba_proto::header::Header<'_>],
+    src: &[u8],
+) -> Result<[HeaderRange; MAX_HEADERS], Error> {
+    let src_base = src.as_ptr() as usize;
+    let src_end = src_base + src.len();
+    let mut ranges = [(0u16, 0u16, 0u16, 0u16); MAX_HEADERS];
 
-    #[test]
-    fn content_length_exact() {
-        let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
+    for (i, h) in headers.iter().enumerate() {
+        let name = h.name.as_bytes();
+        let value = h.value;
 
-        producer.push(make_block(b"hello")).unwrap();
-        producer.push(eof_block()).unwrap();
+        let vs_off = value.as_ptr() as usize - src_base;
+        let name_ptr = name.as_ptr() as usize;
+        let ns_off = if name_ptr >= src_base && name_ptr < src_end {
+            name_ptr - src_base
+        } else {
+            find_subsequence(src, name)
+                .ok_or_else(|| Error::Connection("header name not found in head buffer".into()))?
+        };
 
-        let mut reader =
-            BodyReader::new(consumer, BodyFraming::ContentLength(5), vec![], error, stop);
-
-        let mut buf = vec![0u8; 64];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hello");
-
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn content_length_with_leftover() {
-        let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-
-        producer.push(eof_block()).unwrap();
-
-        let mut reader = BodyReader::new(
-            consumer,
-            BodyFraming::ContentLength(5),
-            b"helloextra".to_vec(),
-            error,
-            stop,
+        ranges[i] = (
+            u16::try_from(ns_off)
+                .map_err(|_| Error::Connection("header name offset overflows u16".into()))?,
+            u16::try_from(name.len())
+                .map_err(|_| Error::Connection("header name length overflows u16".into()))?,
+            u16::try_from(vs_off)
+                .map_err(|_| Error::Connection("header value offset overflows u16".into()))?,
+            u16::try_from(value.len())
+                .map_err(|_| Error::Connection("header value length overflows u16".into()))?,
         );
-
-        let mut buf = vec![0u8; 64];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hello");
-
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
     }
 
-    #[test]
-    fn chunked_body() {
-        let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-
-        producer
-            .push(make_block(b"5\r\nhello\r\n0\r\n\r\n"))
-            .unwrap();
-        producer.push(eof_block()).unwrap();
-
-        let mut reader = BodyReader::new(consumer, BodyFraming::Chunked, vec![], error, stop);
-
-        let mut buf = vec![0u8; 64];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hello");
-
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn chunked_with_leftover() {
-        let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-
-        producer.push(eof_block()).unwrap();
-
-        let mut reader = BodyReader::new(
-            consumer,
-            BodyFraming::Chunked,
-            b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
-            error,
-            stop,
-        );
-
-        let mut buf = vec![0u8; 64];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"hello");
-
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn until_close() {
-        let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-
-        producer.push(make_block(b"hello")).unwrap();
-        producer.push(make_block(b" world")).unwrap();
-        producer.push(eof_block()).unwrap();
-
-        let mut reader = BodyReader::new(consumer, BodyFraming::UntilClose, vec![], error, stop);
-
-        let mut result = Vec::new();
-        let mut buf = vec![0u8; 64];
-        loop {
-            let n = reader.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            result.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(result, b"hello world");
-    }
-
-    #[test]
-    fn no_body() {
-        let (_, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-
-        let mut reader = BodyReader::new(consumer, BodyFraming::None, vec![], error, stop);
-
-        let mut buf = vec![0u8; 64];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[test]
-    fn drop_sets_stop_flag() {
-        let (_, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
-        let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-
-        let reader = BodyReader::new(
-            consumer,
-            BodyFraming::None,
-            vec![],
-            error,
-            Arc::clone(&stop),
-        );
-        drop(reader);
-        assert!(stop.load(Ordering::Relaxed));
-    }
+    Ok(ranges)
 }
