@@ -27,7 +27,7 @@ use std::thread::JoinHandle;
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc::{self, Producer as MpscProducer, RingBuffer as MpscRingBuffer};
 use quetzalcoatl::spmc::{Consumer as SpmcConsumer, Producer as SpmcProducer, RingBuffer as SpmcRingBuffer};
-use ququmatz::types::{MsgFlags, SockAddrIn};
+use ququmatz::types::{MsgFlags, SockAddrIn, TimeoutFlags, Timespec};
 use ququmatz::{Completer, ProvidedBufferRing, RawFd, Sqe, Submitter};
 
 use xibalba_proto::error::Error;
@@ -51,17 +51,19 @@ const PBUF_BGID: u16 = 0;
 const BLOCK_SIZE: usize = 8192;
 const RING_ENTRIES: u32 = 256;
 const SHUTDOWN_UD: u64 = u64::MAX;
+// Second-highest value — cannot collide with recv (bit63=0), send (bit63=1 and not MAX), or SHUTDOWN.
+const TIMEOUT_UD: u64 = u64::MAX - 1;
 
 // ── user_data helpers ─────────────────────────────────────────────────────────
 
 // Upper 32 bits: fd, lower 32 bits: conn_id.
-#[allow(clippy::cast_possible_truncation)]
-fn ud_recv(fd: usize, conn_id: u32) -> u64 {
+#[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+const fn ud_recv(fd: usize, conn_id: u32) -> u64 {
     (fd as u64) << 32 | (conn_id as u64 & 0xffff_ffff)
 }
 
-fn ud_fd(ud: u64) -> usize { (ud >> 32) as usize }
-fn ud_conn_id(ud: u64) -> u32 { (ud & 0xffff_ffff) as u32 }
+const fn ud_fd(ud: u64) -> usize { (ud >> 32) as usize }
+const fn ud_conn_id(ud: u64) -> u32 { (ud & 0xffff_ffff) as u32 }
 
 // ── public types ──────────────────────────────────────────────────────────────
 
@@ -105,10 +107,17 @@ impl Response {
 
 /// Result delivered to the caller for each request.
 pub enum ConnResult {
-    Response(Response),
-    /// The connection was closed or an I/O error occurred.  The `RequestId` is
-    /// the in-flight request at the time of the error.
-    Error { request_id: RequestId, errno: i32 },
+    Response(Box<Response>),
+    /// The connection was closed or an I/O error occurred.
+    Error {
+        request_id: RequestId,
+        /// The connection on which the error occurred.  The caller should
+        /// treat this handle as permanently dead and call `disconnect`.
+        conn: ConnHandle,
+        errno: i32,
+    },
+    /// A `recv_timeout` deadline elapsed before any response arrived.
+    Timeout,
 }
 
 // ── send SQE user_data encoding ───────────────────────────────────────────────
@@ -123,13 +132,13 @@ pub enum ConnResult {
 
 const SEND_UD_FLAG: u64 = 1 << 63;
 
-#[allow(clippy::cast_possible_truncation)]
-fn ud_send(conn_id: u32, seq: u32) -> u64 {
-    SEND_UD_FLAG | (conn_id as u64) << 32 | seq as u64
+const fn ud_send(conn_id: u32, seq: u32) -> u64 {
+    #[allow(clippy::cast_lossless)]
+    { SEND_UD_FLAG | (conn_id as u64) << 32 | seq as u64 }
 }
-fn is_send_cqe(ud: u64) -> bool { ud & SEND_UD_FLAG != 0 && ud != SHUTDOWN_UD }
-fn ud_send_conn_id(ud: u64) -> u32 { ((ud >> 32) & 0x7fff_ffff) as u32 }
-fn ud_send_seq(ud: u64) -> u32 { (ud & 0xffff_ffff) as u32 }
+const fn is_send_cqe(ud: u64) -> bool { ud & SEND_UD_FLAG != 0 && ud != SHUTDOWN_UD }
+const fn ud_send_conn_id(ud: u64) -> u32 { ((ud >> 32) & 0x7fff_ffff) as u32 }
+const fn ud_send_seq(ud: u64) -> u32 { (ud & 0xffff_ffff) as u32 }
 
 // ── inter-thread messages ─────────────────────────────────────────────────────
 
@@ -155,7 +164,7 @@ impl Slot {
 }
 
 struct ConnData {
-    /// Queue of request_ids in submission order.  The front entry is always the
+    /// Queue of `request_ids` in submission order.  The front entry is always the
     /// one currently being received.
     pending_ids: VecDeque<RequestId>,
     slot: Slot,
@@ -193,6 +202,7 @@ enum InternalFraming {
 struct CallerConn {
     fd: usize,
     recv_armed: bool,
+    errored: bool,
     send_buf: [u8; MAX_REQ_SIZE],
 }
 
@@ -205,6 +215,9 @@ pub struct Pool {
     next_conn_id: u32,
     response_rx: SpmcConsumer<ConnResult>,
     rearm_rx: mpsc::Consumer<RearmMsg>,
+    /// Rearms that could not be pushed because the SQ was full; retried at
+    /// the start of every `request()` call.
+    pending_rearms: VecDeque<RearmMsg>,
     next_request_id: u32,
     complete_thread: Option<JoinHandle<()>>,
 }
@@ -218,6 +231,8 @@ impl Drop for Pool {
 }
 
 impl Pool {
+    /// # Errors
+    /// Returns an error if the `io_uring` instance or provided-buffer ring cannot be set up.
     pub fn new() -> Result<Self, Error> {
         let mut ring = ququmatz::IoUring::builder(RING_ENTRIES)
             .build()
@@ -233,7 +248,7 @@ impl Pool {
         let (rearm_tx, rearm_rx) = MpscRingBuffer::<RearmMsg>::new(Capacity::exact(32)).split();
 
         let complete_thread = std::thread::spawn(move || {
-            complete_loop(completer, pbuf, response_tx, rearm_tx)
+            complete_loop(completer, pbuf, &response_tx, &rearm_tx);
         });
 
         Ok(Self {
@@ -243,23 +258,27 @@ impl Pool {
             next_conn_id: 0,
             response_rx,
             rearm_rx,
+            pending_rearms: VecDeque::new(),
             next_request_id: 1,
             complete_thread: Some(complete_thread),
         })
     }
 
+    /// # Errors
+    /// Returns an error if the URL is invalid, DNS resolution fails, or TCP connect fails.
     pub fn connect(&mut self, url: &[u8]) -> Result<ConnHandle, Error> {
         let url = Url::parse(url)?;
         let host_str = std::str::from_utf8(url.host)
             .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
         let addr = resolve(host_str, url.effective_port())?;
         let fd = blocking_connect(&addr)
-            .map_err(|_| Error::Connection("TCP connect failed".into()))?;
+            .map_err(|()| Error::Connection("TCP connect failed".into()))?;
 
         let conn_id = self.alloc_conn_id();
         self.conns.insert(conn_id, CallerConn {
             fd,
             recv_armed: false,
+            errored: false,
             send_buf: [0u8; MAX_REQ_SIZE],
         });
 
@@ -273,6 +292,9 @@ impl Pool {
         }
     }
 
+    /// # Errors
+    /// Returns an error if the connection is unknown, in an error state, the request is too
+    /// large, or the `io_uring` submission queue is full.
     pub fn request(
         &mut self,
         conn: ConnHandle,
@@ -284,6 +306,9 @@ impl Pool {
 
         let c = self.conns.get_mut(&conn.conn_id)
             .ok_or_else(|| Error::Connection("unknown conn_id".into()))?;
+        if c.errored {
+            return Err(Error::Connection("connection is in an error state; call disconnect".into()));
+        }
 
         let headers = [
             Header { name: HeaderName::Host, value: b"placeholder" },
@@ -314,19 +339,62 @@ impl Pool {
         self.sub.submit()
             .map_err(|e| Error::Connection(format!("submit: {e}")))?;
 
-        Ok(seq as RequestId)
+        Ok(RequestId::from(seq))
     }
 
+    /// # Errors
+    /// Returns an error if the connection is unknown, in an error state, or the submission queue is full.
     pub fn get(&mut self, conn: ConnHandle, path: &[u8]) -> Result<RequestId, Error> {
         self.request(conn, Method::Get, path, None)
     }
 
     pub fn poll(&mut self) -> Option<ConnResult> {
-        self.response_rx.pop()
+        let r = self.response_rx.pop()?;
+        self.mark_errored_if_needed(&r);
+        Some(r)
     }
 
+    /// # Panics
+    /// Panics if the complete thread has exited.
     pub fn recv(&mut self) -> ConnResult {
-        self.response_rx.pop_block().expect("complete thread exited")
+        let r = self.response_rx.pop_block().expect("complete thread exited");
+        self.mark_errored_if_needed(&r);
+        r
+    }
+
+    /// Returns `None` if no response arrives within `timeout`.
+    ///
+    /// A `Sqe::timeout` is submitted into the same ring so the complete thread
+    /// wakes up and pushes `ConnResult::Timeout` through the existing response
+    /// channel — no extra thread or channel needed.  If a real response arrives
+    /// first, the pending timeout SQE is cancelled with `timeout_remove`.
+    ///
+    /// # Panics
+    /// Panics if the complete thread has exited.
+    pub fn recv_timeout(&mut self, timeout: std::time::Duration) -> Option<ConnResult> {
+        let ts = Timespec::from_millis(
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        );
+        let tsqe = Sqe::timeout(&ts, 0, TimeoutFlags::default()).user_data(TIMEOUT_UD);
+        // If the SQ is full we can't submit the timeout — fall back to a
+        // non-blocking poll so we don't block forever.
+        if self.sub.push(tsqe).is_err() {
+            return self.poll();
+        }
+        let _ = self.sub.submit();
+
+        let r = self.response_rx.pop_block().expect("complete thread exited");
+        match r {
+            ConnResult::Timeout => None,
+            other => {
+                self.mark_errored_if_needed(&other);
+                // Cancel the pending timeout so it doesn't fire later.
+                let cancel = Sqe::timeout_remove(TIMEOUT_UD);
+                let _ = self.sub.push(cancel);
+                let _ = self.sub.submit();
+                Some(other)
+            }
+        }
     }
 
     pub fn recv_n(&mut self, mut n: usize, mut f: impl FnMut(ConnResult)) {
@@ -335,6 +403,13 @@ impl Pool {
             f(r);
             n -= 1;
         }
+    }
+
+    fn mark_errored_if_needed(&mut self, result: &ConnResult) {
+        if let ConnResult::Error { conn, .. } = result
+            && let Some(c) = self.conns.get_mut(&conn.conn_id) {
+                c.errored = true;
+            }
     }
 
     pub fn subscribe(&self) -> SpmcConsumer<ConnResult> {
@@ -354,18 +429,26 @@ impl Pool {
     }
 
     fn drain_rearms(&mut self) {
+        // Collect new rearm requests from the complete thread.
         while let Some(msg) = self.rearm_rx.pop() {
+            self.pending_rearms.push_back(msg);
+        }
+        // Flush pending rearms into the SQ.  Stop as soon as the SQ is full;
+        // the remainder stays in pending_rearms and is retried next call.
+        while let Some(msg) = self.pending_rearms.front() {
             let raw_fd = RawFd::from_raw(msg.fd);
             let recv = Sqe::recv_multishot(raw_fd, MsgFlags::default())
                 .buffer_select(PBUF_BGID)
                 .user_data(ud_recv(msg.fd, msg.conn_id));
-            // Best-effort: if the SQ is full here we'll miss the rearm and the
-            // connection will stall.  In practice the ring (256 entries) is far
-            // larger than the number of concurrent re-arms.
-            let _ = self.sub.push(recv);
+            if self.sub.push(recv).is_err() {
+                break; // SQ full — leave msg at the front, retry next time
+            }
+            let msg = self.pending_rearms.pop_front().unwrap();
             if let Some(c) = self.conns.get_mut(&msg.conn_id) {
                 c.recv_armed = true;
             }
+        }
+        if !self.pending_rearms.is_empty() {
             let _ = self.sub.submit();
         }
     }
@@ -376,8 +459,8 @@ impl Pool {
 fn complete_loop(
     mut cmp: Completer,
     mut pbuf: ProvidedBufferRing,
-    response_tx: SpmcProducer<ConnResult>,
-    rearm_tx: MpscProducer<RearmMsg>,
+    response_tx: &SpmcProducer<ConnResult>,
+    rearm_tx: &MpscProducer<RearmMsg>,
 ) {
     let mut conns: HashMap<u32, ConnData> = HashMap::new();
 
@@ -389,6 +472,12 @@ fn complete_loop(
                 return;
             }
 
+            if cqe.user_data == TIMEOUT_UD {
+                // Timeout fired before a response arrived; wake the caller.
+                let _ = response_tx.push_block(ConnResult::Timeout);
+                continue;
+            }
+
             // Send CQE: carries the request_id; enqueue it for the connection.
             if is_send_cqe(cqe.user_data) {
                 if cqe.result >= 0 {
@@ -398,7 +487,7 @@ fn complete_loop(
                         pending_ids: VecDeque::new(),
                         slot: Slot { head_accum: Vec::new(), partial: None },
                     });
-                    conn.pending_ids.push_back(seq as RequestId);
+                    conn.pending_ids.push_back(RequestId::from(seq));
                 }
                 // Send errors are ignored — the recv path will surface them.
                 continue;
@@ -416,6 +505,7 @@ fn complete_loop(
                 let request_id = conn.current_request_id();
                 let _ = response_tx.push_block(ConnResult::Error {
                     request_id,
+                    conn: ConnHandle { conn_id, fd },
                     errno: -cqe.result,
                 });
                 conn.slot.reset();
@@ -432,7 +522,7 @@ fn complete_loop(
                     pending_ids: VecDeque::new(),
                     slot: Slot { head_accum: Vec::new(), partial: None },
                 });
-                finish_until_close(conn, &response_tx);
+                finish_until_close(ConnHandle { conn_id, fd }, conn, response_tx);
                 continue;
             }
 
@@ -456,7 +546,7 @@ fn complete_loop(
             if let Some(resp) = process_recv_data(&mut conn.slot, data, request_id) {
                 conn.advance();
                 pbuf.recycle_and_commit(bid);
-                let _ = response_tx.push_block(ConnResult::Response(resp));
+                let _ = response_tx.push_block(ConnResult::Response(Box::new(resp)));
             } else if !more {
                 pbuf.recycle_and_commit(bid);
                 let _ = rearm_tx.push_block(RearmMsg { conn_id, fd });
@@ -469,25 +559,25 @@ fn complete_loop(
 
 /// Called when the socket reaches EOF.  If a `UntilClose` response is in
 /// progress, deliver it; otherwise emit an error.
-fn finish_until_close(conn: &mut ConnData, response_tx: &SpmcProducer<ConnResult>) {
+fn finish_until_close(conn_handle: ConnHandle, conn: &mut ConnData, response_tx: &SpmcProducer<ConnResult>) {
     let request_id = conn.current_request_id();
-    if let Some(ref mut partial) = conn.slot.partial {
-        if matches!(partial.framing, InternalFraming::UntilClose) {
-            partial.body_done = true;
-            let p = conn.slot.partial.take().unwrap();
-            let _ = response_tx.push_block(ConnResult::Response(Response {
-                request_id,
-                version: p.version,
-                status: p.status,
-                head: p.head,
-                body: p.body_buf,
-            }));
-            conn.advance();
-            return;
-        }
+    if let Some(ref mut partial) = conn.slot.partial
+        && matches!(partial.framing, InternalFraming::UntilClose)
+    {
+        partial.body_done = true;
+        let p = conn.slot.partial.take().unwrap();
+        let _ = response_tx.push_block(ConnResult::Response(Box::new(Response {
+            request_id,
+            version: p.version,
+            status: p.status,
+            head: p.head,
+            body: p.body_buf,
+        })));
+        conn.advance();
+        return;
     }
     // EOF without a completed response is an error.
-    let _ = response_tx.push_block(ConnResult::Error { request_id, errno: 0 });
+    let _ = response_tx.push_block(ConnResult::Error { request_id, conn: conn_handle, errno: 0 });
     conn.slot.reset();
     conn.pending_ids.pop_front();
 }
@@ -542,6 +632,7 @@ fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option
     };
 
     let body_capacity = match framing {
+        #[allow(clippy::cast_possible_truncation)] // capacity hint; truncation on 32-bit is harmless
         BodyFraming::ContentLength(n) => n as usize,
         _ => 0,
     };
@@ -586,9 +677,8 @@ fn pump_partial(resp: &mut PartialResponse, data: &[u8]) {
                 pos += consumed;
                 match result {
                     DecodeResult::Data(n) => resp.body_buf.extend_from_slice(&out[..n]),
-                    DecodeResult::Done => { resp.body_done = true; break; }
+                    DecodeResult::Done | DecodeResult::Error(_) => { resp.body_done = true; break; }
                     DecodeResult::NeedMore => break,
-                    DecodeResult::Error(_) => { resp.body_done = true; break; }
                 }
             }
         }
@@ -660,6 +750,145 @@ fn build_ranges(
 // ── libc shim ─────────────────────────────────────────────────────────────────
 
 fn libc_close(fd: usize) {
+    use std::os::unix::io::{FromRawFd, OwnedFd};
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let _ = unsafe { libc::close(fd as i32) };
+    // SAFETY: we have exclusive ownership of this fd at this point.
+    drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn keep_alive_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let resp = resp;
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = s.read(&mut buf).unwrap_or(0);
+                        if n == 0 { break; }
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n")
+                            && s.write_all(resp).is_err() { break; }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// Server that closes the connection immediately after accepting, before
+    /// sending any bytes.
+    fn drop_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream); // close immediately
+            }
+        });
+        port
+    }
+
+    /// Server that accepts but never writes anything.
+    fn silent_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            #[allow(clippy::collection_is_never_read)] // intentional: keep sockets alive
+            let mut conns: Vec<_> = Vec::new();
+            for stream in listener.incoming() {
+                conns.push(stream);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn test_happy_path() {
+        let port = keep_alive_server();
+        let mut pool = Pool::new().unwrap();
+        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        for _ in 0..3 {
+            pool.get(conn, b"/").unwrap();
+            match pool.recv() {
+                ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
+                other => panic!("unexpected: {}", match other {
+                    ConnResult::Error { errno, .. } => format!("error errno={errno}"),
+                    ConnResult::Timeout => "timeout".into(),
+                    ConnResult::Response(_) => unreachable!(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_closes_connection() {
+        let port = drop_server();
+        let mut pool = Pool::new().unwrap();
+        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        pool.get(conn, b"/").unwrap();
+        match pool.recv() {
+            ConnResult::Error { conn: err_conn, .. } => {
+                // The errored handle should match the one we used.
+                assert_eq!(err_conn.conn_id, conn.conn_id);
+                // Further requests on the dead connection must fail immediately.
+                let err = pool.get(conn, b"/").unwrap_err();
+                assert!(err.to_string().contains("error state"));
+            }
+            other => panic!("expected error, got: {}", match other {
+                ConnResult::Response(_) => "response",
+                ConnResult::Timeout => "timeout",
+                ConnResult::Error { .. } => unreachable!(),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_request_on_errored_conn_rejected() {
+        let port = drop_server();
+        let mut pool = Pool::new().unwrap();
+        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        pool.get(conn, b"/").unwrap();
+        // Drain the error to mark the connection as errored.
+        let _ = pool.recv();
+        // Now any subsequent request must return Err immediately.
+        let result = pool.get(conn, b"/");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("error state"));
+    }
+
+    #[test]
+    fn test_recv_timeout_fires() {
+        let port = silent_server();
+        let mut pool = Pool::new().unwrap();
+        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        pool.get(conn, b"/").unwrap();
+        let result = pool.recv_timeout(std::time::Duration::from_millis(200));
+        assert!(result.is_none(), "expected timeout, got a result");
+    }
+
+    #[test]
+    fn test_recv_timeout_succeeds_when_server_responds() {
+        let port = keep_alive_server();
+        let mut pool = Pool::new().unwrap();
+        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        pool.get(conn, b"/").unwrap();
+        let result = pool.recv_timeout(std::time::Duration::from_secs(5));
+        match result {
+            Some(ConnResult::Response(r)) => assert_eq!(&r.body, b"ok"),
+            Some(ConnResult::Error { errno, .. }) => panic!("error errno={errno}"),
+            Some(ConnResult::Timeout) => panic!("unexpected timeout variant"),
+            None => panic!("timed out unexpectedly"),
+        }
+    }
 }

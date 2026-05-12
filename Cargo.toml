@@ -2,8 +2,8 @@
 members = [
     "xibalba-proto",
     "xibalba-client",
+    "xibalba-iouring",
     "examples/tcp-rustls",
-    "examples/io-uring",
     "xibalba-benches",
 ]
 resolver = "2"

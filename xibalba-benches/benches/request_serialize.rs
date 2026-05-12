@@ -9,14 +9,14 @@ fn main() {
     divan::main();
 }
 
-fn small_headers() -> [Header<'static>; 2] {
+const fn small_headers() -> [Header<'static>; 2] {
     [
         Header { name: HeaderName::Host, value: b"example.com" },
         Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" },
     ]
 }
 
-fn large_headers() -> [Header<'static>; 10] {
+const fn large_headers() -> [Header<'static>; 10] {
     [
         Header { name: HeaderName::Host, value: b"api.example.com" },
         Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" },

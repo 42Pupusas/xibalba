@@ -578,8 +578,7 @@ mod tests {
             pos += consumed;
             match result {
                 DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
-                DecodeResult::Done => break,
-                DecodeResult::NeedMore => break,
+                DecodeResult::Done | DecodeResult::NeedMore => break,
                 DecodeResult::Error(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -595,7 +594,7 @@ mod tests {
         let mut output = [0u8; 64];
         let mut total = Vec::new();
 
-        for &byte in input.iter() {
+        for &byte in input {
             let one = [byte];
             let (result, _) = decoder.decode(&one, &mut output);
             match result {
@@ -636,8 +635,7 @@ mod tests {
             pos += consumed;
             match result {
                 DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
-                DecodeResult::Done => break,
-                DecodeResult::NeedMore => break,
+                DecodeResult::Done | DecodeResult::NeedMore => break,
                 DecodeResult::Error(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -674,8 +672,7 @@ mod tests {
             pos += consumed;
             match result {
                 DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
-                DecodeResult::Done => break,
-                DecodeResult::NeedMore => break,
+                DecodeResult::Done | DecodeResult::NeedMore => break,
                 DecodeResult::Error(e) => panic!("unexpected error: {e}"),
             }
         }

@@ -1,8 +1,7 @@
-mod driver;
-
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use driver::Pool;
+
+use xibalba_iouring::driver::{ConnResult, Pool};
 
 fn spawn_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -20,10 +19,7 @@ fn spawn_server() -> u16 {
                         let n = s.read(&mut buf).unwrap_or(0);
                         if n == 0 { break 'conn; }
                         acc.extend_from_slice(&buf[..n]);
-                        eprintln!("[server] read {n} bytes, acc len={}, data={:?}", acc.len(), String::from_utf8_lossy(&acc));
-                        if acc.windows(4).position(|w| w == b"\r\n\r\n").is_some() {
-                            break;
-                        }
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") { break; }
                     }
                     eprintln!("[server] sending response {req_num}");
                     if s.write_all(resp).is_err() { break; }
@@ -47,9 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("request {i}");
         pool.get(conn, b"/")?;
         let resp = match pool.recv() {
-            driver::ConnResult::Response(r) => r,
-            driver::ConnResult::Error { request_id, errno } =>
+            ConnResult::Response(r) => r,
+            ConnResult::Error { request_id, errno, .. } =>
                 panic!("request {request_id} failed: errno {errno}"),
+            ConnResult::Timeout => panic!("request timed out"),
         };
         eprintln!("response {i}: {} bytes, body={:?}", resp.body.len(), String::from_utf8_lossy(&resp.body));
     }

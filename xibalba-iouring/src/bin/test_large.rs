@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-use io_uring_driver::driver::Pool;
+use xibalba_iouring::driver::Pool;
 
 fn main() {
     const N: usize = 65536;
@@ -35,9 +35,10 @@ fn main() {
     for i in 0..5 {
         let id = pool.get(conn, b"/").unwrap_or_else(|e| panic!("iter {i}: get: {e}"));
         let resp = match pool.recv() {
-            io_uring_driver::driver::ConnResult::Response(r) => r,
-            io_uring_driver::driver::ConnResult::Error { request_id, errno } =>
+            xibalba_iouring::driver::ConnResult::Response(r) => r,
+            xibalba_iouring::driver::ConnResult::Error { request_id, errno, .. } =>
                 panic!("iter {i}: request {request_id} failed: errno {errno}"),
+            xibalba_iouring::driver::ConnResult::Timeout => panic!("iter {i}: timed out"),
         };
         assert_eq!(resp.request_id, id);
         assert_eq!(resp.body.len(), N, "iter {i}: wrong body length {}", resp.body.len());

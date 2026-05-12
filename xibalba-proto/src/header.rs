@@ -238,10 +238,8 @@ impl<'a> HeaderName<'a> {
                     return Self::Server;
                 }
             }
-            8 => {
-                if ascii_eq_ignore_case(bytes, b"Location") {
-                    return Self::Location;
-                }
+            8 if ascii_eq_ignore_case(bytes, b"Location") => {
+                return Self::Location;
             }
             10 => {
                 if ascii_eq_ignore_case(bytes, b"User-Agent") {
@@ -254,10 +252,8 @@ impl<'a> HeaderName<'a> {
                     return Self::SetCookie;
                 }
             }
-            12 => {
-                if ascii_eq_ignore_case(bytes, b"Content-Type") {
-                    return Self::ContentType;
-                }
+            12 if ascii_eq_ignore_case(bytes, b"Content-Type") => {
+                return Self::ContentType;
             }
             13 => {
                 if ascii_eq_ignore_case(bytes, b"Authorization") {
@@ -267,25 +263,17 @@ impl<'a> HeaderName<'a> {
                     return Self::CacheControl;
                 }
             }
-            14 => {
-                if ascii_eq_ignore_case(bytes, b"Content-Length") {
-                    return Self::ContentLength;
-                }
+            14 if ascii_eq_ignore_case(bytes, b"Content-Length") => {
+                return Self::ContentLength;
             }
-            15 => {
-                if ascii_eq_ignore_case(bytes, b"Accept-Encoding") {
-                    return Self::AcceptEncoding;
-                }
+            15 if ascii_eq_ignore_case(bytes, b"Accept-Encoding") => {
+                return Self::AcceptEncoding;
             }
-            16 => {
-                if ascii_eq_ignore_case(bytes, b"Content-Encoding") {
-                    return Self::ContentEncoding;
-                }
+            16 if ascii_eq_ignore_case(bytes, b"Content-Encoding") => {
+                return Self::ContentEncoding;
             }
-            17 => {
-                if ascii_eq_ignore_case(bytes, b"Transfer-Encoding") {
-                    return Self::TransferEncoding;
-                }
+            17 if ascii_eq_ignore_case(bytes, b"Transfer-Encoding") => {
+                return Self::TransferEncoding;
             }
             _ => {}
         }

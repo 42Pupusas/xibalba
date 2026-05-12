@@ -147,9 +147,7 @@ impl Read for BodyReader {
         let mut error: Option<std::io::Error> = None;
         let mut done = false;
 
-        loop {
-            // Block until at least one item is available.
-            let Some(first) = self.rx.pop_block() else { break };
+        while let Some(first) = self.rx.pop_block() {
             append_chunk(first, buf, &mut done, &mut error);
             if done || error.is_some() {
                 break;

@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use io_uring_driver::driver::Pool;
+use xibalba_iouring::driver::Pool;
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_proto::error::Error;
@@ -223,12 +223,13 @@ fn run_io_uring(response: Vec<u8>) {
     let conn = pool.connect(url.as_bytes()).unwrap();
 
     let t0 = std::time::Instant::now();
-    for i in 0..ITERATIONS {
+    for _i in 0..ITERATIONS {
         pool.get(conn, black_box(b"/")).unwrap();
         let resp = match pool.recv() {
-            io_uring_driver::driver::ConnResult::Response(r) => r,
-            io_uring_driver::driver::ConnResult::Error { errno, .. } =>
+            xibalba_iouring::driver::ConnResult::Response(r) => r,
+            xibalba_iouring::driver::ConnResult::Error { errno, .. } =>
                 panic!("io_uring error: errno {errno}"),
+            xibalba_iouring::driver::ConnResult::Timeout => panic!("unexpected timeout"),
         };
         black_box(&resp.body);
     }

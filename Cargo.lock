@@ -337,16 +337,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-uring"
-version = "0.1.0"
-dependencies = [
- "libc",
- "quetzalcoatl",
- "ququmatz",
- "xibalba-proto",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -900,10 +890,10 @@ dependencies = [
  "divan",
  "http",
  "httparse",
- "io-uring",
  "ureq",
  "url",
  "xibalba-client",
+ "xibalba-iouring",
  "xibalba-proto",
 ]
 
@@ -912,6 +902,15 @@ name = "xibalba-client"
 version = "0.1.0"
 dependencies = [
  "quetzalcoatl",
+ "xibalba-proto",
+]
+
+[[package]]
+name = "xibalba-iouring"
+version = "0.1.0"
+dependencies = [
+ "quetzalcoatl",
+ "ququmatz",
  "xibalba-proto",
 ]
 

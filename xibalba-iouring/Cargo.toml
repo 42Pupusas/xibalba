@@ -1,0 +1,21 @@
+[package]
+name = "xibalba-iouring"
+version = "0.1.0"
+edition = "2024"
+description = "io_uring-backed HTTP/1.1 connection pool for xibalba"
+
+[dependencies]
+xibalba-proto = { path = "../xibalba-proto" }
+ququmatz = { path = "../../ququmatz" }
+quetzalcoatl = { path = "../../quetzalcoatl" }
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "test-large"
+path = "src/bin/test_large.rs"
+
+[lints]
+workspace = true

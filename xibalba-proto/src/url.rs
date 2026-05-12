@@ -338,8 +338,7 @@ mod tests {
     #[test]
     fn query_params_none_when_no_query() {
         let url = Url::parse(b"http://x.com/path").unwrap();
-        let params: Vec<_> = url.query_params().collect();
-        assert!(params.is_empty());
+        assert!(url.query_params().next().is_none());
     }
 
     #[test]

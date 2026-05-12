@@ -3,7 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use io_uring_driver::driver::{ConnHandle, ConnResult, Pool};
+use xibalba_iouring::driver::{ConnHandle, ConnResult, Pool};
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_proto::error::Error;
@@ -475,6 +475,7 @@ mod stress {
 
 const CONNS: usize = 4;
 const REQS_PER_CONN: usize = 250;
+#[allow(dead_code)]
 const TOTAL_REQS: usize = CONNS * REQS_PER_CONN;
 
 mod concurrent {
@@ -524,9 +525,9 @@ mod concurrent {
                 let agent = ureq_agent();
                 std::thread::spawn(move || {
                     for _ in 0..REQS_PER_CONN {
-                        let _body = agent.get(black_box(&url)).call().unwrap()
+                        let body = agent.get(black_box(&url)).call().unwrap()
                             .body_mut().read_to_string().unwrap();
-                        black_box(&_body);
+                        black_box(&body);
                     }
                 })
             }).collect();
