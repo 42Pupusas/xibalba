@@ -1,5 +1,5 @@
 fn main() {
-    let client = xibalba::client::Client::new();
+    let client = xibalba::client::Client::new().unwrap();
     let mut response = client.get(b"https://httpbin.org/get").unwrap();
     println!("Status: {}", response.status);
     println!("Headers:");

@@ -6,21 +6,21 @@ use std::time::Duration;
 
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::spsc::RingBuffer;
-use rustls::ClientConfig;
+
+use xibalba_proto::error::{Error, IoError};
+use xibalba_proto::header::{Header, HeaderName};
+use xibalba_proto::method::Method;
+use xibalba_proto::request::Request;
+use xibalba_proto::response::{determine_body_framing, parse_response_head};
+use xibalba_proto::status::StatusCode;
+use xibalba_proto::url::Url;
+use xibalba_proto::version::Version;
 
 use crate::body::{BodyReader, IoBlock, reader_thread};
-use crate::connection::connect;
-use crate::error::{Error, IoError};
-use crate::header::{Header, HeaderName};
-use crate::method::Method;
-use crate::request::Request;
-use crate::response::{determine_body_framing, parse_response_head};
-use crate::status::StatusCode;
-use crate::url::Url;
-use crate::version::Version;
+use crate::connector::{Connector, SetReadTimeout};
 
-pub struct Client {
-    tls_config: Arc<ClientConfig>,
+pub struct Client<C: Connector> {
+    tls_config: C::TlsConfig,
 }
 
 pub struct Response {
@@ -32,30 +32,9 @@ pub struct Response {
     stop: Arc<AtomicBool>,
 }
 
-impl Client {
-    /// Create a new client.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Tls` if the TLS configuration cannot be built (e.g. the
-    /// selected crypto provider does not support the required protocol versions).
-    pub fn new() -> Result<Self, crate::error::Error> {
-        let provider = crypto_provider();
-
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let config = ClientConfig::builder_with_provider(Arc::new(provider))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| crate::error::TlsError {
-                message: e.to_string(),
-            })?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        Ok(Self {
-            tls_config: Arc::new(config),
-        })
+impl<C: Connector> Client<C> {
+    pub const fn new(tls_config: C::TlsConfig) -> Self {
+        Self { tls_config }
     }
 
     /// Send a request to the given URL.
@@ -65,7 +44,7 @@ impl Client {
     /// Returns `Error` on connection failure, I/O errors, or malformed responses.
     pub fn request(&self, method: Method, url_bytes: &[u8]) -> Result<Response, Error> {
         let url = Url::parse(url_bytes)?;
-        let mut stream = connect(&url, &self.tls_config)?;
+        let mut stream = C::connect(&url, &self.tls_config)?;
 
         let host_str = std::str::from_utf8(url.host)
             .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
@@ -101,13 +80,10 @@ impl Client {
         req.serialize_to_writer(&mut stream).map_err(Error::from)?;
         stream.flush().map_err(Error::from)?;
 
-        // Set read timeout only after the request (and TLS handshake) is complete.
-        // The reader thread needs this so it can periodically check the stop flag.
         stream
             .set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(Error::from)?;
 
-        // Create ring buffer
         let (producer, mut ringbuf_rx) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -119,7 +95,6 @@ impl Client {
             reader_thread(stream, &producer, &stop_for_thread, &error_for_thread);
         });
 
-        // Accumulate data until we find \r\n\r\n
         let mut head_buf = Vec::with_capacity(4096);
         let head_end = loop {
             if let Some(pos) = find_header_end(&head_buf) {
@@ -145,7 +120,6 @@ impl Client {
             }
         };
 
-        // Parse response head
         let mut resp_headers = vec![Header::empty(); 64];
         let (head, head_len) = parse_response_head(&head_buf[..head_end + 4], &mut resp_headers)?;
 
@@ -153,15 +127,12 @@ impl Client {
         let framing =
             determine_body_framing(head.status, is_head, &resp_headers, head.header_count);
 
-        // Owned headers
         let owned_headers: Vec<(Vec<u8>, Vec<u8>)> = resp_headers[..head.header_count]
             .iter()
             .map(|h| (h.name.as_bytes().to_vec(), h.value.to_vec()))
             .collect();
 
-        // Leftover bytes after the head
         let leftover = head_buf[head_len..].to_vec();
-
         let body = BodyReader::new(ringbuf_rx, framing, leftover, error, Arc::clone(&stop));
 
         Ok(Response {
@@ -217,14 +188,4 @@ impl Drop for Response {
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-#[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-fn crypto_provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::ring::default_provider()
-}
-
-#[cfg(feature = "aws-lc-rs")]
-fn crypto_provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::aws_lc_rs::default_provider()
 }

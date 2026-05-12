@@ -1,0 +1,17 @@
+[package]
+name = "tcp-rustls"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "tcp-rustls"
+path = "src/main.rs"
+
+[dependencies]
+xibalba-client = { path = "../../xibalba-client" }
+xibalba-proto = { path = "../../xibalba-proto" }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "1"
+
+[lints]
+workspace = true

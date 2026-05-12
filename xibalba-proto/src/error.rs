@@ -170,14 +170,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<rustls::Error> for Error {
-    fn from(e: rustls::Error) -> Self {
-        Self::Tls(TlsError {
-            message: e.to_string(),
-        })
-    }
-}
-
 impl std::error::Error for IoError {}
 impl std::error::Error for TlsError {}
 impl std::error::Error for UrlError {}

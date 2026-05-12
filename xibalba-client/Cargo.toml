@@ -1,0 +1,11 @@
+[package]
+name = "xibalba-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xibalba-proto = { path = "../xibalba-proto" }
+quetzalcoatl = { path = "../../quetzalcoatl" }
+
+[lints]
+workspace = true

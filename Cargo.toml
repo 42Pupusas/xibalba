@@ -1,14 +1,13 @@
-[package]
-name = "xibalba"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "xibalba-proto",
+    "xibalba-client",
+    "examples/tcp-rustls",
+]
+resolver = "2"
 
-[features]
-default = ["ring"]
-ring = ["rustls/ring"]
-aws-lc-rs = ["rustls/aws_lc_rs"]
-
-[dependencies]
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-webpki-roots = "0.26"
-quetzalcoatl = { path = "../quetzalcoatl" }
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
