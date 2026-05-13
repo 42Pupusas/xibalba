@@ -285,7 +285,7 @@ mod small {
             let mut body = Vec::new();
             resp.body.read_to_end(&mut body).unwrap();
             black_box(&body);
-            client.reclaim(resp);
+            drop(resp);
         });
     }
 
@@ -333,7 +333,7 @@ mod large_resp {
             let mut body = Vec::new();
             resp.body.read_to_end(&mut body).unwrap();
             black_box(&body);
-            client.reclaim(resp);
+            drop(resp);
         });
     }
 
@@ -383,7 +383,7 @@ mod large_req {
             let mut body = Vec::new();
             resp.body.read_to_end(&mut body).unwrap();
             black_box(&body);
-            client.reclaim(resp);
+            drop(resp);
         });
     }
 
@@ -433,7 +433,7 @@ mod stress {
                 let mut body = Vec::new();
                 resp.body.read_to_end(&mut body).unwrap();
                 black_box(&body);
-                client.reclaim(resp);
+                drop(resp);
             }
         });
     }

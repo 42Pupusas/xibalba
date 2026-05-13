@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 xibalba-proto = { path = "../xibalba-proto" }
-quetzalcoatl = { path = "../../quetzalcoatl" }
 
 [lints]
 workspace = true

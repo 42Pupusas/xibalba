@@ -14,12 +14,6 @@ use xibalba_proto::error::Error;
 use xibalba_proto::method::Method;
 use xibalba_proto::url::Url;
 
-// ── Scenarios ─────────────────────────────────────────────────────────────────
-//
-// "small"  – 13-byte body, Content-Length framing (no allocations on the hot path ideally)
-// "medium" – 1 KiB body, Content-Length
-// "large"  – 64 KiB body, chunked transfer-encoding
-
 const ITERATIONS: usize = 10_000;
 
 const SMALL_RESP: &[u8] =
@@ -124,7 +118,7 @@ fn spawn_server(response: Vec<u8>) -> u16 {
 
 // ── Run helpers ───────────────────────────────────────────────────────────────
 
-fn run(response: Vec<u8>) {
+fn run_blocking(response: Vec<u8>) {
     let port = spawn_server(response);
     let url = format!("http://127.0.0.1:{port}/");
     let mut client = Client::<PlainConnector>::connect(url.as_bytes(), ()).unwrap();
@@ -135,7 +129,6 @@ fn run(response: Vec<u8>) {
     let t0 = std::time::Instant::now();
     for _ in 0..ITERATIONS {
         let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
-        // Pre-size from Content-Length to avoid read_to_end probe reallocs.
         let content_length: usize = resp
             .headers()
             .find(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
@@ -145,71 +138,11 @@ fn run(response: Vec<u8>) {
         let mut body = Vec::with_capacity(content_length);
         resp.body.read_to_end(&mut body).unwrap();
         black_box(&body);
-        client.reclaim(resp);
     }
     let elapsed = t0.elapsed();
     #[allow(clippy::cast_precision_loss)]
     let us_per_iter = elapsed.as_secs_f64() * 1e6 / ITERATIONS as f64;
     println!("blocking:  {ITERATIONS} iters in {elapsed:.2?}  ({us_per_iter:.1} µs/iter)");
-}
-
-/// Like `run` but uses `send_request` + optional sleep + `poll_response` loop.
-///
-/// Set `POLL_DELAY_US` to inject a sleep between send and poll (in microseconds).
-/// Prints per-iteration timing and total poll-spin count so we can compare
-/// against the always-spinning `request()` path.
-fn run_decoupled(response: Vec<u8>) {
-    let delay = std::env::var("POLL_DELAY_US")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(std::time::Duration::from_micros);
-
-    let port = spawn_server(response);
-    let url = format!("http://127.0.0.1:{port}/");
-    let mut client = Client::<PlainConnector>::connect(url.as_bytes(), ()).unwrap();
-
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
-    let mut total_polls: u64 = 0;
-    let t0 = std::time::Instant::now();
-
-    for _ in 0..ITERATIONS {
-        client.send_request(black_box(Method::Get), b"/", None).unwrap();
-
-        if let Some(d) = delay {
-            std::thread::sleep(d);
-        }
-
-        let mut resp = loop {
-            total_polls += 1;
-            match client.poll_response().unwrap() {
-                Some(r) => break r,
-                None => std::hint::spin_loop(),
-            }
-        };
-
-        let content_length: usize = resp
-            .headers()
-            .find(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))
-            .and_then(|(_, v)| std::str::from_utf8(v).ok())
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let mut body = Vec::with_capacity(content_length);
-        resp.body.read_to_end(&mut body).unwrap();
-        black_box(&body);
-        client.reclaim(resp);
-    }
-
-    let elapsed = t0.elapsed();
-    #[allow(clippy::cast_precision_loss)]
-    let (us_per_iter, avg_polls) = (
-        elapsed.as_secs_f64() * 1e6 / ITERATIONS as f64,
-        total_polls as f64 / ITERATIONS as f64,
-    );
-    println!(
-        "decoupled: {ITERATIONS} iters in {elapsed:.2?}  ({us_per_iter:.1} µs/iter)  polls={total_polls}  avg={avg_polls:.1} polls/req",
-    );
 }
 
 fn run_io_uring(response: Vec<u8>) {
@@ -255,11 +188,10 @@ fn main() {
     };
 
     match mode.as_str() {
-        "blocking"  => run(response),
-        "decoupled" => run_decoupled(response),
+        "blocking"  => run_blocking(response),
         "uring"     => run_io_uring(response),
         other => {
-            eprintln!("unknown mode: {other}. use: blocking | decoupled | uring");
+            eprintln!("unknown mode: {other}. use: blocking | uring");
             std::process::exit(1);
         }
     }
