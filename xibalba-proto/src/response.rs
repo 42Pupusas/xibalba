@@ -356,8 +356,53 @@ const fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-fn find_crlf(buf: &[u8]) -> Option<usize> {
+pub const MAX_HEADERS: usize = 64;
+
+#[must_use]
+pub fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Compute `(name_start, name_len, val_start, val_len)` byte-offset tuples for
+/// each parsed header against the raw `src` buffer.
+///
+/// # Errors
+///
+/// Returns `Error::Connection` if a header name cannot be located in `src` or
+/// if any offset or length overflows `u16`.
+pub fn build_ranges(
+    headers: &[Header<'_>],
+    src: &[u8],
+) -> Result<[(u16, u16, u16, u16); MAX_HEADERS], Error> {
+    let src_base = src.as_ptr() as usize;
+    let src_end = src_base + src.len();
+    let mut ranges = [(0u16, 0u16, 0u16, 0u16); MAX_HEADERS];
+    for (i, h) in headers.iter().enumerate() {
+        let name = h.name.as_bytes();
+        let value = h.value;
+        let vs_off = value.as_ptr() as usize - src_base;
+        let name_ptr = name.as_ptr() as usize;
+        let ns_off = if name_ptr >= src_base && name_ptr < src_end {
+            name_ptr - src_base
+        } else {
+            find_subsequence(src, name)
+                .ok_or_else(|| Error::Connection("header name not in head buffer".into()))?
+        };
+        ranges[i] = (
+            u16::try_from(ns_off).map_err(|_| Error::Connection("ns_off overflows u16".into()))?,
+            u16::try_from(name.len()).map_err(|_| Error::Connection("name len overflows u16".into()))?,
+            u16::try_from(vs_off).map_err(|_| Error::Connection("vs_off overflows u16".into()))?,
+            u16::try_from(value.len()).map_err(|_| Error::Connection("val len overflows u16".into()))?,
+        );
+    }
+    Ok(ranges)
 }
 
 /// Single-pass header line parser.

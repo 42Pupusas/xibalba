@@ -35,7 +35,8 @@ use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
 use xibalba_proto::response::{
-    BodyFraming, ChunkedDecoder, DecodeResult, determine_body_framing, parse_response_head,
+    BodyFraming, ChunkedDecoder, DecodeResult, build_ranges, determine_body_framing,
+    parse_response_head,
 };
 use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
@@ -49,17 +50,6 @@ const BLOCK_SIZE: usize = 8192;
 const SHUTDOWN_UD: u64 = u64::MAX;
 // Second-highest value — cannot collide with recv (bit63=0), send (bit63=1 and not MAX), or SHUTDOWN.
 const TIMEOUT_UD: u64 = u64::MAX - 1;
-
-// ── user_data helpers ─────────────────────────────────────────────────────────
-
-// Upper 32 bits: fd, lower 32 bits: conn_id.
-#[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
-const fn ud_recv(fd: usize, conn_id: u32) -> u64 {
-    (fd as u64) << 32 | (conn_id as u64 & 0xffff_ffff)
-}
-
-const fn ud_fd(ud: u64) -> usize { (ud >> 32) as usize }
-const fn ud_conn_id(ud: u64) -> u32 { (ud & 0xffff_ffff) as u32 }
 
 // ── public types ──────────────────────────────────────────────────────────────
 
@@ -130,13 +120,48 @@ pub enum ConnResult {
 
 const SEND_UD_FLAG: u64 = 1 << 63;
 
-const fn ud_send(conn_id: u32, seq: u32) -> u64 {
+#[derive(Clone, Copy)]
+struct UserData(u64);
+
+impl UserData {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+    const fn recv(fd: usize, conn_id: u32) -> Self {
+        Self((fd as u64) << 32 | (conn_id as u64 & 0xffff_ffff))
+    }
+
     #[allow(clippy::cast_lossless)]
-    { SEND_UD_FLAG | (conn_id as u64) << 32 | seq as u64 }
+    const fn send(conn_id: u32, seq: u32) -> Self {
+        Self(SEND_UD_FLAG | (conn_id as u64) << 32 | seq as u64)
+    }
+
+    const fn is_send(self) -> bool {
+        self.0 & SEND_UD_FLAG != 0 && self.0 != SHUTDOWN_UD
+    }
+
+    const fn fd(self) -> usize {
+        (self.0 >> 32) as usize
+    }
+
+    const fn conn_id(self) -> u32 {
+        (self.0 & 0xffff_ffff) as u32
+    }
+
+    const fn send_conn_id(self) -> u32 {
+        ((self.0 >> 32) & 0x7fff_ffff) as u32
+    }
+
+    const fn send_seq(self) -> u32 {
+        (self.0 & 0xffff_ffff) as u32
+    }
 }
-const fn is_send_cqe(ud: u64) -> bool { ud & SEND_UD_FLAG != 0 && ud != SHUTDOWN_UD }
-const fn ud_send_conn_id(ud: u64) -> u32 { ((ud >> 32) & 0x7fff_ffff) as u32 }
-const fn ud_send_seq(ud: u64) -> u32 { (ud & 0xffff_ffff) as u32 }
+
+impl From<UserData> for u64 {
+    fn from(ud: UserData) -> Self { ud.0 }
+}
+
+impl From<u64> for UserData {
+    fn from(v: u64) -> Self { Self(v) }
+}
 
 // ── inter-thread messages ─────────────────────────────────────────────────────
 
@@ -149,25 +174,72 @@ struct RearmMsg {
 
 // ── per-connection state (complete thread) ────────────────────────────────────
 
-struct Slot {
+struct ResponseParser {
     head_accum: Vec<u8>,
     partial: Option<PartialResponse>,
 }
 
-impl Slot {
-    fn reset(&mut self) {
+impl ResponseParser {
+    const fn new() -> Self {
+        Self { head_accum: Vec::new(), partial: None }
+    }
+
+    fn clear(&mut self) {
         self.head_accum.clear();
         self.partial = None;
+    }
+
+    /// Feed data and attempt to complete a response. Returns the complete
+    /// response when one arrives, None when more data is needed.
+    fn feed(&mut self, data: &[u8], request_id: RequestId) -> Option<Response> {
+        if let Some(ref mut partial) = self.partial {
+            if !data.is_empty() {
+                pump_partial(partial, data);
+            }
+            if partial.body_done {
+                let p = self.partial.take().unwrap();
+                self.head_accum.clear();
+                return Some(Response {
+                    request_id,
+                    version: p.version,
+                    status: p.status,
+                    head: p.head,
+                    body: p.body_buf,
+                });
+            }
+            return None;
+        }
+
+        self.head_accum.extend_from_slice(data);
+        parse_head_and_maybe_finish(self, request_id).map(|(resp, _)| resp)
     }
 }
 
 struct ConnData {
     /// Queue of `request_ids` in submission order, populated by send CQEs.
     pending_ids: VecDeque<RequestId>,
-    slot: Slot,
+    parser: ResponseParser,
     /// Raw bytes received before the matching send CQE arrived.
     /// Held here and parsed once `pending_ids` is populated.
     recv_buf: Vec<u8>,
+}
+
+impl ConnData {
+    const fn new() -> Self {
+        Self {
+            pending_ids: VecDeque::new(),
+            parser: ResponseParser::new(),
+            recv_buf: Vec::new(),
+        }
+    }
+
+    fn push_recv_data(&mut self, data: &[u8]) {
+        self.recv_buf.extend_from_slice(data);
+    }
+
+    fn pop_pending_id(&mut self) -> Option<RequestId> {
+        self.pending_ids.pop_front()
+    }
 }
 
 
@@ -363,14 +435,14 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
 
         let raw_fd = RawFd::from_raw(c.fd);
         let send = Sqe::send(raw_fd, &c.send_buf[..len], MsgFlags::default())
-            .user_data(ud_send(conn.conn_id, seq));
+            .user_data(UserData::send(conn.conn_id, seq).into());
         self.sub.push(send)
             .map_err(|e| Error::Connection(format!("SQ full (send): {e}")))?;
 
         if !c.recv_armed {
             let recv = Sqe::recv_multishot(raw_fd, MsgFlags::default())
                 .buffer_select(PBUF_BGID)
-                .user_data(ud_recv(c.fd, conn.conn_id));
+                .user_data(UserData::recv(c.fd, conn.conn_id).into());
             self.sub.push(recv)
                 .map_err(|e| Error::Connection(format!("SQ full (recv): {e}")))?;
             c.recv_armed = true;
@@ -520,7 +592,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             let raw_fd = RawFd::from_raw(msg.fd);
             let recv = Sqe::recv_multishot(raw_fd, MsgFlags::default())
                 .buffer_select(PBUF_BGID)
-                .user_data(ud_recv(msg.fd, msg.conn_id));
+                .user_data(UserData::recv(msg.fd, msg.conn_id).into());
             if self.sub.push(recv).is_err() {
                 break; // SQ full — leave msg at the front, retry next time
             }
@@ -560,15 +632,12 @@ fn complete_loop(
             }
 
             // Send CQE: carries the request_id; enqueue it for the connection.
-            if is_send_cqe(cqe.user_data) {
+            if UserData::from(cqe.user_data).is_send() {
                 if cqe.result >= 0 {
-                    let conn_id = ud_send_conn_id(cqe.user_data);
-                    let seq = ud_send_seq(cqe.user_data);
-                    let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
-                        pending_ids: VecDeque::new(),
-                        slot: Slot { head_accum: Vec::new(), partial: None },
-                        recv_buf: Vec::new(),
-                    });
+                    let ud = UserData::from(cqe.user_data);
+                    let conn_id = ud.send_conn_id();
+                    let seq = ud.send_seq();
+                    let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
                     conn.pending_ids.push_back(RequestId::from(seq));
                     // Drain any bytes that arrived before this send CQE.
                     // fd is not available in the send CQE branch (different ud encoding);
@@ -582,18 +651,15 @@ fn complete_loop(
                 continue;
             }
 
-            let conn_id = ud_conn_id(cqe.user_data);
-            let fd = ud_fd(cqe.user_data);
+            let ud = UserData::from(cqe.user_data);
+            let conn_id = ud.conn_id();
+            let fd = ud.fd();
 
             // Negative result → I/O error; zero with no buffer → EOF (UntilClose).
             if cqe.result < 0 {
-                let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
-                    pending_ids: VecDeque::new(),
-                    slot: Slot { head_accum: Vec::new(), partial: None },
-                    recv_buf: Vec::new(),
-                });
-                let request_id = conn.pending_ids.pop_front().unwrap_or(0);
-                conn.slot.reset();
+                let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
+                let request_id = conn.pop_pending_id().unwrap_or(0);
+                conn.parser.clear();
                 conn.recv_buf.clear();
                 let _ = response_tx.push_block(ConnResult::Error {
                     request_id,
@@ -608,11 +674,7 @@ fn complete_loop(
 
             // result == 0 with no buffer_id means EOF on the socket.
             if n == 0 && cqe.buffer_id().is_none() {
-                let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
-                    pending_ids: VecDeque::new(),
-                    slot: Slot { head_accum: Vec::new(), partial: None },
-                    recv_buf: Vec::new(),
-                });
+                let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
                 finish_until_close(ConnHandle { conn_id, fd }, conn, response_tx);
                 continue;
             }
@@ -626,17 +688,13 @@ fn complete_loop(
                 None => continue,
             };
 
-            let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
-                pending_ids: VecDeque::new(),
-                slot: Slot { head_accum: Vec::new(), partial: None },
-                recv_buf: Vec::new(),
-            });
+            let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
 
             let more = cqe.flags.contains(ququmatz::types::CqeFlags::MORE);
 
             if conn.pending_ids.is_empty() {
                 // Send CQE hasn't arrived yet — buffer raw bytes until it does.
-                conn.recv_buf.extend_from_slice(data);
+                conn.push_recv_data(data);
             } else {
                 let data_owned = data.to_vec();
                 pbuf.recycle_and_commit(bid);
@@ -654,7 +712,7 @@ fn complete_loop(
     }
 }
 
-/// Parse `data` into `conn.slot`, delivering completed responses immediately.
+/// Feed `data` into `conn.parser`, delivering completed responses immediately.
 /// Called only when `conn.pending_ids` is non-empty.
 fn drain_recv_buf(conn: &mut ConnData, data: &[u8], response_tx: &SpmcProducer<ConnResult>) {
     // First call feeds `data`; subsequent calls pass &[] to continue parsing
@@ -664,12 +722,12 @@ fn drain_recv_buf(conn: &mut ConnData, data: &[u8], response_tx: &SpmcProducer<C
         let request_id = conn.pending_ids.front().copied().unwrap_or(0);
         let feed = if first { data } else { &[] };
         first = false;
-        match process_recv_data(&mut conn.slot, feed, request_id) {
-            (Some(resp), _) => {
+        match conn.parser.feed(feed, request_id) {
+            Some(resp) => {
                 conn.pending_ids.pop_front();
                 let _ = response_tx.push_block(ConnResult::Response(Box::new(resp)));
             }
-            (None, _) => break,
+            None => break,
         }
     }
 }
@@ -677,13 +735,13 @@ fn drain_recv_buf(conn: &mut ConnData, data: &[u8], response_tx: &SpmcProducer<C
 /// Called when the socket reaches EOF.  If a `UntilClose` response is in
 /// progress, deliver it; otherwise emit an error.
 fn finish_until_close(conn_handle: ConnHandle, conn: &mut ConnData, response_tx: &SpmcProducer<ConnResult>) {
-    if let Some(ref mut partial) = conn.slot.partial
+    if let Some(ref mut partial) = conn.parser.partial
         && matches!(partial.framing, InternalFraming::UntilClose)
     {
         partial.body_done = true;
-        let p = conn.slot.partial.take().unwrap();
-        let request_id = conn.pending_ids.pop_front().unwrap_or(0);
-        conn.slot.reset();
+        let p = conn.parser.partial.take().unwrap();
+        let request_id = conn.pop_pending_id().unwrap_or(0);
+        conn.parser.clear();
         conn.recv_buf.clear();
         let _ = response_tx.push_block(ConnResult::Response(Box::new(Response {
             request_id, version: p.version, status: p.status, head: p.head, body: p.body_buf,
@@ -691,57 +749,29 @@ fn finish_until_close(conn_handle: ConnHandle, conn: &mut ConnData, response_tx:
         return;
     }
     // EOF without a completed response is an error.
-    let request_id = conn.pending_ids.pop_front().unwrap_or(0);
-    conn.slot.reset();
+    let request_id = conn.pop_pending_id().unwrap_or(0);
+    conn.parser.clear();
     conn.recv_buf.clear();
     let _ = response_tx.push_block(ConnResult::Error { request_id, conn: conn_handle, errno: 0 });
 }
 
 // ── CQE data processing ───────────────────────────────────────────────────────
 
-/// Returns `(Some(response), bytes_consumed_from_data)` when a complete
-/// response is parsed, or `(None, 0)` when more data is needed.
-fn process_recv_data(slot: &mut Slot, data: &[u8], request_id: RequestId) -> (Option<Response>, usize) {
-    if let Some(ref mut partial) = slot.partial {
-        let consumed = if data.is_empty() { 0 } else {
-            pump_partial(partial, data)
-        };
-        if partial.body_done {
-            let p = slot.partial.take().unwrap();
-            slot.head_accum.clear();
-            return (Some(Response {
-                request_id,
-                version: p.version,
-                status: p.status,
-                head: p.head,
-                body: p.body_buf,
-            }), consumed);
-        }
-        return (None, 0);
-    }
-
-    slot.head_accum.extend_from_slice(data);
-    match parse_head_and_maybe_finish(slot, request_id) {
-        Some((resp, _)) => (Some(resp), data.len()),
-        None => (None, 0),
-    }
-}
-
-fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option<(Response, usize)> {
-    let head_end = slot.head_accum.windows(4).position(|w| w == b"\r\n\r\n")?;
+fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestId) -> Option<(Response, usize)> {
+    let head_end = parser.head_accum.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head_bytes_len = head_end + 4;
 
     let mut hdr_buf = [const { xibalba_proto::header::Header::empty() }; MAX_HEADERS];
     let (head, consumed) =
-        parse_response_head(&slot.head_accum[..head_bytes_len], &mut hdr_buf).ok()?;
+        parse_response_head(&parser.head_accum[..head_bytes_len], &mut hdr_buf).ok()?;
 
     let framing = determine_body_framing(
         head.status, false, &hdr_buf[..head.header_count], head.header_count,
     );
     let ranges =
-        build_ranges(&hdr_buf[..head.header_count], &slot.head_accum[..head_bytes_len]).ok()?;
+        build_ranges(&hdr_buf[..head.header_count], &parser.head_accum[..head_bytes_len]).ok()?;
     let (version, status, header_count) = (head.version, head.status, head.header_count);
-    let head_buf = slot.head_accum[..head_bytes_len].to_vec();
+    let head_buf = parser.head_accum[..head_bytes_len].to_vec();
 
     let head_data = HeadData { head_buf, ranges, header_count };
 
@@ -762,7 +792,7 @@ fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option
         body_buf: Vec::with_capacity(body_capacity), body_done, framing: internal_framing,
     };
 
-    let after_head = &slot.head_accum[consumed..];
+    let after_head = &parser.head_accum[consumed..];
     let body_consumed = if !after_head.is_empty() && !body_done {
         pump_partial(&mut partial, after_head)
     } else {
@@ -772,9 +802,9 @@ fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option
     if partial.body_done {
         let total_consumed = consumed + body_consumed;
         // Preserve bytes after the complete response for the next parse.
-        let leftover = slot.head_accum[total_consumed..].to_vec();
-        slot.head_accum = leftover;
-        slot.partial = None;
+        let leftover = parser.head_accum[total_consumed..].to_vec();
+        parser.head_accum = leftover;
+        parser.partial = None;
         Some((Response {
             request_id,
             version: partial.version,
@@ -784,8 +814,8 @@ fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option
         }, body_consumed))
     } else {
         // Trim consumed head bytes from head_accum; body bytes stay in partial.
-        slot.head_accum = slot.head_accum[consumed..].to_vec();
-        slot.partial = Some(partial);
+        parser.head_accum = parser.head_accum[consumed..].to_vec();
+        parser.partial = Some(partial);
         None
     }
 }
@@ -830,21 +860,9 @@ fn pump_partial(resp: &mut PartialResponse, data: &[u8]) -> usize {
 
 // ── blocking connect ──────────────────────────────────────────────────────────
 
-fn blocking_connect(addr: &SockAddrIn) -> Result<usize, ()> {
+fn blocking_connect(addr: std::net::SocketAddr) -> Result<usize, ()> {
     use std::os::unix::io::IntoRawFd;
-    let stream = std::net::TcpStream::connect(std::net::SocketAddrV4::new(
-        std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr)),
-        u16::from_be(addr.sin_port),
-    ))
-    .map_err(|_| ())?;
-    stream.set_nodelay(true).ok();
-    #[allow(clippy::cast_sign_loss)]
-    Ok(stream.into_raw_fd() as usize)
-}
-
-fn blocking_connect_v6(addr: &std::net::SocketAddrV6) -> Result<usize, ()> {
-    use std::os::unix::io::IntoRawFd;
-    let stream = std::net::TcpStream::connect(*addr).map_err(|_| ())?;
+    let stream = std::net::TcpStream::connect(addr).map_err(|_| ())?;
     stream.set_nodelay(true).ok();
     #[allow(clippy::cast_sign_loss)]
     Ok(stream.into_raw_fd() as usize)
@@ -881,38 +899,13 @@ enum ResolvedAddr {
 
 fn blocking_connect_resolved(addr: &ResolvedAddr) -> Result<usize, ()> {
     match addr {
-        ResolvedAddr::V4(a) => blocking_connect(a),
-        ResolvedAddr::V6(a) => blocking_connect_v6(a),
+        ResolvedAddr::V4(a) => {
+            let ip = std::net::Ipv4Addr::from(u32::from_be(a.sin_addr));
+            let port = u16::from_be(a.sin_port);
+            blocking_connect(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+        }
+        ResolvedAddr::V6(a) => blocking_connect(std::net::SocketAddr::V6(*a)),
     }
-}
-
-fn build_ranges(
-    headers: &[xibalba_proto::header::Header<'_>],
-    src: &[u8],
-) -> Result<[(u16, u16, u16, u16); MAX_HEADERS], Error> {
-    let src_base = src.as_ptr() as usize;
-    let src_end = src_base + src.len();
-    let mut ranges = [(0u16, 0u16, 0u16, 0u16); MAX_HEADERS];
-    for (i, h) in headers.iter().enumerate() {
-        let name = h.name.as_bytes();
-        let value = h.value;
-        let vs_off = value.as_ptr() as usize - src_base;
-        let name_ptr = name.as_ptr() as usize;
-        let ns_off = if name_ptr >= src_base && name_ptr < src_end {
-            name_ptr - src_base
-        } else {
-            src.windows(name.len())
-                .position(|w| w == name)
-                .ok_or_else(|| Error::Connection("header name not in head buffer".into()))?
-        };
-        ranges[i] = (
-            u16::try_from(ns_off).map_err(|_| Error::Connection("ns_off overflows u16".into()))?,
-            u16::try_from(name.len()).map_err(|_| Error::Connection("name len overflows u16".into()))?,
-            u16::try_from(vs_off).map_err(|_| Error::Connection("vs_off overflows u16".into()))?,
-            u16::try_from(value.len()).map_err(|_| Error::Connection("val len overflows u16".into()))?,
-        );
-    }
-    Ok(ranges)
 }
 
 fn result_id(r: &ConnResult) -> RequestId {

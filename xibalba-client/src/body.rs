@@ -11,7 +11,7 @@ use xibalba_proto::version::Version;
 pub const BLOCK_SIZE: usize = 8192;
 pub const MAX_REQ_SIZE: usize = 8192;
 pub const HEAD_BUF_SIZE: usize = 8192;
-pub const MAX_HEADERS: usize = 64;
+pub use xibalba_proto::response::MAX_HEADERS;
 // Kernel read buffer — 8× BLOCK_SIZE so one syscall can fill multiple ring
 // slots without re-entering the kernel. Lives on the io thread's stack.
 const RAW_BUF_SIZE: usize = BLOCK_SIZE * 8;
@@ -230,7 +230,7 @@ pub(crate) fn io_thread<S: Read + std::io::Write>(
                     }
                 }
 
-                let Some(head_end) = find_header_end(&head_buf) else {
+                let Some(head_end) = head_buf.windows(4).position(|w| w == b"\r\n\r\n") else {
                     continue;
                 };
 
@@ -246,7 +246,7 @@ pub(crate) fn io_thread<S: Read + std::io::Write>(
                     };
 
                 let copy_len = head_bytes_len.min(HEAD_BUF_SIZE);
-                let ranges = match build_ranges(&hdr_buf[..head.header_count], &head_buf[..copy_len]) {
+                let ranges = match xibalba_proto::response::build_ranges(&hdr_buf[..head.header_count], &head_buf[..copy_len]) {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx_resp.push_block(IoResponse::Error(e));
@@ -445,10 +445,6 @@ pub(crate) fn io_thread<S: Read + std::io::Write>(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
 fn push_chunk(tx: &Producer<IoResponse>, data: &[u8]) -> Result<(), ()> {
     for slice in data.chunks(BLOCK_SIZE) {
         let mut chunk = [0u8; BLOCK_SIZE];
@@ -458,46 +454,3 @@ fn push_chunk(tx: &Producer<IoResponse>, data: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Compute `HeaderRange` offsets for each parsed header against `src`.
-fn build_ranges(
-    headers: &[xibalba_proto::header::Header<'_>],
-    src: &[u8],
-) -> Result<[HeaderRange; MAX_HEADERS], Error> {
-    let src_base = src.as_ptr() as usize;
-    let src_end = src_base + src.len();
-    let mut ranges = [(0u16, 0u16, 0u16, 0u16); MAX_HEADERS];
-
-    for (i, h) in headers.iter().enumerate() {
-        let name = h.name.as_bytes();
-        let value = h.value;
-
-        let vs_off = value.as_ptr() as usize - src_base;
-        let name_ptr = name.as_ptr() as usize;
-        let ns_off = if name_ptr >= src_base && name_ptr < src_end {
-            name_ptr - src_base
-        } else {
-            find_subsequence(src, name)
-                .ok_or_else(|| Error::Connection("header name not found in head buffer".into()))?
-        };
-
-        ranges[i] = (
-            u16::try_from(ns_off)
-                .map_err(|_| Error::Connection("header name offset overflows u16".into()))?,
-            u16::try_from(name.len())
-                .map_err(|_| Error::Connection("header name length overflows u16".into()))?,
-            u16::try_from(vs_off)
-                .map_err(|_| Error::Connection("header value offset overflows u16".into()))?,
-            u16::try_from(value.len())
-                .map_err(|_| Error::Connection("header value length overflows u16".into()))?,
-        );
-    }
-
-    Ok(ranges)
-}
