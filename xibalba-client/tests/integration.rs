@@ -4,7 +4,7 @@ use std::thread;
 
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
-use xibalba_proto::error::Error;
+use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::method::Method;
 use xibalba_proto::url::Url;
 
@@ -40,7 +40,7 @@ impl Connector for PlainConnector {
 
     fn connect(url: &Url<'_>, _tls_config: &()) -> Result<PlainStream, Error> {
         let host = std::str::from_utf8(url.host)
-            .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
+            .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
         let addr = format!("{}:{}", host, url.effective_port());
         TcpStream::connect(&addr).map_err(Error::from).map(PlainStream)
     }

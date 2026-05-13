@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use xibalba_proto::error::Error;
+use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
@@ -38,7 +38,7 @@ impl Response {
         let mut buf = Vec::new();
         self.body.read_to_end(&mut buf).map_err(Error::from)?;
         String::from_utf8(buf)
-            .map_err(|e| Error::Connection(format!("response body is not valid UTF-8: {e}")))
+            .map_err(|_| Error::from(ConnectionError::InvalidUtf8Body))
     }
 }
 

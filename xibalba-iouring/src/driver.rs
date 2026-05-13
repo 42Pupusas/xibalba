@@ -30,7 +30,7 @@ use quetzalcoatl::spmc::{Consumer as SpmcConsumer, Producer as SpmcProducer, Rin
 use ququmatz::types::{MsgFlags, SockAddrIn, TimeoutFlags, Timespec};
 use ququmatz::{Completer, ProvidedBufferRing, RawFd, Sqe, Submitter};
 
-use xibalba_proto::error::Error;
+use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
@@ -64,17 +64,21 @@ pub type RequestId = u64;
 #[derive(Debug)]
 pub struct HeadData {
     pub head_buf: Vec<u8>,
-    pub ranges: [(u16, u16, u16, u16); MAX_HEADERS],
+    pub ranges: [xibalba_proto::response::HeaderRange; MAX_HEADERS],
     pub header_count: usize,
 }
 
 impl HeadData {
     pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         let buf = &self.head_buf;
-        self.ranges[..self.header_count].iter().map(move |&(ns, nl, vs, vl)| (
-            &buf[ns as usize..ns as usize + nl as usize],
-            &buf[vs as usize..vs as usize + vl as usize],
-        ))
+        self.ranges[..self.header_count].iter().filter_map(move |r| {
+            let ns = r.name_start as usize;
+            let vs = r.value_start as usize;
+            Some((
+                buf.get(ns..ns + r.name_len as usize)?,
+                buf.get(vs..vs + r.value_len as usize)?,
+            ))
+        })
     }
 }
 
@@ -176,16 +180,18 @@ struct RearmMsg {
 
 struct ResponseParser {
     head_accum: Vec<u8>,
+    body_buf: Vec<u8>,
     partial: Option<PartialResponse>,
 }
 
 impl ResponseParser {
     const fn new() -> Self {
-        Self { head_accum: Vec::new(), partial: None }
+        Self { head_accum: Vec::new(), body_buf: Vec::new(), partial: None }
     }
 
     fn clear(&mut self) {
         self.head_accum.clear();
+        self.body_buf.clear();
         self.partial = None;
     }
 
@@ -312,11 +318,11 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     pub fn new() -> Result<Self, Error> {
         let mut ring = ququmatz::IoUring::builder(RING)
             .build()
-            .map_err(|e| Error::Connection(format!("io_uring setup: {e}")))?;
+            .map_err(|e| Error::Connection(ConnectionError::Other(format!("io_uring setup: {e}"))))?;
 
         let pbuf = ring
             .register_provided_buffers(PBUF_BGID, BUFS, BUF_SIZE)
-            .map_err(|e| Error::Connection(format!("register provided buffers: {e}")))?;
+            .map_err(|e| Error::Connection(ConnectionError::Other(format!("register provided buffers: {e}"))))?;
 
         let (submitter, completer) = ring.split();
 
@@ -346,10 +352,10 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     pub fn connect(&mut self, url: &[u8]) -> Result<ConnHandle, Error> {
         let parsed = Url::parse(url)?;
         let host_str = std::str::from_utf8(parsed.host)
-            .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
+            .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
         let addr = resolve(host_str, parsed.effective_port())?;
         let fd = blocking_connect_resolved(&addr)
-            .map_err(|()| Error::Connection("TCP connect failed".into()))?;
+            .map_err(|()| Error::Connection(ConnectionError::Other("TCP connect failed".into())))?;
 
         let conn_id = self.alloc_conn_id()?;
         self.conns.insert(conn_id, CallerConn {
@@ -390,20 +396,20 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             let url = self.conns[&conn.conn_id].url.clone();
             let parsed = Url::parse(&url)?;
             let host_str = std::str::from_utf8(parsed.host)
-                .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
+                .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
             let addr = resolve(host_str, parsed.effective_port())?;
             let new_fd = blocking_connect_resolved(&addr)
-                .map_err(|()| Error::Connection("TCP reconnect failed".into()))?;
+                .map_err(|()| Error::Connection(ConnectionError::Other("TCP reconnect failed".into())))?;
             // SAFETY: we checked is_some_and above; no removal between the two accesses.
             let c = self.conns.get_mut(&conn.conn_id)
-                .ok_or_else(|| Error::Connection("unknown conn_id".into()))?;
+                .ok_or_else(|| Error::Connection(ConnectionError::Other("unknown conn_id".into())))?;
             c.fd = new_fd;
             c.recv_armed = false;
             c.needs_reconnect = false;
         }
 
         let c = self.conns.get_mut(&conn.conn_id)
-            .ok_or_else(|| Error::Connection("unknown conn_id".into()))?;
+            .ok_or_else(|| Error::Connection(ConnectionError::Other("unknown conn_id".into())))?;
 
         let host = {
             let parsed = Url::parse(&c.url)?;
@@ -426,9 +432,9 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         ];
         let req = Request { method, path, query, version: Version::Http11, headers: &headers };
         let len = req.serialize_to_buf(c.send_buf.as_mut())
-            .map_err(|_| Error::Connection(
+            .map_err(|_| Error::Connection(ConnectionError::Other(
                 format!("request exceeds MAX_REQ ({MAX_REQ} bytes); increase the MAX_REQ const generic")
-            ))?;
+            )))?;
 
         let seq = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
@@ -437,19 +443,19 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         let send = Sqe::send(raw_fd, &c.send_buf[..len], MsgFlags::default())
             .user_data(UserData::send(conn.conn_id, seq).into());
         self.sub.push(send)
-            .map_err(|e| Error::Connection(format!("SQ full (send): {e}")))?;
+            .map_err(|e| Error::Connection(ConnectionError::Other(format!("SQ full (send): {e}"))))?;
 
         if !c.recv_armed {
             let recv = Sqe::recv_multishot(raw_fd, MsgFlags::default())
                 .buffer_select(PBUF_BGID)
                 .user_data(UserData::recv(c.fd, conn.conn_id).into());
             self.sub.push(recv)
-                .map_err(|e| Error::Connection(format!("SQ full (recv): {e}")))?;
+                .map_err(|e| Error::Connection(ConnectionError::Other(format!("SQ full (recv): {e}"))))?;
             c.recv_armed = true;
         }
 
         self.sub.submit()
-            .map_err(|e| Error::Connection(format!("submit: {e}")))?;
+            .map_err(|e| Error::Connection(ConnectionError::Other(format!("submit: {e}"))))?;
 
         Ok(RequestId::from(seq))
     }
@@ -490,7 +496,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                 return Ok(r);
             }
             let r = self.response_rx.pop_block()
-                .ok_or_else(|| Error::Connection("complete thread exited unexpectedly".into()))?;
+                .ok_or_else(|| Error::Connection(ConnectionError::Other("complete thread exited unexpectedly".into())))?;
             let r = match r {
                 ConnResult::Error { request_id, conn, errno } =>
                     self.handle_error(request_id, conn, errno),
@@ -529,7 +535,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
 
         loop {
             let r = self.response_rx.pop_block()
-                .ok_or_else(|| Error::Connection("complete thread exited unexpectedly".into()))?;
+                .ok_or_else(|| Error::Connection(ConnectionError::Other("complete thread exited unexpectedly".into())))?;
             match r {
                 ConnResult::Timeout => return Ok(None),
                 ConnResult::Error { request_id, conn, errno } => {
@@ -577,7 +583,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         }
         let id = self.next_conn_id;
         self.next_conn_id = self.next_conn_id.checked_add(1)
-            .ok_or_else(|| Error::Connection("conn_id space exhausted (>4B connections)".into()))?;
+            .ok_or_else(|| Error::Connection(ConnectionError::Other("conn_id space exhausted (>4B connections)".into())))?;
         Ok(id)
     }
 
@@ -771,7 +777,13 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
     let ranges =
         build_ranges(&hdr_buf[..head.header_count], &parser.head_accum[..head_bytes_len]).ok()?;
     let (version, status, header_count) = (head.version, head.status, head.header_count);
-    let head_buf = parser.head_accum[..head_bytes_len].to_vec();
+
+    // Split head bytes out of head_accum without a fresh allocation: drain the
+    // prefix and collect into a vec (reuses the drained allocation when possible).
+    let head_buf: Vec<u8> = parser.head_accum.drain(..head_bytes_len).collect();
+    // `consumed` was an index into the original head_accum; after the drain the
+    // remaining bytes start at what was index `head_bytes_len`, so adjust.
+    let consumed_after_drain = consumed - head_bytes_len;
 
     let head_data = HeadData { head_buf, ranges, header_count };
 
@@ -782,17 +794,19 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
         BodyFraming::UntilClose => (InternalFraming::UntilClose, false),
     };
 
-    let body_capacity = match framing {
-        #[allow(clippy::cast_possible_truncation)]
-        BodyFraming::ContentLength(n) => n as usize,
-        _ => 0,
-    };
+    // Reuse the parser's body buffer instead of allocating a fresh Vec.
+    let mut body_buf = std::mem::take(&mut parser.body_buf);
+    body_buf.clear();
+    #[allow(clippy::cast_possible_truncation)]
+    if let BodyFraming::ContentLength(n) = framing {
+        body_buf.reserve(n as usize);
+    }
     let mut partial = PartialResponse {
         version, status, head: head_data,
-        body_buf: Vec::with_capacity(body_capacity), body_done, framing: internal_framing,
+        body_buf, body_done, framing: internal_framing,
     };
 
-    let after_head = &parser.head_accum[consumed..];
+    let after_head = &parser.head_accum[consumed_after_drain..];
     let body_consumed = if !after_head.is_empty() && !body_done {
         pump_partial(&mut partial, after_head)
     } else {
@@ -800,10 +814,9 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
     };
 
     if partial.body_done {
-        let total_consumed = consumed + body_consumed;
-        // Preserve bytes after the complete response for the next parse.
-        let leftover = parser.head_accum[total_consumed..].to_vec();
-        parser.head_accum = leftover;
+        let total_consumed = consumed_after_drain + body_consumed;
+        // Shift leftover bytes to the front of head_accum (no new allocation).
+        parser.head_accum.drain(..total_consumed);
         parser.partial = None;
         Some((Response {
             request_id,
@@ -814,7 +827,7 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
         }, body_consumed))
     } else {
         // Trim consumed head bytes from head_accum; body bytes stay in partial.
-        parser.head_accum = parser.head_accum[consumed..].to_vec();
+        parser.head_accum.drain(..consumed_after_drain);
         parser.partial = Some(partial);
         None
     }
@@ -873,7 +886,7 @@ fn blocking_connect(addr: std::net::SocketAddr) -> Result<usize, ()> {
 fn resolve(host: &str, port: u16) -> Result<ResolvedAddr, Error> {
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
-        .map_err(|e| Error::Connection(format!("DNS resolution failed: {e}")))?
+        .map_err(|e| Error::Connection(ConnectionError::Other(format!("DNS resolution failed: {e}"))))?
         .collect();
 
     if let Some(v4) = addrs.iter().find_map(|a| if let std::net::SocketAddr::V4(v4) = a { Some(*v4) } else { None }) {
@@ -889,7 +902,7 @@ fn resolve(host: &str, port: u16) -> Result<ResolvedAddr, Error> {
         return Ok(ResolvedAddr::V6(v6));
     }
 
-    Err(Error::Connection("no address found".into()))
+    Err(Error::Connection(ConnectionError::Other("no address found".into())))
 }
 
 enum ResolvedAddr {

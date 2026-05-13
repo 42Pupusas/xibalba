@@ -1,4 +1,4 @@
-use crate::error::{Error, ParseError};
+use crate::error::{ConnectionError, Error, ParseError};
 use crate::header::{
     Header, HeaderName, contains_token_ignore_case, is_tchar, parse_u64_from_bytes,
 };
@@ -358,6 +358,14 @@ const fn hex_digit(b: u8) -> Option<u8> {
 
 pub const MAX_HEADERS: usize = 64;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeaderRange {
+    pub name_start: u16,
+    pub name_len: u16,
+    pub value_start: u16,
+    pub value_len: u16,
+}
+
 #[must_use]
 pub fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
@@ -370,20 +378,20 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Compute `(name_start, name_len, val_start, val_len)` byte-offset tuples for
-/// each parsed header against the raw `src` buffer.
+/// Compute byte-offset ranges for each parsed header against the raw `src` buffer.
 ///
 /// # Errors
 ///
-/// Returns `Error::Connection` if a header name cannot be located in `src` or
-/// if any offset or length overflows `u16`.
+/// Returns [`ConnectionError::HeaderNotInBuffer`] if a header name cannot be
+/// located in `src`, or [`ConnectionError::HeaderRangeOverflow`] if any offset
+/// or length overflows `u16`.
 pub fn build_ranges(
     headers: &[Header<'_>],
     src: &[u8],
-) -> Result<[(u16, u16, u16, u16); MAX_HEADERS], Error> {
+) -> Result<[HeaderRange; MAX_HEADERS], Error> {
     let src_base = src.as_ptr() as usize;
     let src_end = src_base + src.len();
-    let mut ranges = [(0u16, 0u16, 0u16, 0u16); MAX_HEADERS];
+    let mut ranges = [HeaderRange::default(); MAX_HEADERS];
     for (i, h) in headers.iter().enumerate() {
         let name = h.name.as_bytes();
         let value = h.value;
@@ -393,14 +401,15 @@ pub fn build_ranges(
             name_ptr - src_base
         } else {
             find_subsequence(src, name)
-                .ok_or_else(|| Error::Connection("header name not in head buffer".into()))?
+                .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?
         };
-        ranges[i] = (
-            u16::try_from(ns_off).map_err(|_| Error::Connection("ns_off overflows u16".into()))?,
-            u16::try_from(name.len()).map_err(|_| Error::Connection("name len overflows u16".into()))?,
-            u16::try_from(vs_off).map_err(|_| Error::Connection("vs_off overflows u16".into()))?,
-            u16::try_from(value.len()).map_err(|_| Error::Connection("val len overflows u16".into()))?,
-        );
+        let overflow = |_| Error::from(ConnectionError::HeaderRangeOverflow);
+        ranges[i] = HeaderRange {
+            name_start: u16::try_from(ns_off).map_err(overflow)?,
+            name_len: u16::try_from(name.len()).map_err(overflow)?,
+            value_start: u16::try_from(vs_off).map_err(overflow)?,
+            value_len: u16::try_from(value.len()).map_err(overflow)?,
+        };
     }
     Ok(ranges)
 }

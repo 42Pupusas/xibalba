@@ -8,7 +8,7 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
-use xibalba_proto::error::Error;
+use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::scheme::Scheme;
 use xibalba_proto::url::Url;
 
@@ -63,21 +63,21 @@ impl Connector for TcpConnector {
 
     fn connect(url: &Url<'_>, tls_config: &Arc<ClientConfig>) -> Result<Stream, Error> {
         let host_str = std::str::from_utf8(url.host)
-            .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
+            .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
 
         let port = url.effective_port();
         let addr = (host_str, port)
             .to_socket_addrs()
-            .map_err(|e| Error::Connection(format!("DNS resolution failed: {e}")))?
+            .map_err(|e| Error::Connection(ConnectionError::Other(format!("DNS resolution failed: {e}"))))?
             .next()
-            .ok_or_else(|| Error::Connection("DNS returned no addresses".into()))?;
+            .ok_or_else(|| Error::Connection(ConnectionError::Other("DNS returned no addresses".into())))?;
 
         let tcp = TcpStream::connect(addr)?;
 
         match url.scheme {
             Scheme::Https => {
                 let server_name = ServerName::try_from(host_str.to_owned())
-                    .map_err(|e| Error::Connection(format!("invalid server name: {e}")))?;
+                    .map_err(|e| Error::Connection(ConnectionError::Other(format!("invalid server name: {e}"))))?;
                 let conn = ClientConnection::new(Arc::clone(tls_config), server_name)
                     .map_err(|e| xibalba_proto::error::TlsError { message: e.to_string() })?;
                 Ok(Stream::Tls(Box::new(StreamOwned::new(conn, tcp))))

@@ -10,7 +10,7 @@ use rustls::ClientConfig;
 
 use crate::body::{BodyReader, IoBlock, reader_thread};
 use crate::connection::connect;
-use crate::error::{Error, IoError};
+use crate::error::{ConnectionError, Error, IoError};
 use crate::header::{Header, HeaderName};
 use crate::method::Method;
 use crate::request::Request;
@@ -68,7 +68,7 @@ impl Client {
         let mut stream = connect(&url, &self.tls_config)?;
 
         let host_str = std::str::from_utf8(url.host)
-            .map_err(|_| Error::Connection("invalid UTF-8 in host".into()))?;
+            .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
         let host_value: Vec<u8> = if url.port.is_some() {
             format!("{}:{}", host_str, url.effective_port()).into_bytes()
         } else {
@@ -202,7 +202,7 @@ impl Response {
         let mut buf = Vec::new();
         self.body.read_to_end(&mut buf).map_err(Error::from)?;
         String::from_utf8(buf)
-            .map_err(|e| Error::Connection(format!("response body is not valid UTF-8: {e}")))
+            .map_err(|e| Error::Connection(ConnectionError::Other(format!("response body is not valid UTF-8: {e}"))))
     }
 }
 

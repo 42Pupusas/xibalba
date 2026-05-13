@@ -1,14 +1,12 @@
 use std::io::Read;
 
-use xibalba_proto::error::Error;
+use xibalba_proto::error::{ConnectionError, Error};
+use xibalba_proto::response::HeaderRange;
 use xibalba_proto::status::StatusCode;
 use xibalba_proto::version::Version;
 
 pub const HEAD_BUF_SIZE: usize = 8192;
 pub use xibalba_proto::response::MAX_HEADERS;
-
-/// `(name_start, name_len, val_start, val_len)` — byte offsets into `HeadData::head_buf`.
-pub type HeaderRange = (u16, u16, u16, u16);
 
 pub struct HeadData {
     pub version: Version,
@@ -22,15 +20,19 @@ pub struct HeadData {
 impl HeadData {
     pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         let buf = &self.head_buf[..self.head_len];
-        self.ranges[..self.header_count].iter().map(move |&(ns, nl, vs, vl)| {
-            (
-                &buf[ns as usize..ns as usize + nl as usize],
-                &buf[vs as usize..vs as usize + vl as usize],
-            )
+        self.ranges[..self.header_count].iter().filter_map(move |r| {
+            let ns = r.name_start as usize;
+            let vs = r.value_start as usize;
+            Some((
+                buf.get(ns..ns + r.name_len as usize)?,
+                buf.get(vs..vs + r.value_len as usize)?,
+            ))
         })
     }
 }
 
+/// In-memory body reader with a specialised `read_to_end` that does a single
+/// `extend_from_slice` instead of reading through the `Read` trait.
 pub struct BodyReader {
     data: Vec<u8>,
     pos: usize,
@@ -77,9 +79,7 @@ pub(crate) fn read_response_head<S: Read>(
     let head_end = loop {
         let n = stream.read(&mut raw)?;
         if n == 0 {
-            return Err(Error::Connection(
-                "connection closed before headers complete".into(),
-            ));
+            return Err(ConnectionError::ConnectionClosed.into());
         }
         head_acc.extend_from_slice(&raw[..n]);
         if let Some(pos) = head_acc.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -124,7 +124,7 @@ pub(crate) fn read_body<S: Read>(
 
         ProtoFraming::ContentLength(len) => {
             let len = usize::try_from(len)
-                .map_err(|_| Error::Connection("content-length exceeds usize".into()))?;
+                .map_err(|_| Error::from(ConnectionError::ContentLengthOverflow))?;
             let mut body = Vec::with_capacity(len);
             let from_tail = tail.len().min(len);
             body.extend_from_slice(&tail[..from_tail]);
@@ -156,7 +156,7 @@ pub(crate) fn read_body<S: Read>(
             loop {
                 let n = stream.read(&mut raw)?;
                 if n == 0 {
-                    return Err(Error::Connection("connection closed mid-chunk".into()));
+                    return Err(ConnectionError::ConnectionClosed.into());
                 }
                 let mut pos = 0;
                 while pos < n {

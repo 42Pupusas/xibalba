@@ -18,7 +18,17 @@ pub enum Error {
     Serialize(SerializeError),
     Io(IoError),
     Tls(TlsError),
-    Connection(String),
+    Connection(ConnectionError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionError {
+    ConnectionClosed,
+    ContentLengthOverflow,
+    InvalidUtf8Body,
+    HeaderRangeOverflow,
+    HeaderNotInBuffer,
+    Other(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +89,19 @@ impl fmt::Display for TlsError {
     }
 }
 
+impl fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectionClosed => f.write_str("connection closed unexpectedly"),
+            Self::ContentLengthOverflow => f.write_str("content-length exceeds usize"),
+            Self::InvalidUtf8Body => f.write_str("response body is not valid UTF-8"),
+            Self::HeaderRangeOverflow => f.write_str("header offset/length overflows u16"),
+            Self::HeaderNotInBuffer => f.write_str("header name not in head buffer"),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -87,7 +110,7 @@ impl fmt::Display for Error {
             Self::Serialize(e) => write!(f, "serialize error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Tls(e) => write!(f, "tls error: {e}"),
-            Self::Connection(msg) => write!(f, "connection error: {msg}"),
+            Self::Connection(e) => write!(f, "connection error: {e}"),
         }
     }
 }
@@ -161,6 +184,12 @@ impl From<TlsError> for Error {
     }
 }
 
+impl From<ConnectionError> for Error {
+    fn from(e: ConnectionError) -> Self {
+        Self::Connection(e)
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::Io(IoError {
@@ -175,6 +204,7 @@ impl std::error::Error for TlsError {}
 impl std::error::Error for UrlError {}
 impl std::error::Error for ParseError {}
 impl std::error::Error for SerializeError {}
+impl std::error::Error for ConnectionError {}
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -184,7 +214,7 @@ impl std::error::Error for Error {
             Self::Serialize(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::Tls(e) => Some(e),
-            Self::Connection(_) => None,
+            Self::Connection(e) => Some(e),
         }
     }
 }
@@ -255,7 +285,10 @@ mod tests {
 
     #[test]
     fn connection_error_display() {
-        let e = Error::Connection("DNS failed".into());
+        let e = Error::Connection(ConnectionError::Other("DNS failed".into()));
         assert_eq!(e.to_string(), "connection error: DNS failed");
+
+        let e = Error::Connection(ConnectionError::ConnectionClosed);
+        assert_eq!(e.to_string(), "connection error: connection closed unexpectedly");
     }
 }
