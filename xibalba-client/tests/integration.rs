@@ -582,6 +582,55 @@ fn redirect_307_preserves_method_and_body() {
     server.join().unwrap();
 }
 
+// ── Builder / custom header tests ────────────────────────────────────────────
+
+#[test]
+fn builder_sends_custom_headers() {
+    let (port, server) = echo_request_server();
+    let mut client = connect(port);
+
+    client
+        .build(Method::Get, b"/api")
+        .header(b"Authorization", b"Bearer tok123")
+        .header(b"Content-Type", b"application/json")
+        .send()
+        .unwrap();
+
+    let req = server.join().unwrap();
+    let req_str = String::from_utf8_lossy(&req);
+    assert!(req_str.contains("Authorization: Bearer tok123"), "missing Authorization header:\n{req_str}");
+    assert!(req_str.contains("Content-Type: application/json"), "missing Content-Type header:\n{req_str}");
+}
+
+#[test]
+fn builder_with_body_and_headers() {
+    let (port, server) = echo_body_server();
+    let mut client = connect(port);
+
+    let resp = client
+        .build(Method::Put, b"/upload")
+        .header(b"Content-Type", b"text/plain")
+        .body(b"file contents")
+        .send()
+        .unwrap();
+
+    assert_eq!(resp.text().unwrap(), "file contents");
+    server.join().unwrap();
+}
+
+#[test]
+fn builder_no_hardcoded_user_agent() {
+    let (port, server) = echo_request_server();
+    let mut client = connect(port);
+
+    client.build(Method::Get, b"/check").send().unwrap();
+
+    let req = server.join().unwrap();
+    let req_str = String::from_utf8_lossy(&req);
+    assert!(!req_str.contains("User-Agent"), "User-Agent should not be hardcoded:\n{req_str}");
+    assert!(req_str.contains("Host:"), "Host header must always be present:\n{req_str}");
+}
+
 // ── Size limit tests ─────────────────────────────────────────────────────────
 
 #[test]

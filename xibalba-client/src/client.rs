@@ -12,6 +12,8 @@ use xibalba_proto::version::Version;
 use crate::body::{BodyReader, HeadData, HEAD_BUF_SIZE, read_body, read_response_head};
 use crate::connector::Connector;
 
+// ── Config ───────────────────────────────────────────────────────────────────
+
 pub struct Config {
     pub read_timeout: Option<Duration>,
     pub max_response_body: usize,
@@ -30,16 +32,7 @@ impl Default for Config {
     }
 }
 
-pub struct Client<C: Connector> {
-    tls_config: C::TlsConfig,
-    stream: C::Stream,
-    config: Config,
-    host: Vec<u8>,
-    port: u16,
-    scheme: xibalba_proto::scheme::Scheme,
-    write_buf: Vec<u8>,
-    head_buf: Vec<u8>,
-}
+// ── Response ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct Response {
@@ -67,6 +60,67 @@ impl Response {
     }
 }
 
+// ── RequestBuilder ───────────────────────────────────────────────────────────
+
+pub struct RequestBuilder<'a, C: Connector> {
+    client: &'a mut Client<C>,
+    method: Method,
+    path: &'a [u8],
+    query: Option<&'a [u8]>,
+    body: Option<&'a [u8]>,
+    extra_headers: Vec<(&'a [u8], &'a [u8])>,
+}
+
+impl<'a, C: Connector> RequestBuilder<'a, C> {
+    #[must_use]
+    pub fn header(mut self, name: &'a [u8], value: &'a [u8]) -> Self {
+        self.extra_headers.push((name, value));
+        self
+    }
+
+    #[must_use]
+    pub const fn body(mut self, data: &'a [u8]) -> Self {
+        self.body = Some(data);
+        self
+    }
+
+    #[must_use]
+    pub const fn query(mut self, q: &'a [u8]) -> Self {
+        self.query = Some(q);
+        self
+    }
+
+    /// # Errors
+    ///
+    /// Returns `Error` on serialization failure, connection error, or if
+    /// the redirect limit is exceeded.
+    pub fn send(self) -> Result<Response, Error> {
+        let extra: Vec<Header<'_>> = self
+            .extra_headers
+            .iter()
+            .map(|(n, v)| Header {
+                name: HeaderName::from_bytes(n),
+                value: v,
+            })
+            .collect();
+        self.client
+            .execute(self.method, self.path, self.query, self.body, &extra)
+    }
+}
+
+// ── Client ───────────────────────────────────────────────────────────────────
+
+pub struct Client<C: Connector> {
+    tls_config: C::TlsConfig,
+    stream: C::Stream,
+    config: Config,
+    host: Vec<u8>,
+    port: u16,
+    scheme: xibalba_proto::scheme::Scheme,
+    write_buf: Vec<u8>,
+    head_buf: Vec<u8>,
+}
+
 impl<C: Connector> Client<C> {
     /// # Errors
     ///
@@ -92,14 +146,54 @@ impl<C: Connector> Client<C> {
         Ok(client)
     }
 
-    /// Connect with default configuration.
-    ///
     /// # Errors
     ///
     /// Returns `Error` on connection failure.
     pub fn connect_default(url_bytes: &[u8], tls_config: C::TlsConfig) -> Result<Self, Error> {
         Self::connect(url_bytes, tls_config, Config::default())
     }
+
+    /// Start building a request. Chain `.header()`, `.body()`, `.query()`,
+    /// then call `.send()`.
+    pub const fn build<'a>(&'a mut self, method: Method, path: &'a [u8]) -> RequestBuilder<'a, C> {
+        RequestBuilder {
+            client: self,
+            method,
+            path,
+            query: None,
+            body: None,
+            extra_headers: Vec::new(),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// See [`RequestBuilder::send`].
+    pub fn request(
+        &mut self,
+        method: Method,
+        path: &[u8],
+        query: Option<&[u8]>,
+        body: Option<&[u8]>,
+    ) -> Result<Response, Error> {
+        self.execute(method, path, query, body, &[])
+    }
+
+    /// # Errors
+    ///
+    /// See [`request`](Self::request).
+    pub fn get(&mut self, path: &[u8]) -> Result<Response, Error> {
+        self.execute(Method::Get, path, None, None, &[])
+    }
+
+    /// # Errors
+    ///
+    /// See [`request`](Self::request).
+    pub fn post(&mut self, path: &[u8], body: &[u8]) -> Result<Response, Error> {
+        self.execute(Method::Post, path, None, Some(body), &[])
+    }
+
+    // ── internals ────────────────────────────────────────────────────────────
 
     fn apply_timeouts(&self) -> Result<(), Error> {
         use crate::connector::SetReadTimeout;
@@ -128,19 +222,20 @@ impl<C: Connector> Client<C> {
         }
     }
 
-    fn send_request(
+    fn send_one(
         &mut self,
         method: Method,
         path: &[u8],
         query: Option<&[u8]>,
         body: Option<&[u8]>,
+        extra_headers: &[Header<'_>],
     ) -> Result<Response, Error> {
         let host_value = self.host_header_value();
         let content_len_str;
-        let mut headers = Vec::with_capacity(4);
+        let mut headers = Vec::with_capacity(1 + extra_headers.len() + 1);
+
         headers.push(Header { name: HeaderName::Host, value: &host_value });
-        headers.push(Header { name: HeaderName::Connection, value: b"keep-alive" });
-        headers.push(Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" });
+        headers.extend_from_slice(extra_headers);
 
         if let Some(data) = body {
             content_len_str = data.len().to_string();
@@ -187,16 +282,13 @@ impl<C: Connector> Client<C> {
         })
     }
 
-    /// # Errors
-    ///
-    /// Returns `Error` on serialization failure, connection error, or if
-    /// the redirect limit is exceeded.
-    pub fn request(
+    fn execute(
         &mut self,
         method: Method,
         path: &[u8],
         query: Option<&[u8]>,
         body: Option<&[u8]>,
+        extra_headers: &[Header<'_>],
     ) -> Result<Response, Error> {
         let mut current_method = method;
         let mut current_path: Vec<u8> = path.to_vec();
@@ -204,11 +296,12 @@ impl<C: Connector> Client<C> {
         let mut current_body = body.map(<[u8]>::to_vec);
 
         for _ in 0..=self.config.max_redirects {
-            let resp = self.send_request(
+            let resp = self.send_one(
                 current_method,
                 &current_path,
                 current_query.as_deref(),
                 current_body.as_deref(),
+                extra_headers,
             )?;
 
             if !resp.status.is_redirect() {
@@ -270,19 +363,5 @@ impl<C: Connector> Client<C> {
         }
 
         Err(ConnectionError::TooManyRedirects.into())
-    }
-
-    /// # Errors
-    ///
-    /// See [`request`](Self::request).
-    pub fn get(&mut self, path: &[u8]) -> Result<Response, Error> {
-        self.request(Method::Get, path, None, None)
-    }
-
-    /// # Errors
-    ///
-    /// See [`request`](Self::request).
-    pub fn post(&mut self, path: &[u8], body: &[u8]) -> Result<Response, Error> {
-        self.request(Method::Post, path, None, Some(body))
     }
 }
