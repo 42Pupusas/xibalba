@@ -637,14 +637,18 @@ fn complete_loop(
             if conn.pending_ids.is_empty() {
                 // Send CQE hasn't arrived yet — buffer raw bytes until it does.
                 conn.recv_buf.extend_from_slice(data);
-                pbuf.recycle_and_commit(bid);
-                if !more {
-                    let _ = rearm_tx.push_block(RearmMsg { conn_id, fd });
-                }
             } else {
                 let data_owned = data.to_vec();
                 pbuf.recycle_and_commit(bid);
                 drain_recv_buf(conn, &data_owned, response_tx);
+                if !more {
+                    let _ = rearm_tx.push_block(RearmMsg { conn_id, fd });
+                }
+                continue;
+            }
+            pbuf.recycle_and_commit(bid);
+            if !more {
+                let _ = rearm_tx.push_block(RearmMsg { conn_id, fd });
             }
         }
     }
@@ -704,6 +708,7 @@ fn process_recv_data(slot: &mut Slot, data: &[u8], request_id: RequestId) -> (Op
         };
         if partial.body_done {
             let p = slot.partial.take().unwrap();
+            slot.head_accum.clear();
             return (Some(Response {
                 request_id,
                 version: p.version,
