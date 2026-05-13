@@ -209,9 +209,7 @@ impl<'a> HeaderName<'a> {
             Self::SetCookie => "Set-Cookie",
             Self::Cookie => "Cookie",
             Self::Authorization => "Authorization",
-            Self::Unknown(raw) | Self::Raw(raw) => {
-                core::str::from_utf8(raw).unwrap_or("<invalid>")
-            }
+            Self::Unknown(raw) | Self::Raw(raw) => core::str::from_utf8(raw).unwrap_or("<invalid>"),
         }
     }
 
@@ -533,15 +531,24 @@ mod tests {
 
     #[test]
     fn header_name_length_collision() {
-        assert_eq!(HeaderName::from_bytes(b"Vary"), HeaderName::Unknown(b"Vary"));
+        assert_eq!(
+            HeaderName::from_bytes(b"Vary"),
+            HeaderName::Unknown(b"Vary")
+        );
         assert_eq!(HeaderName::from_bytes(b"Host"), HeaderName::Host);
         assert_eq!(HeaderName::from_bytes(b"Date"), HeaderName::Date);
     }
 
     #[test]
     fn raw_vs_known_equality() {
-        assert_eq!(HeaderName::Raw(b"content-length"), HeaderName::ContentLength);
-        assert_eq!(HeaderName::Raw(b"CONTENT-LENGTH"), HeaderName::ContentLength);
+        assert_eq!(
+            HeaderName::Raw(b"content-length"),
+            HeaderName::ContentLength
+        );
+        assert_eq!(
+            HeaderName::Raw(b"CONTENT-LENGTH"),
+            HeaderName::ContentLength
+        );
         assert_eq!(HeaderName::Raw(b"host"), HeaderName::Host);
     }
 

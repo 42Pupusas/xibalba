@@ -21,14 +21,16 @@ pub struct HeadData {
 impl HeadData {
     pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         let buf = &self.head_buf[..self.head_len];
-        self.ranges[..self.header_count].iter().filter_map(move |r| {
-            let ns = r.name_start as usize;
-            let vs = r.value_start as usize;
-            Some((
-                buf.get(ns..ns + r.name_len as usize)?,
-                buf.get(vs..vs + r.value_len as usize)?,
-            ))
-        })
+        self.ranges[..self.header_count]
+            .iter()
+            .filter_map(move |r| {
+                let ns = r.name_start as usize;
+                let vs = r.value_start as usize;
+                Some((
+                    buf.get(ns..ns + r.name_len as usize)?,
+                    buf.get(vs..vs + r.value_len as usize)?,
+                ))
+            })
     }
 }
 

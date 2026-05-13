@@ -9,7 +9,7 @@ use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
 use xibalba_proto::version::Version;
 
-use crate::body::{BodyReader, HeadData, HEAD_BUF_SIZE, read_body, read_response_head};
+use crate::body::{BodyReader, HEAD_BUF_SIZE, HeadData, read_body, read_response_head};
 use crate::connector::Connector;
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -55,8 +55,7 @@ impl Response {
         use std::io::Read;
         let mut buf = Vec::new();
         self.body.read_to_end(&mut buf).map_err(Error::from)?;
-        String::from_utf8(buf)
-            .map_err(|_| Error::from(ConnectionError::InvalidUtf8Body))
+        String::from_utf8(buf).map_err(|_| Error::from(ConnectionError::InvalidUtf8Body))
     }
 }
 
@@ -125,7 +124,11 @@ impl<C: Connector> Client<C> {
     /// # Errors
     ///
     /// Returns `Error` on connection failure.
-    pub fn connect(url_bytes: &[u8], tls_config: C::TlsConfig, config: Config) -> Result<Self, Error> {
+    pub fn connect(
+        url_bytes: &[u8],
+        tls_config: C::TlsConfig,
+        config: Config,
+    ) -> Result<Self, Error> {
         let url = Url::parse(url_bytes)?;
         let stream = C::connect(&url, &tls_config)?;
         let host = url.host.to_vec();
@@ -234,7 +237,10 @@ impl<C: Connector> Client<C> {
         let content_len_str;
         let mut headers = Vec::with_capacity(1 + extra_headers.len() + 1);
 
-        headers.push(Header { name: HeaderName::Host, value: &host_value });
+        headers.push(Header {
+            name: HeaderName::Host,
+            value: &host_value,
+        });
         headers.extend_from_slice(extra_headers);
 
         if let Some(data) = body {
@@ -310,9 +316,7 @@ impl<C: Connector> Client<C> {
 
             let location = resp
                 .headers()
-                .find(|(name, _)| {
-                    xibalba_proto::header::ascii_eq_ignore_case(name, b"Location")
-                })
+                .find(|(name, _)| xibalba_proto::header::ascii_eq_ignore_case(name, b"Location"))
                 .map(|(_, v)| v);
 
             let location = match location {
@@ -321,9 +325,7 @@ impl<C: Connector> Client<C> {
             };
 
             match resp.status {
-                StatusCode::MOVED_PERMANENTLY
-                | StatusCode::FOUND
-                | StatusCode::SEE_OTHER => {
+                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER => {
                     current_method = Method::Get;
                     current_body = None;
                 }

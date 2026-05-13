@@ -85,5 +85,4 @@ mod tests {
         assert!(Version::try_from(b"HTTP" as &[u8]).is_err());
         assert!(Version::try_from(b"http/1.1" as &[u8]).is_err());
     }
-
 }

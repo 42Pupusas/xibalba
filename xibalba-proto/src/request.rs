@@ -314,7 +314,10 @@ mod tests {
         // Verify all 20 headers appear
         let output = &buf[..len];
         assert_eq!(
-            output.windows(b"Accept: */*".len()).filter(|w| *w == b"Accept: */*").count(),
+            output
+                .windows(b"Accept: */*".len())
+                .filter(|w| *w == b"Accept: */*")
+                .count(),
             20
         );
     }
@@ -340,8 +343,14 @@ mod tests {
     #[test]
     fn serialize_to_writer_matches_buf() {
         let headers = [
-            Header { name: HeaderName::Host, value: b"example.com" },
-            Header { name: HeaderName::ContentLength, value: b"42" },
+            Header {
+                name: HeaderName::Host,
+                value: b"example.com",
+            },
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"42",
+            },
         ];
         let req = Request {
             method: Method::Post,

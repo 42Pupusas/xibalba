@@ -2,9 +2,14 @@
 name = "xibalba-client"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Minimal synchronous HTTP/1.1 client with TLS, redirects, timeouts, and a builder API"
+repository = "https://github.com/42pupusas/xibalba"
+keywords = ["http", "client", "http-client", "tls"]
+categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-xibalba-proto = { path = "../xibalba-proto" }
+xibalba-proto = { path = "../xibalba-proto", version = "0.1.0" }
 
 [lints]
 workspace = true

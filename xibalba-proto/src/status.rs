@@ -174,5 +174,4 @@ mod tests {
         assert!(!StatusCode::OK.is_redirect());
         assert!(!StatusCode::NOT_FOUND.is_success());
     }
-
 }

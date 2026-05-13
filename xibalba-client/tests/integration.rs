@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use xibalba_client::client::{Client, Config};
 use xibalba_client::connector::{Connector, SetReadTimeout};
-use xibalba_proto::error::{ConnectionError, Error};
-use xibalba_proto::method::Method;
-use xibalba_proto::url::Url;
+use xibalba_client::proto::error::{ConnectionError, Error};
+use xibalba_client::proto::method::Method;
+use xibalba_client::proto::url::Url;
 
 // ── Plain TCP connector ───────────────────────────────────────────────────────
 
@@ -40,10 +40,13 @@ impl Connector for PlainConnector {
     type TlsConfig = ();
 
     fn connect(url: &Url<'_>, _tls_config: &()) -> Result<PlainStream, Error> {
-        let host = std::str::from_utf8(url.host)
-            .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
+        let host = std::str::from_utf8(url.host).map_err(|_| {
+            Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
+        })?;
         let addr = format!("{}:{}", host, url.effective_port());
-        TcpStream::connect(&addr).map_err(Error::from).map(PlainStream)
+        TcpStream::connect(&addr)
+            .map_err(Error::from)
+            .map(PlainStream)
     }
 }
 
@@ -54,9 +57,13 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut acc = Vec::new();
     loop {
         let n = stream.read(&mut buf).unwrap();
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         acc.extend_from_slice(&buf[..n]);
-        if acc.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
     }
     acc
 }
@@ -91,7 +98,7 @@ fn get_content_length_response() {
     let mut client = connect(port);
 
     let resp = client.request(Method::Get, b"/", None, None).unwrap();
-    assert_eq!(resp.status, xibalba_proto::status::StatusCode::OK);
+    assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
     assert_eq!(resp.text().unwrap(), "hello");
     server.join().unwrap();
 }
@@ -114,7 +121,7 @@ fn get_no_body_204() {
     let mut client = connect(port);
 
     let resp = client.request(Method::Get, b"/", None, None).unwrap();
-    assert_eq!(resp.status, xibalba_proto::status::StatusCode::NO_CONTENT);
+    assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::NO_CONTENT);
     assert!(resp.text().unwrap().is_empty());
     server.join().unwrap();
 }
@@ -190,9 +197,13 @@ fn keepalive_server(r1: &'static [u8], r2: &'static [u8]) -> (u16, thread::JoinH
             let mut acc = Vec::new();
             loop {
                 let n = stream.read(&mut buf).unwrap();
-                if n == 0 { return; }
+                if n == 0 {
+                    return;
+                }
                 acc.extend_from_slice(&buf[..n]);
-                if acc.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
             }
             stream.write_all(response).unwrap();
             stream.flush().unwrap();
@@ -341,7 +352,10 @@ fn host_header_with_default_port() {
     client.get(b"/").unwrap();
     let req = server.join().unwrap();
     let req_str = String::from_utf8_lossy(&req);
-    assert!(req_str.contains("Host: 127.0.0.1:"), "Host header must include non-default port");
+    assert!(
+        req_str.contains("Host: 127.0.0.1:"),
+        "Host header must include non-default port"
+    );
 }
 
 // ── Timeout tests ────────────────────────────────────────────────────────────
@@ -366,7 +380,10 @@ fn timeout_fires_on_stalled_server() {
     let start = std::time::Instant::now();
     let result = client.request(Method::Get, b"/", None, None);
     assert!(result.is_err(), "expected timeout error");
-    assert!(start.elapsed() < Duration::from_secs(2), "should time out quickly");
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "should time out quickly"
+    );
     drop(server);
 }
 
@@ -399,10 +416,7 @@ fn echo_body_server() -> (u16, thread::JoinHandle<Vec<u8>>) {
         body.truncate(content_length);
 
         // Echo the body back
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
         stream.write_all(response.as_bytes()).unwrap();
         stream.write_all(&body).unwrap();
         body
@@ -426,7 +440,9 @@ fn post_with_empty_body() {
     let (port, server) = echo_body_server();
     let mut client = connect(port);
 
-    let resp = client.request(Method::Post, b"/submit", None, Some(b"")).unwrap();
+    let resp = client
+        .request(Method::Post, b"/submit", None, Some(b""))
+        .unwrap();
     assert_eq!(resp.text().unwrap(), "");
     server.join().unwrap();
 }
@@ -464,7 +480,7 @@ fn redirect_301_followed() {
     let mut client = connect(port);
 
     let resp = client.get(b"/start").unwrap();
-    assert_eq!(resp.status, xibalba_proto::status::StatusCode::OK);
+    assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
     assert_eq!(resp.text().unwrap(), "done");
     server.join().unwrap();
 }
@@ -477,17 +493,23 @@ fn redirect_chain() {
         let (mut stream, _) = listener.accept().unwrap();
         // Hop 1: 301 → /hop2
         read_request(&mut stream);
-        stream.write_all(b"HTTP/1.1 301 Moved\r\nContent-Length: 0\r\nLocation: /hop2\r\n\r\n").unwrap();
+        stream
+            .write_all(b"HTTP/1.1 301 Moved\r\nContent-Length: 0\r\nLocation: /hop2\r\n\r\n")
+            .unwrap();
         stream.flush().unwrap();
 
         // Hop 2: 302 → /final
         read_request(&mut stream);
-        stream.write_all(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /final\r\n\r\n").unwrap();
+        stream
+            .write_all(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /final\r\n\r\n")
+            .unwrap();
         stream.flush().unwrap();
 
         // Final
         read_request(&mut stream);
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\narrived").unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\narrived")
+            .unwrap();
     });
     let mut client = connect(port);
     let resp = client.get(b"/start").unwrap();
@@ -504,9 +526,13 @@ fn redirect_max_exceeded() {
         // Infinite redirect loop
         loop {
             let req = read_request(&mut stream);
-            if req.is_empty() { break; }
+            if req.is_empty() {
+                break;
+            }
             let resp = b"HTTP/1.1 301 Moved\r\nContent-Length: 0\r\nLocation: /loop\r\n\r\n";
-            if stream.write_all(resp).is_err() { break; }
+            if stream.write_all(resp).is_err() {
+                break;
+            }
             stream.flush().ok();
         }
     });
@@ -533,7 +559,9 @@ fn redirect_307_preserves_method_and_body() {
         // First request: 307 redirect
         let req1 = read_request(&mut stream);
         assert!(String::from_utf8_lossy(&req1).starts_with("POST "));
-        stream.write_all(b"HTTP/1.1 307 Temporary\r\nContent-Length: 0\r\nLocation: /target\r\n\r\n").unwrap();
+        stream
+            .write_all(b"HTTP/1.1 307 Temporary\r\nContent-Length: 0\r\nLocation: /target\r\n\r\n")
+            .unwrap();
         stream.flush().unwrap();
         // Read the body from first request
         let req1_str = String::from_utf8_lossy(&req1);
@@ -553,7 +581,10 @@ fn redirect_307_preserves_method_and_body() {
         // Second request: should still be POST with body
         let req2 = read_request(&mut stream);
         let req2_str = String::from_utf8_lossy(&req2);
-        assert!(req2_str.starts_with("POST "), "expected POST after 307, got: {req2_str}");
+        assert!(
+            req2_str.starts_with("POST "),
+            "expected POST after 307, got: {req2_str}"
+        );
         // Read the body
         let cl2: usize = req2_str
             .lines()
@@ -598,8 +629,14 @@ fn builder_sends_custom_headers() {
 
     let req = server.join().unwrap();
     let req_str = String::from_utf8_lossy(&req);
-    assert!(req_str.contains("Authorization: Bearer tok123"), "missing Authorization header:\n{req_str}");
-    assert!(req_str.contains("Content-Type: application/json"), "missing Content-Type header:\n{req_str}");
+    assert!(
+        req_str.contains("Authorization: Bearer tok123"),
+        "missing Authorization header:\n{req_str}"
+    );
+    assert!(
+        req_str.contains("Content-Type: application/json"),
+        "missing Content-Type header:\n{req_str}"
+    );
 }
 
 #[test]
@@ -627,8 +664,14 @@ fn builder_no_hardcoded_user_agent() {
 
     let req = server.join().unwrap();
     let req_str = String::from_utf8_lossy(&req);
-    assert!(!req_str.contains("User-Agent"), "User-Agent should not be hardcoded:\n{req_str}");
-    assert!(req_str.contains("Host:"), "Host header must always be present:\n{req_str}");
+    assert!(
+        !req_str.contains("User-Agent"),
+        "User-Agent should not be hardcoded:\n{req_str}"
+    );
+    assert!(
+        req_str.contains("Host:"),
+        "Host header must always be present:\n{req_str}"
+    );
 }
 
 // ── Size limit tests ─────────────────────────────────────────────────────────

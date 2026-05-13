@@ -120,5 +120,4 @@ mod tests {
         assert!(Method::try_from(b"FOOBAR" as &[u8]).is_err());
         assert!(Method::try_from(b"" as &[u8]).is_err());
     }
-
 }

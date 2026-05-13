@@ -2,6 +2,11 @@
 name = "xibalba-proto"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "HTTP/1.1 protocol primitives: zero-copy parser, chunked decoder, request serializer"
+repository = "https://github.com/42pupusas/xibalba"
+keywords = ["http", "parser", "protocol", "no-alloc"]
+categories = ["network-programming", "parser-implementations"]
 
 [lints]
 workspace = true

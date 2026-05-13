@@ -107,5 +107,4 @@ mod tests {
         assert!(Scheme::try_from(b"" as &[u8]).is_err());
         assert!(Scheme::try_from(b"httpx" as &[u8]).is_err());
     }
-
 }

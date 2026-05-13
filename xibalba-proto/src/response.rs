@@ -83,7 +83,10 @@ pub fn parse_response_head<'a>(
         if count >= headers.len() {
             return Err(ParseError::TooManyHeaders.into());
         }
-        headers[count] = Header { name: HeaderName::Raw(name_bytes), value };
+        headers[count] = Header {
+            name: HeaderName::Raw(name_bytes),
+            value,
+        };
         count += 1;
 
         pos += line_end;
@@ -119,8 +122,7 @@ pub fn determine_body_framing(
     let hdrs = &headers[..header_count];
 
     for h in hdrs {
-        if h.name == HeaderName::TransferEncoding
-            && contains_token_ignore_case(h.value, b"chunked")
+        if h.name == HeaderName::TransferEncoding && contains_token_ignore_case(h.value, b"chunked")
         {
             return BodyFraming::Chunked;
         }
@@ -914,7 +916,10 @@ mod tests {
         let mut decoder = ChunkedDecoder::new();
         let mut output = [0u8; 64];
         let (result, _) = decoder.decode(input, &mut output);
-        assert!(matches!(result, DecodeResult::Error(ParseError::InvalidChunkSize)));
+        assert!(matches!(
+            result,
+            DecodeResult::Error(ParseError::InvalidChunkSize)
+        ));
     }
 
     #[test]
@@ -952,7 +957,10 @@ mod tests {
 
         // Now feed 'X' where \r\n was expected.
         let (result, _) = decoder.decode(b"X", &mut output);
-        assert!(matches!(result, DecodeResult::Error(ParseError::InvalidChunkTerminator)));
+        assert!(matches!(
+            result,
+            DecodeResult::Error(ParseError::InvalidChunkTerminator)
+        ));
     }
 
     #[test]
@@ -1043,7 +1051,10 @@ mod tests {
         let mut decoder = ChunkedDecoder::new();
         let mut output = [0u8; 64];
         let (result, _) = decoder.decode(input, &mut output);
-        assert!(matches!(result, DecodeResult::Error(ParseError::InvalidChunkSize)));
+        assert!(matches!(
+            result,
+            DecodeResult::Error(ParseError::InvalidChunkSize)
+        ));
     }
 
     #[test]

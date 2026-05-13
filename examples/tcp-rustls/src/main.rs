@@ -62,24 +62,36 @@ impl Connector for TcpConnector {
     type TlsConfig = Arc<ClientConfig>;
 
     fn connect(url: &Url<'_>, tls_config: &Arc<ClientConfig>) -> Result<Stream, Error> {
-        let host_str = std::str::from_utf8(url.host)
-            .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
+        let host_str = std::str::from_utf8(url.host).map_err(|_| {
+            Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
+        })?;
 
         let port = url.effective_port();
         let addr = (host_str, port)
             .to_socket_addrs()
-            .map_err(|e| Error::Connection(ConnectionError::Other(format!("DNS resolution failed: {e}"))))?
+            .map_err(|e| {
+                Error::Connection(ConnectionError::Other(format!(
+                    "DNS resolution failed: {e}"
+                )))
+            })?
             .next()
-            .ok_or_else(|| Error::Connection(ConnectionError::Other("DNS returned no addresses".into())))?;
+            .ok_or_else(|| {
+                Error::Connection(ConnectionError::Other("DNS returned no addresses".into()))
+            })?;
 
         let tcp = TcpStream::connect(addr)?;
 
         match url.scheme {
             Scheme::Https => {
-                let server_name = ServerName::try_from(host_str.to_owned())
-                    .map_err(|e| Error::Connection(ConnectionError::Other(format!("invalid server name: {e}"))))?;
-                let conn = ClientConnection::new(Arc::clone(tls_config), server_name)
-                    .map_err(|e| xibalba_proto::error::TlsError { message: e.to_string() })?;
+                let server_name = ServerName::try_from(host_str.to_owned()).map_err(|e| {
+                    Error::Connection(ConnectionError::Other(format!("invalid server name: {e}")))
+                })?;
+                let conn =
+                    ClientConnection::new(Arc::clone(tls_config), server_name).map_err(|e| {
+                        xibalba_proto::error::TlsError {
+                            message: e.to_string(),
+                        }
+                    })?;
                 Ok(Stream::Tls(Box::new(StreamOwned::new(conn, tcp))))
             }
             Scheme::Http => Ok(Stream::Plain(tcp)),
@@ -95,7 +107,9 @@ fn build_tls_config() -> Result<Arc<ClientConfig>, Error> {
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
-        .map_err(|e| xibalba_proto::error::TlsError { message: e.to_string() })?
+        .map_err(|e| xibalba_proto::error::TlsError {
+            message: e.to_string(),
+        })?
         .with_root_certificates(root_store)
         .with_no_client_auth();
     Ok(Arc::new(config))
@@ -105,7 +119,8 @@ fn build_tls_config() -> Result<Arc<ClientConfig>, Error> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_config = build_tls_config()?;
-    let mut client = Client::<TcpConnector>::connect_default(b"https://httpbin.org/get", tls_config)?;
+    let mut client =
+        Client::<TcpConnector>::connect_default(b"https://httpbin.org/get", tls_config)?;
     let response = client.get(b"/get")?;
 
     println!("Status: {}", response.status);
