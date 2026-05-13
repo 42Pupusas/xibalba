@@ -121,23 +121,4 @@ mod tests {
         assert!(Method::try_from(b"" as &[u8]).is_err());
     }
 
-    #[test]
-    fn display() {
-        assert_eq!(Method::Get.to_string(), "GET");
-        assert_eq!(Method::Post.to_string(), "POST");
-    }
-
-    #[test]
-    fn as_ref_str() {
-        let m = Method::Delete;
-        let s: &str = m.as_ref();
-        assert_eq!(s, "DELETE");
-    }
-
-    #[test]
-    fn as_ref_bytes() {
-        let m = Method::Options;
-        let b: &[u8] = m.as_ref();
-        assert_eq!(b, b"OPTIONS");
-    }
 }

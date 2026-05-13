@@ -734,4 +734,325 @@ mod tests {
         assert_eq!(total, b"0123456789");
         assert!(decoder.is_done());
     }
+
+    // ── Adversarial response head parsing ────────────────────────────────────
+
+    #[test]
+    fn garbage_status_line() {
+        let raw = b"\x00\xff\xfe garbage\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        assert!(parse_response_head(raw, &mut headers).is_err());
+    }
+
+    #[test]
+    fn truncated_version() {
+        let raw = b"HTTP/1\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidVersion));
+    }
+
+    #[test]
+    fn status_line_no_space_after_version() {
+        let raw = b"HTTP/1.1200 OK\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        assert!(parse_response_head(raw, &mut headers).is_err());
+    }
+
+    #[test]
+    fn header_with_nul_byte_in_name() {
+        let raw = b"HTTP/1.1 200 OK\r\nBad\x00Name: val\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
+    }
+
+    #[test]
+    fn header_missing_colon() {
+        // Parser scans tchar-by-tchar; \r is not a tchar, so InvalidHeaderName
+        // fires before MissingColon can be reached.
+        let raw = b"HTTP/1.1 200 OK\r\nHeaderNoColon\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
+    }
+
+    #[test]
+    fn header_empty_name() {
+        let raw = b"HTTP/1.1 200 OK\r\n: value\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
+    }
+
+    #[test]
+    fn header_name_with_space() {
+        let raw = b"HTTP/1.1 200 OK\r\nBad Name: val\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
+    }
+
+    #[test]
+    fn header_value_ows_trimmed() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Test:   spaced   \r\n\r\n";
+        let (head, _, headers) = make_response(raw);
+        assert_eq!(head.header_count, 1);
+        assert_eq!(headers[0].value, b"spaced");
+    }
+
+    #[test]
+    fn only_crlf_no_status_line() {
+        let raw = b"\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        assert!(parse_response_head(raw, &mut headers).is_err());
+    }
+
+    #[test]
+    fn status_line_exactly_min_length() {
+        // "HTTP/1.1 200" is exactly 12 bytes — the minimum.
+        let raw = b"HTTP/1.1 200\r\n\r\n";
+        let (head, _, _) = make_response(raw);
+        assert_eq!(head.status, StatusCode::OK);
+        assert_eq!(head.reason, b"");
+    }
+
+    // ── Adversarial body framing ─────────────────────────────────────────────
+
+    #[test]
+    fn body_framing_304_no_body() {
+        let headers = [Header {
+            name: HeaderName::ContentLength,
+            value: b"1000",
+        }];
+        assert_eq!(
+            determine_body_framing(StatusCode::NOT_MODIFIED, false, &headers, 1),
+            BodyFraming::None
+        );
+    }
+
+    #[test]
+    fn body_framing_1xx_no_body() {
+        let headers: [Header<'_>; 0] = [];
+        assert_eq!(
+            determine_body_framing(StatusCode::CONTINUE, false, &headers, 0),
+            BodyFraming::None
+        );
+    }
+
+    #[test]
+    fn content_length_zero() {
+        let headers = [Header {
+            name: HeaderName::ContentLength,
+            value: b"0",
+        }];
+        assert_eq!(
+            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::ContentLength(0)
+        );
+    }
+
+    #[test]
+    fn content_length_with_ows() {
+        let headers = [Header {
+            name: HeaderName::ContentLength,
+            value: b" 42 ",
+        }];
+        assert_eq!(
+            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::ContentLength(42)
+        );
+    }
+
+    #[test]
+    fn content_length_non_numeric_falls_through() {
+        let headers = [Header {
+            name: HeaderName::ContentLength,
+            value: b"abc",
+        }];
+        assert_eq!(
+            determine_body_framing(StatusCode::OK, false, &headers, 0),
+            BodyFraming::UntilClose
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_not_chunked() {
+        let headers = [Header {
+            name: HeaderName::TransferEncoding,
+            value: b"gzip",
+        }];
+        assert_eq!(
+            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::UntilClose
+        );
+    }
+
+    #[test]
+    fn duplicate_transfer_encoding_both_chunked() {
+        let headers = [
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"chunked",
+            },
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"chunked",
+            },
+        ];
+        assert_eq!(
+            determine_body_framing(StatusCode::OK, false, &headers, 2),
+            BodyFraming::Chunked
+        );
+    }
+
+    // ── Adversarial chunked decoder ──────────────────────────────────────────
+
+    #[test]
+    fn chunk_size_overflow() {
+        let input = b"FFFFFFFFFFFFFFFF0\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, _) = decoder.decode(input, &mut output);
+        assert!(matches!(result, DecodeResult::Error(ParseError::InvalidChunkSize)));
+    }
+
+    #[test]
+    fn chunk_size_leading_zeros() {
+        let input = b"007\r\nabcdefg\r\n0\r\n\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let mut total = Vec::new();
+        let mut pos = 0;
+
+        loop {
+            let (result, consumed) = decoder.decode(&input[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                DecodeResult::Done => break,
+                DecodeResult::NeedMore => {}
+                DecodeResult::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert_eq!(total, b"abcdefg");
+        assert!(decoder.is_done());
+    }
+
+    #[test]
+    fn chunk_missing_crlf_after_data() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+
+        // Feed size + data in one call so decoder yields the body data.
+        let (result, _) = decoder.decode(b"5\r\nhello", &mut output);
+        assert_eq!(result, DecodeResult::Data(5));
+        assert_eq!(&output[..5], b"hello");
+
+        // Now feed 'X' where \r\n was expected.
+        let (result, _) = decoder.decode(b"X", &mut output);
+        assert!(matches!(result, DecodeResult::Error(ParseError::InvalidChunkTerminator)));
+    }
+
+    #[test]
+    fn chunk_decode_empty_input() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, consumed) = decoder.decode(b"", &mut output);
+        assert_eq!(result, DecodeResult::NeedMore);
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn chunk_multiple_trailers() {
+        let input = b"5\r\nhello\r\n0\r\nTrailer-A: 1\r\nTrailer-B: 2\r\n\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let mut total = Vec::new();
+        let mut pos = 0;
+
+        loop {
+            let (result, consumed) = decoder.decode(&input[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                DecodeResult::Done => break,
+                DecodeResult::NeedMore => {}
+                DecodeResult::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert_eq!(total, b"hello");
+        assert!(decoder.is_done());
+    }
+
+    #[test]
+    fn chunk_extension_with_quoted_value() {
+        let input = b"5;ext=\"val\"\r\nhello\r\n0\r\n\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let mut total = Vec::new();
+        let mut pos = 0;
+
+        loop {
+            let (result, consumed) = decoder.decode(&input[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                DecodeResult::Done => break,
+                DecodeResult::NeedMore => {}
+                DecodeResult::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert_eq!(total, b"hello");
+    }
+
+    #[test]
+    fn chunk_interleaved_partial_feeds() {
+        // Feed the chunk size partially, then the rest
+        let part1 = b"1";
+        let part2 = b"0\r\n0123456789abcdef\r\n0\r\n\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let mut total = Vec::new();
+
+        let (result, _) = decoder.decode(part1, &mut output);
+        assert_eq!(result, DecodeResult::NeedMore);
+
+        let mut pos = 0;
+        loop {
+            let (result, consumed) = decoder.decode(&part2[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                DecodeResult::Done => break,
+                DecodeResult::NeedMore => {}
+                DecodeResult::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert_eq!(total, b"0123456789abcdef");
+        assert!(decoder.is_done());
+    }
+
+    #[test]
+    fn chunk_invalid_hex_in_size() {
+        let input = b"ZZ\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, _) = decoder.decode(input, &mut output);
+        assert!(matches!(result, DecodeResult::Error(ParseError::InvalidChunkSize)));
+    }
+
+    #[test]
+    fn chunk_empty_body_immediate_terminator() {
+        let input = b"0\r\n\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, _) = decoder.decode(input, &mut output);
+        assert_eq!(result, DecodeResult::Done);
+        assert!(decoder.is_done());
+    }
 }

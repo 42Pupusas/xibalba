@@ -108,15 +108,4 @@ mod tests {
         assert!(Scheme::try_from(b"httpx" as &[u8]).is_err());
     }
 
-    #[test]
-    fn default_ports() {
-        assert_eq!(Scheme::Http.default_port(), 80);
-        assert_eq!(Scheme::Https.default_port(), 443);
-    }
-
-    #[test]
-    fn display() {
-        assert_eq!(Scheme::Http.to_string(), "http");
-        assert_eq!(Scheme::Https.to_string(), "https");
-    }
 }

@@ -8,6 +8,7 @@ use xibalba_proto::version::Version;
 pub const HEAD_BUF_SIZE: usize = 8192;
 pub use xibalba_proto::response::MAX_HEADERS;
 
+#[derive(Debug)]
 pub struct HeadData {
     pub version: Version,
     pub status: StatusCode,
@@ -33,6 +34,7 @@ impl HeadData {
 
 /// In-memory body reader with a specialised `read_to_end` that does a single
 /// `extend_from_slice` instead of reading through the `Read` trait.
+#[derive(Debug)]
 pub struct BodyReader {
     data: Vec<u8>,
     pos: usize,
@@ -69,6 +71,7 @@ impl Read for BodyReader {
 pub(crate) fn read_response_head<S: Read>(
     stream: &mut S,
     head_acc: &mut Vec<u8>,
+    max_head: usize,
 ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
     use xibalba_proto::header::Header;
     use xibalba_proto::response::{build_ranges, determine_body_framing, parse_response_head};
@@ -82,6 +85,9 @@ pub(crate) fn read_response_head<S: Read>(
             return Err(ConnectionError::ConnectionClosed.into());
         }
         head_acc.extend_from_slice(&raw[..n]);
+        if head_acc.len() > max_head {
+            return Err(ConnectionError::HeadTooLarge.into());
+        }
         if let Some(pos) = head_acc.windows(4).position(|w| w == b"\r\n\r\n") {
             break pos + 4;
         }
@@ -116,6 +122,7 @@ pub(crate) fn read_body<S: Read>(
     stream: &mut S,
     framing: &xibalba_proto::response::BodyFraming,
     tail: &[u8],
+    max_body: usize,
 ) -> Result<Vec<u8>, Error> {
     use xibalba_proto::response::{BodyFraming as ProtoFraming, ChunkedDecoder, DecodeResult};
 
@@ -125,6 +132,9 @@ pub(crate) fn read_body<S: Read>(
         ProtoFraming::ContentLength(len) => {
             let len = usize::try_from(len)
                 .map_err(|_| Error::from(ConnectionError::ContentLengthOverflow))?;
+            if len > max_body {
+                return Err(ConnectionError::BodyTooLarge.into());
+            }
             let mut body = Vec::with_capacity(len);
             let from_tail = tail.len().min(len);
             body.extend_from_slice(&tail[..from_tail]);
@@ -146,7 +156,12 @@ pub(crate) fn read_body<S: Read>(
                 let (result, consumed) = decoder.decode(input, &mut decode_buf);
                 input = &input[consumed..];
                 match result {
-                    DecodeResult::Data(n) => body.extend_from_slice(&decode_buf[..n]),
+                    DecodeResult::Data(n) => {
+                        body.extend_from_slice(&decode_buf[..n]);
+                        if body.len() > max_body {
+                            return Err(ConnectionError::BodyTooLarge.into());
+                        }
+                    }
                     DecodeResult::Done => return Ok(body),
                     DecodeResult::NeedMore => break,
                     DecodeResult::Error(e) => return Err(Error::Parse(e)),
@@ -163,7 +178,12 @@ pub(crate) fn read_body<S: Read>(
                     let (result, consumed) = decoder.decode(&raw[pos..n], &mut decode_buf);
                     pos += consumed;
                     match result {
-                        DecodeResult::Data(dn) => body.extend_from_slice(&decode_buf[..dn]),
+                        DecodeResult::Data(dn) => {
+                            body.extend_from_slice(&decode_buf[..dn]);
+                            if body.len() > max_body {
+                                return Err(ConnectionError::BodyTooLarge.into());
+                            }
+                        }
                         DecodeResult::Done => return Ok(body),
                         DecodeResult::NeedMore => break,
                         DecodeResult::Error(e) => return Err(Error::Parse(e)),
@@ -181,6 +201,9 @@ pub(crate) fn read_body<S: Read>(
                     return Ok(body);
                 }
                 body.extend_from_slice(&raw[..n]);
+                if body.len() > max_body {
+                    return Err(ConnectionError::BodyTooLarge.into());
+                }
             }
         }
     }

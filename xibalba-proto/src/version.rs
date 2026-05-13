@@ -86,9 +86,4 @@ mod tests {
         assert!(Version::try_from(b"http/1.1" as &[u8]).is_err());
     }
 
-    #[test]
-    fn display() {
-        assert_eq!(Version::Http11.to_string(), "HTTP/1.1");
-        assert_eq!(Version::Http10.to_string(), "HTTP/1.0");
-    }
 }

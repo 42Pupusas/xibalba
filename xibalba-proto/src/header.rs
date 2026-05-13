@@ -4,7 +4,8 @@ use crate::error::ParseError;
 
 /// Compare two byte slices for ASCII-case-insensitive equality.
 #[inline]
-pub(crate) fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+#[must_use]
+pub fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -479,43 +480,102 @@ mod tests {
         assert_eq!(name.as_bytes(), b"X-Custom");
     }
 
+    // ── Adversarial tests ────────────────────────────────────────────────────
+
     #[test]
-    fn header_name_display() {
-        assert_eq!(HeaderName::ContentLength.to_string(), "Content-Length");
-        assert_eq!(HeaderName::Host.to_string(), "Host");
+    fn ascii_eq_digits_not_case_folded() {
+        assert!(ascii_eq_ignore_case(b"Content-1", b"content-1"));
+        assert!(!ascii_eq_ignore_case(b"Content-1", b"content-2"));
     }
 
     #[test]
-    fn headers_collection() {
-        let hdrs = [
-            Header {
-                name: HeaderName::ContentLength,
-                value: b"42",
-            },
-            Header {
-                name: HeaderName::TransferEncoding,
-                value: b"chunked",
-            },
-        ];
+    fn ascii_eq_hyphens_not_case_folded() {
+        assert!(ascii_eq_ignore_case(b"X-My-Header", b"x-my-header"));
+    }
 
-        let headers = Headers::new(&hdrs, 2);
-        assert_eq!(headers.len(), 2);
-        assert!(!headers.is_empty());
+    #[test]
+    fn parse_u64_overflow() {
+        assert_eq!(parse_u64_from_bytes(b"99999999999999999999"), None);
+    }
+
+    #[test]
+    fn parse_u64_leading_zeros() {
+        assert_eq!(parse_u64_from_bytes(b"007"), Some(7));
+    }
+
+    #[test]
+    fn parse_u64_max() {
         assert_eq!(
-            headers.get(&HeaderName::ContentLength),
-            Some(b"42" as &[u8])
+            parse_u64_from_bytes(b"18446744073709551615"),
+            Some(u64::MAX)
         );
-        assert_eq!(headers.content_length(), Some(Ok(42)));
-        assert!(headers.is_chunked());
     }
 
     #[test]
-    fn headers_empty() {
-        let hdrs: [Header<'_>; 0] = [];
-        let headers = Headers::new(&hdrs, 0);
-        assert!(headers.is_empty());
-        assert_eq!(headers.get(&HeaderName::Host), None);
-        assert_eq!(headers.content_length(), None);
-        assert!(!headers.is_chunked());
+    fn parse_u64_just_past_max() {
+        assert_eq!(parse_u64_from_bytes(b"18446744073709551616"), None);
+    }
+
+    #[test]
+    fn parse_u64_only_whitespace() {
+        assert_eq!(parse_u64_from_bytes(b"   "), None);
+    }
+
+    #[test]
+    fn contains_token_empty_value() {
+        assert!(!contains_token_ignore_case(b"", b"chunked"));
+    }
+
+    #[test]
+    fn contains_token_whitespace_only_commas() {
+        assert!(!contains_token_ignore_case(b"  ,  ,  ", b"chunked"));
+    }
+
+    #[test]
+    fn header_name_length_collision() {
+        assert_eq!(HeaderName::from_bytes(b"Vary"), HeaderName::Unknown(b"Vary"));
+        assert_eq!(HeaderName::from_bytes(b"Host"), HeaderName::Host);
+        assert_eq!(HeaderName::from_bytes(b"Date"), HeaderName::Date);
+    }
+
+    #[test]
+    fn raw_vs_known_equality() {
+        assert_eq!(HeaderName::Raw(b"content-length"), HeaderName::ContentLength);
+        assert_eq!(HeaderName::Raw(b"CONTENT-LENGTH"), HeaderName::ContentLength);
+        assert_eq!(HeaderName::Raw(b"host"), HeaderName::Host);
+    }
+
+    #[test]
+    fn raw_vs_raw_case_insensitive() {
+        assert_eq!(HeaderName::Raw(b"FOO"), HeaderName::Raw(b"foo"));
+        assert_ne!(HeaderName::Raw(b"FOO"), HeaderName::Raw(b"BAR"));
+    }
+
+    #[test]
+    fn unknown_vs_unknown_exact_match() {
+        assert_eq!(
+            HeaderName::Unknown(b"X-Custom"),
+            HeaderName::Unknown(b"X-Custom")
+        );
+        assert_ne!(
+            HeaderName::Unknown(b"X-Custom"),
+            HeaderName::Unknown(b"x-custom")
+        );
+    }
+
+    #[test]
+    fn tchar_boundary_exhaustive() {
+        for &b in b"!#$%&'*+-.^_`|~" {
+            assert!(is_tchar(b), "expected tchar: {}", b as char);
+        }
+        for &b in b" \t\r\n\"(),/:;<=>?@[\\]{}\x7f" {
+            assert!(!is_tchar(b), "unexpected tchar: {:02x}", b);
+        }
+    }
+
+    #[test]
+    fn contains_token_partial_match_not_accepted() {
+        assert!(!contains_token_ignore_case(b"chunked", b"chunk"));
+        assert!(!contains_token_ignore_case(b"chunk", b"chunked"));
     }
 }

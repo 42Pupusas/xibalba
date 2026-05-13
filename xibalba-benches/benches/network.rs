@@ -256,7 +256,7 @@ fn network_enabled() -> bool {
 
 fn xibalba_client(port: u16) -> Client<PlainConnector> {
     let url = format!("http://127.0.0.1:{port}/");
-    Client::<PlainConnector>::connect(url.as_bytes(), ()).unwrap()
+    Client::<PlainConnector>::connect_default(url.as_bytes(), ()).unwrap()
 }
 
 fn ureq_agent() -> ureq::Agent {
@@ -281,7 +281,7 @@ mod small {
         if !network_enabled() { return; }
         let mut client = xibalba_client(port_small_xibalba());
         bencher.bench_local(|| {
-            let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
+            let mut resp = client.request(black_box(Method::Get), b"/", None, None).unwrap();
             let mut body = Vec::new();
             resp.body.read_to_end(&mut body).unwrap();
             black_box(&body);
@@ -329,7 +329,7 @@ mod large_resp {
         if !network_enabled() { return; }
         let mut client = xibalba_client(port_large_resp_xibalba());
         bencher.bench_local(|| {
-            let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
+            let mut resp = client.request(black_box(Method::Get), b"/", None, None).unwrap();
             let mut body = Vec::new();
             resp.body.read_to_end(&mut body).unwrap();
             black_box(&body);
@@ -378,7 +378,7 @@ mod large_req {
         let mut client = xibalba_client(port_large_req_xibalba());
         bencher.bench_local(|| {
             let mut resp = client
-                .request(black_box(Method::Get), b"/search", Some(black_box(LARGE_QUERY)))
+                .request(black_box(Method::Get), b"/search", Some(black_box(LARGE_QUERY)), None)
                 .unwrap();
             let mut body = Vec::new();
             resp.body.read_to_end(&mut body).unwrap();
@@ -429,7 +429,7 @@ mod stress {
         let mut client = xibalba_client(port_stress_xibalba());
         bencher.bench_local(|| {
             for _ in 0..1000 {
-                let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
+                let mut resp = client.request(black_box(Method::Get), b"/", None, None).unwrap();
                 let mut body = Vec::new();
                 resp.body.read_to_end(&mut body).unwrap();
                 black_box(&body);

@@ -105,7 +105,7 @@ fn build_tls_config() -> Result<Arc<ClientConfig>, Error> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_config = build_tls_config()?;
-    let mut client = Client::<TcpConnector>::connect(b"https://httpbin.org/get", tls_config)?;
+    let mut client = Client::<TcpConnector>::connect_default(b"https://httpbin.org/get", tls_config)?;
     let response = client.get(b"/get")?;
 
     println!("Status: {}", response.status);

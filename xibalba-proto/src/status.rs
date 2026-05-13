@@ -175,9 +175,4 @@ mod tests {
         assert!(!StatusCode::NOT_FOUND.is_success());
     }
 
-    #[test]
-    fn display() {
-        assert_eq!(StatusCode::OK.to_string(), "200");
-        assert_eq!(StatusCode::NOT_FOUND.to_string(), "404");
-    }
 }

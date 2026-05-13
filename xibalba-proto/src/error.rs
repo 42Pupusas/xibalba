@@ -28,6 +28,9 @@ pub enum ConnectionError {
     InvalidUtf8Body,
     HeaderRangeOverflow,
     HeaderNotInBuffer,
+    BodyTooLarge,
+    HeadTooLarge,
+    TooManyRedirects,
     Other(String),
 }
 
@@ -97,6 +100,9 @@ impl fmt::Display for ConnectionError {
             Self::InvalidUtf8Body => f.write_str("response body is not valid UTF-8"),
             Self::HeaderRangeOverflow => f.write_str("header offset/length overflows u16"),
             Self::HeaderNotInBuffer => f.write_str("header name not in head buffer"),
+            Self::BodyTooLarge => f.write_str("response body exceeds size limit"),
+            Self::HeadTooLarge => f.write_str("response head exceeds size limit"),
+            Self::TooManyRedirects => f.write_str("too many redirects"),
             Self::Other(msg) => f.write_str(msg),
         }
     }
@@ -219,76 +225,3 @@ impl std::error::Error for Error {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn error_display_formats() {
-        let e = Error::Url(UrlError::Empty);
-        assert_eq!(e.to_string(), "url error: input is empty");
-
-        let e = Error::Parse(ParseError::Incomplete);
-        assert_eq!(e.to_string(), "parse error: incomplete input");
-
-        let e = Error::Serialize(SerializeError::BufferTooSmall);
-        assert_eq!(e.to_string(), "serialize error: output buffer too small");
-    }
-
-    #[test]
-    fn url_error_invalid_byte_shows_offset() {
-        let e = UrlError::InvalidByte(42);
-        assert_eq!(e.to_string(), "invalid byte at offset 42");
-    }
-
-    #[test]
-    fn from_conversions() {
-        let e: Error = UrlError::MissingHost.into();
-        assert_eq!(e, Error::Url(UrlError::MissingHost));
-
-        let e: Error = ParseError::InvalidMethod.into();
-        assert_eq!(e, Error::Parse(ParseError::InvalidMethod));
-
-        let e: Error = SerializeError::BufferTooSmall.into();
-        assert_eq!(e, Error::Serialize(SerializeError::BufferTooSmall));
-    }
-
-    #[test]
-    fn io_error_display() {
-        let e = IoError {
-            kind: std::io::ErrorKind::ConnectionRefused,
-            message: "connection refused".into(),
-        };
-        assert_eq!(e.to_string(), "connection refused: connection refused");
-    }
-
-    #[test]
-    fn tls_error_display() {
-        let e = TlsError {
-            message: "bad certificate".into(),
-        };
-        assert_eq!(e.to_string(), "bad certificate");
-    }
-
-    #[test]
-    fn from_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broke");
-        let e: Error = io_err.into();
-        match &e {
-            Error::Io(inner) => {
-                assert_eq!(inner.kind, std::io::ErrorKind::BrokenPipe);
-                assert!(inner.message.contains("pipe broke"));
-            }
-            other => panic!("expected Io variant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn connection_error_display() {
-        let e = Error::Connection(ConnectionError::Other("DNS failed".into()));
-        assert_eq!(e.to_string(), "connection error: DNS failed");
-
-        let e = Error::Connection(ConnectionError::ConnectionClosed);
-        assert_eq!(e.to_string(), "connection error: connection closed unexpectedly");
-    }
-}

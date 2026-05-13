@@ -348,4 +348,96 @@ mod tests {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], (b"only" as &[u8], Some(b"one" as &[u8])));
     }
+
+    // ── Adversarial URL tests ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_port() {
+        let err = Url::parse(b"http://host:/path").unwrap_err();
+        assert_eq!(err, Error::Url(UrlError::InvalidPort));
+    }
+
+    #[test]
+    fn port_zero() {
+        let url = Url::parse(b"http://host:0/path").unwrap();
+        assert_eq!(url.port, Some(0));
+    }
+
+    #[test]
+    fn port_65535() {
+        let url = Url::parse(b"http://host:65535/path").unwrap();
+        assert_eq!(url.port, Some(65535));
+    }
+
+    #[test]
+    fn port_65536() {
+        assert!(Url::parse(b"http://host:65536/path").is_err());
+    }
+
+    #[test]
+    fn scheme_only_no_host() {
+        let err = Url::parse(b"http://").unwrap_err();
+        assert_eq!(err, Error::Url(UrlError::MissingHost));
+    }
+
+    #[test]
+    fn double_slash_in_path() {
+        let url = Url::parse(b"http://host//path").unwrap();
+        assert_eq!(url.path, b"//path");
+    }
+
+    #[test]
+    fn query_with_consecutive_ampersands() {
+        let url = Url::parse(b"http://x.com/?a=1&&b=2").unwrap();
+        let params: Vec<_> = url.query_params().collect();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0], (b"a" as &[u8], Some(b"1" as &[u8])));
+        assert_eq!(params[1], (b"" as &[u8], None));
+        assert_eq!(params[2], (b"b" as &[u8], Some(b"2" as &[u8])));
+    }
+
+    #[test]
+    fn fragment_with_query_chars() {
+        let url = Url::parse(b"http://x.com/#?foo=bar").unwrap();
+        assert_eq!(url.query, None);
+        assert_eq!(url.fragment, Some(b"?foo=bar" as &[u8]));
+    }
+
+    #[test]
+    fn very_long_host() {
+        let mut input = b"http://".to_vec();
+        input.extend_from_slice(&[b'a'; 256]);
+        input.extend_from_slice(b"/path");
+        let url = Url::parse(&input).unwrap();
+        assert_eq!(url.host.len(), 256);
+    }
+
+    #[test]
+    fn ipv6_missing_bracket() {
+        assert!(Url::parse(b"http://[::1/path").is_err());
+    }
+
+    #[test]
+    fn ipv6_garbage_after_bracket() {
+        assert!(Url::parse(b"http://[::1]garbage/path").is_err());
+    }
+
+    #[test]
+    fn path_with_special_chars() {
+        let url = Url::parse(b"http://host/a/b/../c").unwrap();
+        // No normalization — raw path preserved
+        assert_eq!(url.path, b"/a/b/../c");
+    }
+
+    #[test]
+    fn query_with_equals_in_value() {
+        let url = Url::parse(b"http://x.com/?key=a=b=c").unwrap();
+        let params: Vec<_> = url.query_params().collect();
+        assert_eq!(params[0], (b"key" as &[u8], Some(b"a=b=c" as &[u8])));
+    }
+
+    #[test]
+    fn scheme_with_trailing_colon_no_slashes() {
+        assert!(Url::parse(b"http:host/path").is_err());
+    }
 }

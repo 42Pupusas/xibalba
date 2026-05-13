@@ -1,25 +1,50 @@
 use std::io::Write;
+use std::time::Duration;
 
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
+use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
 use xibalba_proto::version::Version;
 
 use crate::body::{BodyReader, HeadData, HEAD_BUF_SIZE, read_body, read_response_head};
 use crate::connector::Connector;
 
+pub struct Config {
+    pub read_timeout: Option<Duration>,
+    pub max_response_body: usize,
+    pub max_head_size: usize,
+    pub max_redirects: u8,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            read_timeout: Some(Duration::from_secs(30)),
+            max_response_body: 10 * 1024 * 1024,
+            max_head_size: 16 * 1024,
+            max_redirects: 10,
+        }
+    }
+}
+
 pub struct Client<C: Connector> {
-    _tls_config: C::TlsConfig,
+    tls_config: C::TlsConfig,
     stream: C::Stream,
+    config: Config,
+    host: Vec<u8>,
+    port: u16,
+    scheme: xibalba_proto::scheme::Scheme,
     write_buf: Vec<u8>,
     head_buf: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct Response {
     pub version: Version,
-    pub status: xibalba_proto::status::StatusCode,
+    pub status: StatusCode,
     pub head: HeadData,
     pub body: BodyReader,
 }
@@ -46,25 +71,85 @@ impl<C: Connector> Client<C> {
     /// # Errors
     ///
     /// Returns `Error` on connection failure.
-    pub fn connect(url_bytes: &[u8], tls_config: C::TlsConfig) -> Result<Self, Error> {
+    pub fn connect(url_bytes: &[u8], tls_config: C::TlsConfig, config: Config) -> Result<Self, Error> {
         let url = Url::parse(url_bytes)?;
         let stream = C::connect(&url, &tls_config)?;
-        Ok(Self {
-            _tls_config: tls_config,
+        let host = url.host.to_vec();
+        let port = url.effective_port();
+        let scheme = url.scheme;
+
+        let client = Self {
+            tls_config,
             stream,
+            config,
+            host,
+            port,
+            scheme,
             write_buf: Vec::with_capacity(512),
             head_buf: Vec::with_capacity(HEAD_BUF_SIZE),
-        })
+        };
+        client.apply_timeouts()?;
+        Ok(client)
     }
 
+    /// Connect with default configuration.
+    ///
     /// # Errors
     ///
-    /// Returns `Error` on serialization failure or connection error.
-    pub fn request(&mut self, method: Method, path: &[u8], query: Option<&[u8]>) -> Result<Response, Error> {
-        let headers = [
-            Header { name: HeaderName::Connection, value: b"keep-alive" },
-            Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" },
-        ];
+    /// Returns `Error` on connection failure.
+    pub fn connect_default(url_bytes: &[u8], tls_config: C::TlsConfig) -> Result<Self, Error> {
+        Self::connect(url_bytes, tls_config, Config::default())
+    }
+
+    fn apply_timeouts(&self) -> Result<(), Error> {
+        use crate::connector::SetReadTimeout;
+        self.stream.set_read_timeout(self.config.read_timeout)?;
+        Ok(())
+    }
+
+    fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
+        self.stream = C::connect(url, &self.tls_config)?;
+        self.host = url.host.to_vec();
+        self.port = url.effective_port();
+        self.scheme = url.scheme;
+        self.apply_timeouts()?;
+        Ok(())
+    }
+
+    fn host_header_value(&self) -> Vec<u8> {
+        let default_port = self.scheme.default_port();
+        if self.port == default_port {
+            self.host.clone()
+        } else {
+            let mut val = self.host.clone();
+            val.push(b':');
+            val.extend_from_slice(self.port.to_string().as_bytes());
+            val
+        }
+    }
+
+    fn send_request(
+        &mut self,
+        method: Method,
+        path: &[u8],
+        query: Option<&[u8]>,
+        body: Option<&[u8]>,
+    ) -> Result<Response, Error> {
+        let host_value = self.host_header_value();
+        let content_len_str;
+        let mut headers = Vec::with_capacity(4);
+        headers.push(Header { name: HeaderName::Host, value: &host_value });
+        headers.push(Header { name: HeaderName::Connection, value: b"keep-alive" });
+        headers.push(Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" });
+
+        if let Some(data) = body {
+            content_len_str = data.len().to_string();
+            headers.push(Header {
+                name: HeaderName::ContentLength,
+                value: content_len_str.as_bytes(),
+            });
+        }
+
         let req = Request {
             method,
             path,
@@ -76,10 +161,23 @@ impl<C: Connector> Client<C> {
         req.serialize_to_writer(&mut self.write_buf)?;
 
         self.stream.write_all(&self.write_buf)?;
+        if let Some(data) = body {
+            self.stream.write_all(data)?;
+        }
         self.stream.flush()?;
 
-        let (head_data, framing, tail_offset) = read_response_head(&mut self.stream, &mut self.head_buf)?;
-        let body_data = read_body(&mut self.stream, &framing, &self.head_buf[tail_offset..])?;
+        let (head_data, framing, tail_offset) = read_response_head(
+            &mut self.stream,
+            &mut self.head_buf,
+            self.config.max_head_size,
+        )?;
+
+        let body_data = read_body(
+            &mut self.stream,
+            &framing,
+            &self.head_buf[tail_offset..],
+            self.config.max_response_body,
+        )?;
 
         Ok(Response {
             version: head_data.version,
@@ -91,8 +189,100 @@ impl<C: Connector> Client<C> {
 
     /// # Errors
     ///
+    /// Returns `Error` on serialization failure, connection error, or if
+    /// the redirect limit is exceeded.
+    pub fn request(
+        &mut self,
+        method: Method,
+        path: &[u8],
+        query: Option<&[u8]>,
+        body: Option<&[u8]>,
+    ) -> Result<Response, Error> {
+        let mut current_method = method;
+        let mut current_path: Vec<u8> = path.to_vec();
+        let mut current_query: Option<Vec<u8>> = query.map(<[u8]>::to_vec);
+        let mut current_body = body.map(<[u8]>::to_vec);
+
+        for _ in 0..=self.config.max_redirects {
+            let resp = self.send_request(
+                current_method,
+                &current_path,
+                current_query.as_deref(),
+                current_body.as_deref(),
+            )?;
+
+            if !resp.status.is_redirect() {
+                return Ok(resp);
+            }
+
+            let location = resp
+                .headers()
+                .find(|(name, _)| {
+                    xibalba_proto::header::ascii_eq_ignore_case(name, b"Location")
+                })
+                .map(|(_, v)| v);
+
+            let location = match location {
+                Some(loc) => loc.to_vec(),
+                None => return Ok(resp),
+            };
+
+            match resp.status {
+                StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER => {
+                    current_method = Method::Get;
+                    current_body = None;
+                }
+                StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {}
+                _ => return Ok(resp),
+            }
+
+            if location.starts_with(b"http://") || location.starts_with(b"https://") {
+                let url = Url::parse(&location)?;
+                let target_port = url.effective_port();
+                let same_origin = url.host == &self.host[..]
+                    && target_port == self.port
+                    && url.scheme == self.scheme;
+                if !same_origin {
+                    self.reconnect(&url)?;
+                }
+                current_path = if url.path.is_empty() {
+                    b"/".to_vec()
+                } else {
+                    url.path.to_vec()
+                };
+                current_query = url.query.map(<[u8]>::to_vec);
+            } else {
+                let (path_part, query_part) = location
+                    .iter()
+                    .position(|&b| b == b'?')
+                    .map_or((location.as_slice(), None), |pos| {
+                        (&location[..pos], Some(location[pos + 1..].to_vec()))
+                    });
+                current_path = if path_part.is_empty() {
+                    b"/".to_vec()
+                } else {
+                    path_part.to_vec()
+                };
+                current_query = query_part;
+            }
+        }
+
+        Err(ConnectionError::TooManyRedirects.into())
+    }
+
+    /// # Errors
+    ///
     /// See [`request`](Self::request).
     pub fn get(&mut self, path: &[u8]) -> Result<Response, Error> {
-        self.request(Method::Get, path, None)
+        self.request(Method::Get, path, None, None)
+    }
+
+    /// # Errors
+    ///
+    /// See [`request`](Self::request).
+    pub fn post(&mut self, path: &[u8], body: &[u8]) -> Result<Response, Error> {
+        self.request(Method::Post, path, None, Some(body))
     }
 }

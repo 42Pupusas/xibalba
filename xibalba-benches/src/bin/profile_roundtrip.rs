@@ -121,14 +121,14 @@ fn spawn_server(response: Vec<u8>) -> u16 {
 fn run_blocking(response: Vec<u8>) {
     let port = spawn_server(response);
     let url = format!("http://127.0.0.1:{port}/");
-    let mut client = Client::<PlainConnector>::connect(url.as_bytes(), ()).unwrap();
+    let mut client = Client::<PlainConnector>::connect_default(url.as_bytes(), ()).unwrap();
 
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
     let t0 = std::time::Instant::now();
     for _ in 0..ITERATIONS {
-        let mut resp = client.request(black_box(Method::Get), b"/", None).unwrap();
+        let mut resp = client.request(black_box(Method::Get), b"/", None, None).unwrap();
         let content_length: usize = resp
             .headers()
             .find(|(n, _)| n.eq_ignore_ascii_case(b"content-length"))

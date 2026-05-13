@@ -258,4 +258,120 @@ mod tests {
         let len = req.serialize_to_buf(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"HEAD / HTTP/1.0\r\n\r\n");
     }
+
+    // ── Adversarial request serialization tests ──────────────────────────────
+
+    #[test]
+    fn buffer_exactly_right_size() {
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &[],
+        };
+        let exact = req.serialized_len();
+        let mut buf = vec![0u8; exact];
+        let len = req.serialize_to_buf(&mut buf).unwrap();
+        assert_eq!(len, exact);
+    }
+
+    #[test]
+    fn buffer_one_byte_short() {
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &[],
+        };
+        let exact = req.serialized_len();
+        let mut buf = vec![0u8; exact - 1];
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::BufferTooSmall)
+        );
+    }
+
+    #[test]
+    fn many_headers() {
+        let headers: Vec<Header<'_>> = (0..20)
+            .map(|_| Header {
+                name: HeaderName::Accept,
+                value: b"*/*",
+            })
+            .collect();
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &headers,
+        };
+        let mut buf = vec![0u8; req.serialized_len()];
+        let len = req.serialize_to_buf(&mut buf).unwrap();
+        assert_eq!(len, req.serialized_len());
+        // Verify all 20 headers appear
+        let output = &buf[..len];
+        assert_eq!(
+            output.windows(b"Accept: */*".len()).filter(|w| *w == b"Accept: */*").count(),
+            20
+        );
+    }
+
+    #[test]
+    fn header_with_empty_value() {
+        let headers = [Header {
+            name: HeaderName::Accept,
+            value: b"",
+        }];
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &headers,
+        };
+        let mut buf = [0u8; 128];
+        let len = req.serialize_to_buf(&mut buf).unwrap();
+        assert!(buf[..len].windows(10).any(|w| w == b"Accept: \r\n"));
+    }
+
+    #[test]
+    fn serialize_to_writer_matches_buf() {
+        let headers = [
+            Header { name: HeaderName::Host, value: b"example.com" },
+            Header { name: HeaderName::ContentLength, value: b"42" },
+        ];
+        let req = Request {
+            method: Method::Post,
+            path: b"/api",
+            query: Some(b"v=1"),
+            version: Version::Http11,
+            headers: &headers,
+        };
+
+        let mut buf_out = vec![0u8; req.serialized_len()];
+        let len = req.serialize_to_buf(&mut buf_out).unwrap();
+
+        let mut writer_out = Vec::new();
+        req.serialize_to_writer(&mut writer_out).unwrap();
+
+        assert_eq!(&buf_out[..len], writer_out.as_slice());
+    }
+
+    #[test]
+    fn empty_path_serializes() {
+        let req = Request {
+            method: Method::Get,
+            path: b"",
+            query: None,
+            version: Version::Http11,
+            headers: &[],
+        };
+        let mut buf = [0u8; 64];
+        let len = req.serialize_to_buf(&mut buf).unwrap();
+        // "GET  HTTP/1.1\r\n\r\n" — empty path produces double space
+        assert!(buf[..len].starts_with(b"GET  HTTP/1.1"));
+    }
 }
