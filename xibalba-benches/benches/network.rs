@@ -294,8 +294,8 @@ mod small {
         if !network_enabled() { return; }
         let (mut pool, conn) = io_uring_pool(port_small_uring());
         bencher.bench_local(|| {
-            pool.get(conn, black_box(b"/")).unwrap();
-            if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
+            let id = pool.get(conn, black_box(b"/")).unwrap();
+            if let Ok(super::ConnResult::Response(r)) = pool.recv(id) { black_box(&r.body); }
         });
     }
 
@@ -342,8 +342,8 @@ mod large_resp {
         if !network_enabled() { return; }
         let (mut pool, conn) = io_uring_pool(port_large_resp_uring());
         bencher.bench_local(|| {
-            pool.get(conn, black_box(b"/")).unwrap();
-            if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
+            let id = pool.get(conn, black_box(b"/")).unwrap();
+            if let Ok(super::ConnResult::Response(r)) = pool.recv(id) { black_box(&r.body); }
         });
     }
 
@@ -392,8 +392,8 @@ mod large_req {
         if !network_enabled() { return; }
         let (mut pool, conn) = io_uring_pool(port_large_req_uring());
         bencher.bench_local(|| {
-            pool.request(conn, black_box(Method::Get), b"/search", Some(black_box(LARGE_QUERY))).unwrap();
-            if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
+            let id = pool.request(conn, black_box(Method::Get), b"/search", Some(black_box(LARGE_QUERY))).unwrap();
+            if let Ok(super::ConnResult::Response(r)) = pool.recv(id) { black_box(&r.body); }
         });
     }
 
@@ -444,8 +444,8 @@ mod stress {
         let (mut pool, conn) = io_uring_pool(port_stress_uring());
         bencher.bench_local(|| {
             for _ in 0..1000 {
-                pool.get(conn, black_box(b"/")).unwrap();
-                if let Ok(super::ConnResult::Response(r)) = pool.recv() { black_box(&r.body); }
+                let id = pool.get(conn, black_box(b"/")).unwrap();
+                if let Ok(super::ConnResult::Response(r)) = pool.recv(id) { black_box(&r.body); }
             }
         });
     }
@@ -503,12 +503,14 @@ mod concurrent {
             // CONNS responses.  Keeps one request in-flight per connection
             // at a time while batching all CONNS sends into one submission burst.
             for _ in 0..REQS_PER_CONN {
-                for &conn in &conns {
-                    pool.get(conn, black_box(b"/")).unwrap();
+                let ids: Vec<_> = conns.iter()
+                    .map(|&conn| pool.get(conn, black_box(b"/")).unwrap())
+                    .collect();
+                for id in ids {
+                    if let Ok(super::ConnResult::Response(resp)) = pool.recv(id) {
+                        black_box(&resp.body);
+                    }
                 }
-                pool.recv_n(CONNS, |r| {
-                    if let super::ConnResult::Response(resp) = r { black_box(&resp.body); }
-                }).unwrap();
             }
         });
     }

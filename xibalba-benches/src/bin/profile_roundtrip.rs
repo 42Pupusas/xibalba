@@ -224,8 +224,8 @@ fn run_io_uring(response: Vec<u8>) {
 
     let t0 = std::time::Instant::now();
     for _i in 0..ITERATIONS {
-        pool.get(conn, black_box(b"/")).unwrap();
-        let resp = match pool.recv().unwrap_or_else(|e| panic!("io_uring recv: {e}")) {
+        let id = pool.get(conn, black_box(b"/")).unwrap();
+        let resp = match pool.recv(id).unwrap_or_else(|e| panic!("io_uring recv: {e}")) {
             xibalba_iouring::driver::ConnResult::Response(r) => r,
             xibalba_iouring::driver::ConnResult::Error { errno, .. } =>
                 panic!("io_uring error: errno {errno}"),

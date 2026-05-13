@@ -34,7 +34,7 @@ fn main() {
 
     for i in 0..5 {
         let id = pool.get(conn, b"/").unwrap_or_else(|e| panic!("iter {i}: get: {e}"));
-        let resp = match pool.recv().unwrap_or_else(|e| panic!("iter {i}: recv: {e}")) {
+        let resp = match pool.recv(id).unwrap_or_else(|e| panic!("iter {i}: recv: {e}")) {
             xibalba_iouring::driver::ConnResult::Response(r) => r,
             xibalba_iouring::driver::ConnResult::Error { request_id, errno, .. } =>
                 panic!("iter {i}: request {request_id} failed: errno {errno}"),

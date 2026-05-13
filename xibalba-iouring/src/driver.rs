@@ -71,6 +71,7 @@ pub struct ConnHandle {
 
 pub type RequestId = u64;
 
+#[derive(Debug)]
 pub struct HeadData {
     pub head_buf: Vec<u8>,
     pub ranges: [(u16, u16, u16, u16); MAX_HEADERS],
@@ -87,6 +88,7 @@ impl HeadData {
     }
 }
 
+#[derive(Debug)]
 pub struct Response {
     pub request_id: RequestId,
     pub version: Version,
@@ -102,6 +104,7 @@ impl Response {
 }
 
 /// Result delivered to the caller for each request.
+#[derive(Debug)]
 pub enum ConnResult {
     Response(Box<Response>),
     /// The connection was closed or an I/O error occurred and reconnect failed.
@@ -159,22 +162,14 @@ impl Slot {
 }
 
 struct ConnData {
-    /// Queue of `request_ids` in submission order.  The front entry is always the
-    /// one currently being received.
+    /// Queue of `request_ids` in submission order, populated by send CQEs.
     pending_ids: VecDeque<RequestId>,
     slot: Slot,
+    /// Raw bytes received before the matching send CQE arrived.
+    /// Held here and parsed once `pending_ids` is populated.
+    recv_buf: Vec<u8>,
 }
 
-impl ConnData {
-    fn current_request_id(&self) -> RequestId {
-        self.pending_ids.front().copied().unwrap_or(0)
-    }
-
-    fn advance(&mut self) {
-        self.pending_ids.pop_front();
-        self.slot.reset();
-    }
-}
 
 struct PartialResponse {
     version: Version,
@@ -221,6 +216,9 @@ pub struct Pool<
     /// the start of every `request()` call.
     pending_rearms: VecDeque<RearmMsg>,
     next_request_id: u32,
+    /// Responses that arrived out-of-order (wrong `request_id`); drained by
+    /// subsequent `recv(id)` / `poll(id)` calls.
+    stash: HashMap<RequestId, ConnResult>,
     complete_thread: Option<JoinHandle<()>>,
 }
 
@@ -266,6 +264,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             rearm_rx,
             pending_rearms: VecDeque::new(),
             next_request_id: 1,
+            stash: HashMap::new(),
             complete_thread: Some(complete_thread),
         })
     }
@@ -390,31 +389,61 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         self.request(conn, Method::Get, path, None)
     }
 
-    pub fn poll(&mut self) -> Option<ConnResult> {
-        match self.response_rx.pop()? {
-            ConnResult::Error { request_id, conn, errno } =>
-                Some(self.handle_error(request_id, conn, errno)),
-            other => Some(other),
+    /// Non-blocking: returns the response for `id` if it has already arrived,
+    /// `None` otherwise.
+    pub fn poll(&mut self, id: RequestId) -> Option<ConnResult> {
+        // Drain the ring into the stash first so we don't miss anything.
+        while let Some(r) = self.response_rx.pop() {
+            let r = match r {
+                ConnResult::Error { request_id, conn, errno } =>
+                    self.handle_error(request_id, conn, errno),
+                other => other,
+            };
+            let rid = result_id(&r);
+            self.stash.insert(rid, r);
         }
+        self.stash.remove(&id)
     }
 
-    /// # Errors
-    /// Returns an error if the complete thread has exited unexpectedly.
-    pub fn recv(&mut self) -> Result<ConnResult, Error> {
-        let r = self.response_rx.pop_block()
-            .ok_or_else(|| Error::Connection("complete thread exited unexpectedly".into()))?;
-        Ok(match r {
-            ConnResult::Error { request_id, conn, errno } =>
-                self.handle_error(request_id, conn, errno),
-            other => other,
-        })
-    }
-
-    /// Returns `None` if no response arrives within `timeout`.
+    /// Block until the response for `id` arrives.
+    ///
+    /// Responses for other request IDs that arrive while waiting are stashed
+    /// and returned by later `recv`/`poll` calls.
     ///
     /// # Errors
     /// Returns an error if the complete thread has exited unexpectedly.
-    pub fn recv_timeout(&mut self, timeout: std::time::Duration) -> Result<Option<ConnResult>, Error> {
+    pub fn recv(&mut self, id: RequestId) -> Result<ConnResult, Error> {
+        loop {
+            if let Some(r) = self.stash.remove(&id) {
+                return Ok(r);
+            }
+            let r = self.response_rx.pop_block()
+                .ok_or_else(|| Error::Connection("complete thread exited unexpectedly".into()))?;
+            let r = match r {
+                ConnResult::Error { request_id, conn, errno } =>
+                    self.handle_error(request_id, conn, errno),
+                other => other,
+            };
+            let rid = result_id(&r);
+            if rid == id {
+                return Ok(r);
+            }
+            self.stash.insert(rid, r);
+        }
+    }
+
+    /// Block until the response for `id` arrives, or `timeout` elapses.
+    ///
+    /// Returns `None` on timeout. Responses for other IDs that arrive while
+    /// waiting are stashed.
+    ///
+    /// # Errors
+    /// Returns an error if the complete thread has exited unexpectedly.
+    pub fn recv_timeout(&mut self, id: RequestId, timeout: std::time::Duration) -> Result<Option<ConnResult>, Error> {
+        if let Some(r) = self.stash.remove(&id) {
+            return Ok(Some(r));
+        }
+
         let ts = Timespec::from_millis(
             u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         );
@@ -422,40 +451,37 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         // If the SQ is full we can't submit the timeout — fall back to a
         // non-blocking poll so we don't block forever.
         if self.sub.push(tsqe).is_err() {
-            return Ok(self.poll());
+            return Ok(self.poll(id));
         }
         let _ = self.sub.submit();
 
-        let r = self.response_rx.pop_block()
-            .ok_or_else(|| Error::Connection("complete thread exited unexpectedly".into()))?;
-        match r {
-            ConnResult::Timeout => Ok(None),
-            ConnResult::Error { request_id, conn, errno } => {
-                Ok(Some(self.handle_error(request_id, conn, errno)))
-            }
-            ConnResult::Response(_) => {
-                // Cancel the pending timeout so it doesn't fire later.
-                let cancel = Sqe::timeout_remove(TIMEOUT_UD);
-                let _ = self.sub.push(cancel);
-                let _ = self.sub.submit();
-                Ok(Some(r))
+        loop {
+            let r = self.response_rx.pop_block()
+                .ok_or_else(|| Error::Connection("complete thread exited unexpectedly".into()))?;
+            match r {
+                ConnResult::Timeout => return Ok(None),
+                ConnResult::Error { request_id, conn, errno } => {
+                    let r = self.handle_error(request_id, conn, errno);
+                    let rid = result_id(&r);
+                    if rid == id {
+                        let cancel = Sqe::timeout_remove(TIMEOUT_UD);
+                        let _ = self.sub.push(cancel);
+                        let _ = self.sub.submit();
+                        return Ok(Some(r));
+                    }
+                    self.stash.insert(rid, r);
+                }
+                ConnResult::Response(ref resp) if resp.request_id == id => {
+                    let cancel = Sqe::timeout_remove(TIMEOUT_UD);
+                    let _ = self.sub.push(cancel);
+                    let _ = self.sub.submit();
+                    return Ok(Some(r));
+                }
+                ConnResult::Response(resp) => {
+                    self.stash.insert(resp.request_id, ConnResult::Response(resp));
+                }
             }
         }
-    }
-
-    /// # Errors
-    /// Returns an error if the complete thread has exited unexpectedly.
-    pub fn recv_n(&mut self, mut n: usize, mut f: impl FnMut(ConnResult)) -> Result<(), Error> {
-        while n > 0 {
-            let r = self.recv()?;
-            f(r);
-            n -= 1;
-        }
-        Ok(())
-    }
-
-    pub fn subscribe(&self) -> SpmcConsumer<ConnResult> {
-        self.response_rx.clone()
     }
 
     /// Called when the complete thread reports an error on a connection.
@@ -541,8 +567,16 @@ fn complete_loop(
                     let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
                         pending_ids: VecDeque::new(),
                         slot: Slot { head_accum: Vec::new(), partial: None },
+                        recv_buf: Vec::new(),
                     });
                     conn.pending_ids.push_back(RequestId::from(seq));
+                    // Drain any bytes that arrived before this send CQE.
+                    // fd is not available in the send CQE branch (different ud encoding);
+                    // pass 0 — rearm is only triggered on !more which can't happen here.
+                    if !conn.recv_buf.is_empty() {
+                        let buf = std::mem::take(&mut conn.recv_buf);
+                        drain_recv_buf(conn, &buf, response_tx);
+                    }
                 }
                 // Send errors are ignored — the recv path will surface them.
                 continue;
@@ -556,15 +590,16 @@ fn complete_loop(
                 let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
                     pending_ids: VecDeque::new(),
                     slot: Slot { head_accum: Vec::new(), partial: None },
+                    recv_buf: Vec::new(),
                 });
-                let request_id = conn.current_request_id();
+                let request_id = conn.pending_ids.pop_front().unwrap_or(0);
+                conn.slot.reset();
+                conn.recv_buf.clear();
                 let _ = response_tx.push_block(ConnResult::Error {
                     request_id,
                     conn: ConnHandle { conn_id, fd },
                     errno: -cqe.result,
                 });
-                conn.slot.reset();
-                conn.pending_ids.pop_front();
                 continue;
             }
 
@@ -576,6 +611,7 @@ fn complete_loop(
                 let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
                     pending_ids: VecDeque::new(),
                     slot: Slot { head_accum: Vec::new(), partial: None },
+                    recv_buf: Vec::new(),
                 });
                 finish_until_close(ConnHandle { conn_id, fd }, conn, response_tx);
                 continue;
@@ -593,21 +629,43 @@ fn complete_loop(
             let conn = conns.entry(conn_id).or_insert_with(|| ConnData {
                 pending_ids: VecDeque::new(),
                 slot: Slot { head_accum: Vec::new(), partial: None },
+                recv_buf: Vec::new(),
             });
 
             let more = cqe.flags.contains(ququmatz::types::CqeFlags::MORE);
-            let request_id = conn.current_request_id();
 
-            if let Some(resp) = process_recv_data(&mut conn.slot, data, request_id) {
-                conn.advance();
+            if conn.pending_ids.is_empty() {
+                // Send CQE hasn't arrived yet — buffer raw bytes until it does.
+                conn.recv_buf.extend_from_slice(data);
                 pbuf.recycle_and_commit(bid);
-                let _ = response_tx.push_block(ConnResult::Response(Box::new(resp)));
-            } else if !more {
-                pbuf.recycle_and_commit(bid);
-                let _ = rearm_tx.push_block(RearmMsg { conn_id, fd });
+                if !more {
+                    let _ = rearm_tx.push_block(RearmMsg { conn_id, fd });
+                }
             } else {
+                let data_owned = data.to_vec();
                 pbuf.recycle_and_commit(bid);
+                drain_recv_buf(conn, &data_owned, response_tx);
             }
+        }
+    }
+}
+
+/// Parse `data` into `conn.slot`, delivering completed responses immediately.
+/// Called only when `conn.pending_ids` is non-empty.
+fn drain_recv_buf(conn: &mut ConnData, data: &[u8], response_tx: &SpmcProducer<ConnResult>) {
+    // First call feeds `data`; subsequent calls pass &[] to continue parsing
+    // whatever leftover bytes parse_head_and_maybe_finish kept in head_accum.
+    let mut first = true;
+    while !conn.pending_ids.is_empty() {
+        let request_id = conn.pending_ids.front().copied().unwrap_or(0);
+        let feed = if first { data } else { &[] };
+        first = false;
+        match process_recv_data(&mut conn.slot, feed, request_id) {
+            (Some(resp), _) => {
+                conn.pending_ids.pop_front();
+                let _ = response_tx.push_block(ConnResult::Response(Box::new(resp)));
+            }
+            (None, _) => break,
         }
     }
 }
@@ -615,53 +673,56 @@ fn complete_loop(
 /// Called when the socket reaches EOF.  If a `UntilClose` response is in
 /// progress, deliver it; otherwise emit an error.
 fn finish_until_close(conn_handle: ConnHandle, conn: &mut ConnData, response_tx: &SpmcProducer<ConnResult>) {
-    let request_id = conn.current_request_id();
     if let Some(ref mut partial) = conn.slot.partial
         && matches!(partial.framing, InternalFraming::UntilClose)
     {
         partial.body_done = true;
         let p = conn.slot.partial.take().unwrap();
+        let request_id = conn.pending_ids.pop_front().unwrap_or(0);
+        conn.slot.reset();
+        conn.recv_buf.clear();
         let _ = response_tx.push_block(ConnResult::Response(Box::new(Response {
-            request_id,
-            version: p.version,
-            status: p.status,
-            head: p.head,
-            body: p.body_buf,
+            request_id, version: p.version, status: p.status, head: p.head, body: p.body_buf,
         })));
-        conn.advance();
         return;
     }
     // EOF without a completed response is an error.
-    let _ = response_tx.push_block(ConnResult::Error { request_id, conn: conn_handle, errno: 0 });
+    let request_id = conn.pending_ids.pop_front().unwrap_or(0);
     conn.slot.reset();
-    conn.pending_ids.pop_front();
+    conn.recv_buf.clear();
+    let _ = response_tx.push_block(ConnResult::Error { request_id, conn: conn_handle, errno: 0 });
 }
 
 // ── CQE data processing ───────────────────────────────────────────────────────
 
-fn process_recv_data(slot: &mut Slot, data: &[u8], request_id: RequestId) -> Option<Response> {
+/// Returns `(Some(response), bytes_consumed_from_data)` when a complete
+/// response is parsed, or `(None, 0)` when more data is needed.
+fn process_recv_data(slot: &mut Slot, data: &[u8], request_id: RequestId) -> (Option<Response>, usize) {
     if let Some(ref mut partial) = slot.partial {
-        if !data.is_empty() {
-            pump_partial(partial, data);
-        }
+        let consumed = if data.is_empty() { 0 } else {
+            pump_partial(partial, data)
+        };
         if partial.body_done {
             let p = slot.partial.take().unwrap();
-            return Some(Response {
+            return (Some(Response {
                 request_id,
                 version: p.version,
                 status: p.status,
                 head: p.head,
                 body: p.body_buf,
-            });
+            }), consumed);
         }
-        return None;
+        return (None, 0);
     }
 
     slot.head_accum.extend_from_slice(data);
-    parse_head_and_maybe_finish(slot, request_id)
+    match parse_head_and_maybe_finish(slot, request_id) {
+        Some((resp, _)) => (Some(resp), data.len()),
+        None => (None, 0),
+    }
 }
 
-fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option<Response> {
+fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option<(Response, usize)> {
     let head_end = slot.head_accum.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head_bytes_len = head_end + 4;
 
@@ -687,7 +748,7 @@ fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option
     };
 
     let body_capacity = match framing {
-        #[allow(clippy::cast_possible_truncation)] // capacity hint; truncation on 32-bit is harmless
+        #[allow(clippy::cast_possible_truncation)]
         BodyFraming::ContentLength(n) => n as usize,
         _ => 0,
     };
@@ -696,34 +757,46 @@ fn parse_head_and_maybe_finish(slot: &mut Slot, request_id: RequestId) -> Option
         body_buf: Vec::with_capacity(body_capacity), body_done, framing: internal_framing,
     };
 
-    if consumed < slot.head_accum.len() && !body_done {
-        pump_partial(&mut partial, &slot.head_accum[consumed..]);
-    }
+    let after_head = &slot.head_accum[consumed..];
+    let body_consumed = if !after_head.is_empty() && !body_done {
+        pump_partial(&mut partial, after_head)
+    } else {
+        0
+    };
 
     if partial.body_done {
-        Some(Response {
+        let total_consumed = consumed + body_consumed;
+        // Preserve bytes after the complete response for the next parse.
+        let leftover = slot.head_accum[total_consumed..].to_vec();
+        slot.head_accum = leftover;
+        slot.partial = None;
+        Some((Response {
             request_id,
             version: partial.version,
             status: partial.status,
             head: partial.head,
             body: partial.body_buf,
-        })
+        }, body_consumed))
     } else {
+        // Trim consumed head bytes from head_accum; body bytes stay in partial.
+        slot.head_accum = slot.head_accum[consumed..].to_vec();
         slot.partial = Some(partial);
         None
     }
 }
 
-fn pump_partial(resp: &mut PartialResponse, data: &[u8]) {
+/// Feeds `data` into `resp`, returning the number of bytes consumed.
+fn pump_partial(resp: &mut PartialResponse, data: &[u8]) -> usize {
     let mut out = [0u8; BLOCK_SIZE];
     match &mut resp.framing {
-        InternalFraming::Done => { resp.body_done = true; }
+        InternalFraming::Done => { resp.body_done = true; 0 }
         InternalFraming::ContentLength { remaining } => {
             #[allow(clippy::cast_possible_truncation)]
             let to_take = data.len().min(*remaining as usize);
             resp.body_buf.extend_from_slice(&data[..to_take]);
             *remaining -= to_take as u64;
             if *remaining == 0 { resp.body_done = true; }
+            to_take
         }
         InternalFraming::Chunked { decoder } => {
             let mut pos = 0;
@@ -740,10 +813,13 @@ fn pump_partial(resp: &mut PartialResponse, data: &[u8]) {
                 }
             }
             if decoder.is_done() { resp.body_done = true; }
+            pos
         }
-        // UntilClose body is accumulated but only marked done on EOF (handled
-        // in finish_until_close, not here).
-        InternalFraming::UntilClose => { resp.body_buf.extend_from_slice(data); }
+        // UntilClose body is accumulated but only marked done on EOF.
+        InternalFraming::UntilClose => {
+            resp.body_buf.extend_from_slice(data);
+            data.len()
+        }
     }
 }
 
@@ -834,6 +910,14 @@ fn build_ranges(
     Ok(ranges)
 }
 
+fn result_id(r: &ConnResult) -> RequestId {
+    match r {
+        ConnResult::Response(resp) => resp.request_id,
+        ConnResult::Error { request_id, .. } => *request_id,
+        ConnResult::Timeout => 0,
+    }
+}
+
 // ── libc shim ─────────────────────────────────────────────────────────────────
 
 fn libc_close(fd: usize) {
@@ -861,11 +945,16 @@ mod tests {
                 let resp = resp;
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
+                    let mut acc: Vec<u8> = Vec::new();
                     loop {
                         let n = s.read(&mut buf).unwrap_or(0);
                         if n == 0 { break; }
-                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n")
-                            && s.write_all(resp).is_err() { break; }
+                        acc.extend_from_slice(&buf[..n]);
+                        // Send one response per complete request header block found.
+                        while let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                            acc.drain(..pos + 4);
+                            if s.write_all(resp).is_err() { return; }
+                        }
                     }
                 });
             }
@@ -950,8 +1039,8 @@ mod tests {
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
         for _ in 0..3 {
-            pool.get(conn, b"/").unwrap();
-            match pool.recv().unwrap() {
+            let id = pool.get(conn, b"/").unwrap();
+            match pool.recv(id).unwrap() {
                 ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
                 ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
                 ConnResult::Timeout => panic!("timeout"),
@@ -960,12 +1049,45 @@ mod tests {
     }
 
     #[test]
+    fn test_pipelined_requests() {
+        let port = keep_alive_server();
+        let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
+        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        // Submit 3 requests before reading any response.
+        let id1 = pool.get(conn, b"/").unwrap();
+        let id2 = pool.get(conn, b"/").unwrap();
+        let id3 = pool.get(conn, b"/").unwrap();
+        // Collect out-of-order: ask for id3 first, then id1, then id2.
+        match pool.recv(id3).unwrap() {
+            ConnResult::Response(r) => {
+                assert_eq!(r.request_id, id3);
+                assert_eq!(&r.body, b"ok");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match pool.recv(id1).unwrap() {
+            ConnResult::Response(r) => {
+                assert_eq!(r.request_id, id1);
+                assert_eq!(&r.body, b"ok");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match pool.recv(id2).unwrap() {
+            ConnResult::Response(r) => {
+                assert_eq!(r.request_id, id2);
+                assert_eq!(&r.body, b"ok");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_chunked_body() {
         let port = chunked_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
-        pool.get(conn, b"/").unwrap();
-        match pool.recv().unwrap() {
+        let id = pool.get(conn, b"/").unwrap();
+        match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"hello"),
             ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
             ConnResult::Timeout => panic!("timeout"),
@@ -977,8 +1099,8 @@ mod tests {
         let port = until_close_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
-        pool.get(conn, b"/").unwrap();
-        match pool.recv().unwrap() {
+        let id = pool.get(conn, b"/").unwrap();
+        match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"hello"),
             ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
             ConnResult::Timeout => panic!("timeout"),
@@ -998,8 +1120,8 @@ mod tests {
         // up — use keep_alive_server and just verify happy path still holds.
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
-        pool.get(conn, b"/").unwrap();
-        match pool.recv().unwrap() {
+        let id = pool.get(conn, b"/").unwrap();
+        match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
             ConnResult::Error { errno, .. } => panic!("unexpected error errno={errno}"),
             ConnResult::Timeout => panic!("timeout"),
@@ -1016,9 +1138,9 @@ mod tests {
 
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conn = pool.connect(format!("http://127.0.0.1:{drop_port}").as_bytes()).unwrap();
-        pool.get(conn, b"/").unwrap();
+        let id = pool.get(conn, b"/").unwrap();
         // Drop server closes immediately — we get an error (not a panic).
-        match pool.recv().unwrap() {
+        match pool.recv(id).unwrap() {
             ConnResult::Error { conn: err_conn, .. } => {
                 assert_eq!(err_conn.conn_id, conn.conn_id);
                 // Explicitly clean up the dead connection.
@@ -1029,8 +1151,8 @@ mod tests {
         }
         // The pool is still alive and can open a fresh connection to a live server.
         let conn2 = pool.connect(format!("http://127.0.0.1:{live_port}").as_bytes()).unwrap();
-        pool.get(conn2, b"/").unwrap();
-        match pool.recv().unwrap() {
+        let id2 = pool.get(conn2, b"/").unwrap();
+        match pool.recv(id2).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
             ConnResult::Error { errno, .. } => panic!("error on live conn: errno={errno}"),
             ConnResult::Timeout => panic!("timeout"),
@@ -1042,8 +1164,8 @@ mod tests {
         let port = silent_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
-        pool.get(conn, b"/").unwrap();
-        let result = pool.recv_timeout(std::time::Duration::from_millis(200)).unwrap();
+        let id = pool.get(conn, b"/").unwrap();
+        let result = pool.recv_timeout(id, std::time::Duration::from_millis(200)).unwrap();
         assert!(result.is_none(), "expected timeout, got a result");
     }
 
@@ -1052,8 +1174,8 @@ mod tests {
         let port = keep_alive_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
-        pool.get(conn, b"/").unwrap();
-        let result = pool.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let id = pool.get(conn, b"/").unwrap();
+        let result = pool.recv_timeout(id, std::time::Duration::from_secs(5)).unwrap();
         match result {
             Some(ConnResult::Response(r)) => assert_eq!(&r.body, b"ok"),
             Some(ConnResult::Error { errno, .. }) => panic!("error errno={errno}"),
@@ -1100,8 +1222,8 @@ mod tests {
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
         let url = format!("http://127.0.0.1:{port}");
         let conn = pool.connect(url.as_bytes()).unwrap();
-        pool.get(conn, b"/").unwrap();
-        match pool.recv().unwrap() {
+        let id = pool.get(conn, b"/").unwrap();
+        match pool.recv(id).unwrap() {
             ConnResult::Response(r) => {
                 let expected = format!("127.0.0.1:{port}");
                 assert_eq!(r.body, expected.as_bytes(), "Host header was {:?}", std::str::from_utf8(&r.body));

@@ -41,8 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..5 {
         eprintln!("request {i}");
-        pool.get(conn, b"/")?;
-        let resp = match pool.recv().unwrap_or_else(|e| panic!("recv: {e}")) {
+        let id = pool.get(conn, b"/")?;
+        let resp = match pool.recv(id).unwrap_or_else(|e| panic!("recv: {e}")) {
             ConnResult::Response(r) => r,
             ConnResult::Error { request_id, errno, .. } =>
                 panic!("request {request_id} failed: errno {errno}"),
