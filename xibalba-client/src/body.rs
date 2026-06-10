@@ -163,6 +163,13 @@ pub(crate) fn read_body<S: Read>(
                         if body.len() > max_body {
                             return Err(ConnectionError::BodyTooLarge.into());
                         }
+                        // `Data` takes priority over `Done` in the decoder's
+                        // return value; without this check a read that ends
+                        // exactly at the terminal chunk would block forever
+                        // waiting for input that never comes.
+                        if decoder.is_done() {
+                            return Ok(body);
+                        }
                     }
                     DecodeResult::Done => return Ok(body),
                     DecodeResult::NeedMore => break,
@@ -184,6 +191,12 @@ pub(crate) fn read_body<S: Read>(
                             body.extend_from_slice(&decode_buf[..dn]);
                             if body.len() > max_body {
                                 return Err(ConnectionError::BodyTooLarge.into());
+                            }
+                            // See the tail loop above: `Data` masks `Done`,
+                            // and this loop only re-enters the decoder while
+                            // unconsumed bytes remain in `raw`.
+                            if decoder.is_done() {
+                                return Ok(body);
                             }
                         }
                         DecodeResult::Done => return Ok(body),

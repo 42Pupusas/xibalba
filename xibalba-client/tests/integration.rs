@@ -246,6 +246,44 @@ fn server_sends_empty_chunked_body() {
 }
 
 #[test]
+fn chunked_data_and_terminator_in_same_read() {
+    // Regression: when one read delivers both chunk data and the
+    // terminal "0\r\n\r\n", the decoder reaches Done internally but
+    // reports Data (data takes priority). The body reader must notice
+    // completion instead of issuing another read that blocks until the
+    // server gives up — observed live against CloudFront, where TLS
+    // record boundaries decide whether the terminator shares a read
+    // with the data.
+    let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let body = b"5\r\nhello\r\n0\r\n\r\n";
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream.set_nodelay(true).unwrap();
+        // Two writes with a pause so the head arrives alone and the
+        // entire chunked body (data + terminator) lands in one read.
+        stream.write_all(head).unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+        // Hold the connection open: a buggy client blocks here.
+        thread::sleep(Duration::from_millis(500));
+    });
+
+    let config = Config {
+        read_timeout: Some(Duration::from_secs(2)),
+        ..Config::default()
+    };
+    let mut client = connect_with_config(port, config);
+    let resp = client.request(Method::Get, b"/", None, None).unwrap();
+    assert_eq!(resp.text().unwrap(), "hello");
+    server.join().unwrap();
+}
+
+#[test]
 fn multiple_requests_same_connection() {
     let r1: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst";
     let r2: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond";
