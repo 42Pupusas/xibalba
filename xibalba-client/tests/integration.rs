@@ -362,6 +362,42 @@ fn streaming_content_length_body() {
 }
 
 #[test]
+fn stale_keepalive_reconnects_and_retries() {
+    // Server accepts a first connection, serves one response, then
+    // closes it (simulating an idle keep-alive timeout). The second
+    // request finds the connection dead on read; the client must
+    // reconnect to a fresh connection and succeed transparently.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let r1 = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst";
+        let r2 = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond";
+
+        let (mut s1, _) = listener.accept().unwrap();
+        read_request(&mut s1);
+        s1.write_all(r1).unwrap();
+        s1.flush().unwrap();
+        // Close the first connection: the client's next request will
+        // hit EOF on this socket.
+        drop(s1);
+
+        let (mut s2, _) = listener.accept().unwrap();
+        read_request(&mut s2);
+        s2.write_all(r2).unwrap();
+        s2.flush().unwrap();
+    });
+
+    let mut client = connect(port);
+    let first = client.request(Method::Get, b"/", None, None).unwrap();
+    assert_eq!(first.text().unwrap(), "first");
+
+    // Reuses the (now dead) connection, detects EOF, reconnects, retries.
+    let second = client.request(Method::Get, b"/", None, None).unwrap();
+    assert_eq!(second.text().unwrap(), "second");
+    server.join().unwrap();
+}
+
+#[test]
 fn chunked_data_and_terminator_in_same_read() {
     // Regression: when one read delivers both chunk data and the
     // terminal "0\r\n\r\n", the decoder reaches Done internally but

@@ -163,6 +163,12 @@ pub struct Client<C: Connector> {
     /// reader is dropped before the body is fully consumed. The next
     /// request reconnects instead of reading a stale body.
     dirty: bool,
+    /// `true` once at least one request has completed its head read on
+    /// the current connection. A transport failure on a *reused*
+    /// connection is the stale-keep-alive signature (the server closed
+    /// an idle connection), so the request is reconnected and retried
+    /// once; on a fresh connection it's a real error and propagates.
+    used: bool,
 }
 
 impl<C: Connector> Client<C> {
@@ -190,6 +196,7 @@ impl<C: Connector> Client<C> {
             write_buf: Vec::with_capacity(512),
             head_buf: Vec::with_capacity(HEAD_BUF_SIZE),
             dirty: false,
+            used: false,
         };
         client.apply_timeouts()?;
         Ok(client)
@@ -275,8 +282,43 @@ impl<C: Connector> Client<C> {
         self.host = url.host.to_vec();
         self.port = url.effective_port();
         self.scheme = url.scheme;
+        self.used = false;
         self.apply_timeouts()?;
         Ok(())
+    }
+
+    /// Reconnect to the current host (used to recover a stale
+    /// keep-alive connection without re-parsing a URL).
+    fn reconnect_same_host(&mut self) -> Result<(), Error> {
+        let host = self.host.clone();
+        let url = Url {
+            scheme: self.scheme,
+            host: &host,
+            port: Some(self.port),
+            path: b"/",
+            query: None,
+            fragment: None,
+        };
+        self.reconnect(&url)
+    }
+
+    /// Whether `err` is the signature of a server-closed idle keep-alive
+    /// connection: a transport-level failure (TLS/TCP EOF, reset, broken
+    /// pipe) or our own `ConnectionClosed`. Safe to retry only because
+    /// we check it *before* any response bytes reached the caller.
+    const fn is_stale_connection(err: &Error) -> bool {
+        use std::io::ErrorKind;
+        match err {
+            Error::Connection(ConnectionError::ConnectionClosed) => true,
+            Error::Io(io) => matches!(
+                io.kind,
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+            ),
+            _ => false,
+        }
     }
 
     fn host_header_value(&self) -> Vec<u8> {
@@ -291,10 +333,39 @@ impl<C: Connector> Client<C> {
         }
     }
 
+    /// Write one request and read the response head, reconnecting and
+    /// retrying once if a *reused* connection fails at the transport
+    /// level (the stale-keep-alive case — the server dropped an idle
+    /// connection). Retry is safe here: the failure is detected before
+    /// any response byte reaches the caller, so the request was never
+    /// processed.
+    fn send_head(
+        &mut self,
+        method: Method,
+        path: &[u8],
+        query: Option<&[u8]>,
+        body: Option<&[u8]>,
+        extra_headers: &[Header<'_>],
+    ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
+        match self.send_head_once(method, path, query, body, extra_headers) {
+            Ok(head) => {
+                self.used = true;
+                Ok(head)
+            }
+            Err(e) if self.used && Self::is_stale_connection(&e) => {
+                self.reconnect_same_host()?;
+                let head = self.send_head_once(method, path, query, body, extra_headers)?;
+                self.used = true;
+                Ok(head)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Write one request and read the response head, leaving the body
     /// unread on the stream. Returns the head, its framing, and the
     /// offset of the body's first byte within `self.head_buf`.
-    fn send_head(
+    fn send_head_once(
         &mut self,
         method: Method,
         path: &[u8],
