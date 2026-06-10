@@ -398,6 +398,36 @@ fn stale_keepalive_reconnects_and_retries() {
 }
 
 #[test]
+fn stale_before_first_request_reconnects_and_retries() {
+    // The connection can die before it ever serves a request: a host
+    // that connects at startup and sends its first request much later
+    // (the server times the idle connection out in between). The retry
+    // must cover this case too — there is no response in flight, so
+    // resending is safe.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        // Accept the initial connection and close it immediately,
+        // without serving anything.
+        let (s1, _) = listener.accept().unwrap();
+        drop(s1);
+
+        let (mut s2, _) = listener.accept().unwrap();
+        read_request(&mut s2);
+        s2.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .unwrap();
+        s2.flush().unwrap();
+    });
+
+    let mut client = connect(port);
+    // First request ever on this client hits the dead socket; the
+    // client must reconnect and retry transparently.
+    let resp = client.request(Method::Get, b"/", None, None).unwrap();
+    assert_eq!(resp.text().unwrap(), "hello");
+    server.join().unwrap();
+}
+
+#[test]
 fn chunked_data_and_terminator_in_same_read() {
     // Regression: when one read delivers both chunk data and the
     // terminal "0\r\n\r\n", the decoder reaches Done internally but

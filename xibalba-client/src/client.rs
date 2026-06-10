@@ -163,12 +163,6 @@ pub struct Client<C: Connector> {
     /// reader is dropped before the body is fully consumed. The next
     /// request reconnects instead of reading a stale body.
     dirty: bool,
-    /// `true` once at least one request has completed its head read on
-    /// the current connection. A transport failure on a *reused*
-    /// connection is the stale-keep-alive signature (the server closed
-    /// an idle connection), so the request is reconnected and retried
-    /// once; on a fresh connection it's a real error and propagates.
-    used: bool,
 }
 
 impl<C: Connector> Client<C> {
@@ -196,7 +190,6 @@ impl<C: Connector> Client<C> {
             write_buf: Vec::with_capacity(512),
             head_buf: Vec::with_capacity(HEAD_BUF_SIZE),
             dirty: false,
-            used: false,
         };
         client.apply_timeouts()?;
         Ok(client)
@@ -282,7 +275,6 @@ impl<C: Connector> Client<C> {
         self.host = url.host.to_vec();
         self.port = url.effective_port();
         self.scheme = url.scheme;
-        self.used = false;
         self.apply_timeouts()?;
         Ok(())
     }
@@ -334,11 +326,13 @@ impl<C: Connector> Client<C> {
     }
 
     /// Write one request and read the response head, reconnecting and
-    /// retrying once if a *reused* connection fails at the transport
-    /// level (the stale-keep-alive case — the server dropped an idle
-    /// connection). Retry is safe here: the failure is detected before
-    /// any response byte reaches the caller, so the request was never
-    /// processed.
+    /// retrying once if the connection fails at the transport level
+    /// (the stale-keep-alive case — the server dropped an idle
+    /// connection). The connection can go stale before its *first*
+    /// request too: hosts that connect at startup and send the first
+    /// request much later hit exactly that. Retry is safe here: the
+    /// failure is detected before any response byte reaches the caller,
+    /// so the request was never processed.
     fn send_head(
         &mut self,
         method: Method,
@@ -348,15 +342,10 @@ impl<C: Connector> Client<C> {
         extra_headers: &[Header<'_>],
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
         match self.send_head_once(method, path, query, body, extra_headers) {
-            Ok(head) => {
-                self.used = true;
-                Ok(head)
-            }
-            Err(e) if self.used && Self::is_stale_connection(&e) => {
+            Ok(head) => Ok(head),
+            Err(e) if Self::is_stale_connection(&e) => {
                 self.reconnect_same_host()?;
-                let head = self.send_head_once(method, path, query, body, extra_headers)?;
-                self.used = true;
-                Ok(head)
+                self.send_head_once(method, path, query, body, extra_headers)
             }
             Err(e) => Err(e),
         }
