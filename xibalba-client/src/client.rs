@@ -9,7 +9,9 @@ use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
 use xibalba_proto::version::Version;
 
-use crate::body::{BodyReader, HEAD_BUF_SIZE, HeadData, read_body, read_response_head};
+use crate::body::{
+    BodyReader, HEAD_BUF_SIZE, HeadData, StreamingBody, read_body, read_response_head,
+};
 use crate::connector::Connector;
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -40,6 +42,26 @@ pub struct Response {
     pub status: StatusCode,
     pub head: HeadData,
     pub body: BodyReader,
+}
+
+/// A response whose body is decoded incrementally from the live
+/// connection. Produced by [`RequestBuilder::send_streaming`].
+///
+/// Borrows the client mutably until dropped. Reading the body to
+/// completion leaves the connection reusable; dropping early marks it
+/// dirty so the next request reconnects.
+#[derive(Debug)]
+pub struct StreamingResponse<'a, S: std::io::Read> {
+    pub version: Version,
+    pub status: StatusCode,
+    pub head: HeadData,
+    pub body: StreamingBody<'a, S>,
+}
+
+impl<S: std::io::Read> StreamingResponse<'_, S> {
+    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.head.headers()
+    }
 }
 
 impl Response {
@@ -105,6 +127,25 @@ impl<'a, C: Connector> RequestBuilder<'a, C> {
         self.client
             .execute(self.method, self.path, self.query, self.body, &extra)
     }
+
+    /// Like [`send`](Self::send), but the response body is decoded
+    /// incrementally as it is read. See [`Client::execute_streaming`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` on serialization or connection failure.
+    pub fn send_streaming(self) -> Result<StreamingResponse<'a, C::Stream>, Error> {
+        let extra: Vec<Header<'_>> = self
+            .extra_headers
+            .iter()
+            .map(|(n, v)| Header {
+                name: HeaderName::from_bytes(n),
+                value: v,
+            })
+            .collect();
+        self.client
+            .execute_streaming(self.method, self.path, self.query, self.body, &extra)
+    }
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────
@@ -118,6 +159,10 @@ pub struct Client<C: Connector> {
     scheme: xibalba_proto::scheme::Scheme,
     write_buf: Vec<u8>,
     head_buf: Vec<u8>,
+    /// Set while a streaming response is in flight; stays set if the
+    /// reader is dropped before the body is fully consumed. The next
+    /// request reconnects instead of reading a stale body.
+    dirty: bool,
 }
 
 impl<C: Connector> Client<C> {
@@ -144,6 +189,7 @@ impl<C: Connector> Client<C> {
             scheme,
             write_buf: Vec::with_capacity(512),
             head_buf: Vec::with_capacity(HEAD_BUF_SIZE),
+            dirty: false,
         };
         client.apply_timeouts()?;
         Ok(client)
@@ -204,6 +250,26 @@ impl<C: Connector> Client<C> {
         Ok(())
     }
 
+    /// Reconnect to the current host if a previous streaming response
+    /// was dropped before its body was fully consumed.
+    fn ensure_clean(&mut self) -> Result<(), Error> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let host = self.host.clone();
+        let url = Url {
+            scheme: self.scheme,
+            host: &host,
+            port: Some(self.port),
+            path: b"/",
+            query: None,
+            fragment: None,
+        };
+        self.reconnect(&url)?;
+        self.dirty = false;
+        Ok(())
+    }
+
     fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
         self.stream = C::connect(url, &self.tls_config)?;
         self.host = url.host.to_vec();
@@ -225,14 +291,17 @@ impl<C: Connector> Client<C> {
         }
     }
 
-    fn send_one(
+    /// Write one request and read the response head, leaving the body
+    /// unread on the stream. Returns the head, its framing, and the
+    /// offset of the body's first byte within `self.head_buf`.
+    fn send_head(
         &mut self,
         method: Method,
         path: &[u8],
         query: Option<&[u8]>,
         body: Option<&[u8]>,
         extra_headers: &[Header<'_>],
-    ) -> Result<Response, Error> {
+    ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
         let host_value = self.host_header_value();
         let content_len_str;
         let mut headers = Vec::with_capacity(1 + extra_headers.len() + 1);
@@ -273,6 +342,20 @@ impl<C: Connector> Client<C> {
             self.config.max_head_size,
         )?;
 
+        Ok((head_data, framing, tail_offset))
+    }
+
+    fn send_one(
+        &mut self,
+        method: Method,
+        path: &[u8],
+        query: Option<&[u8]>,
+        body: Option<&[u8]>,
+        extra_headers: &[Header<'_>],
+    ) -> Result<Response, Error> {
+        let (head_data, framing, tail_offset) =
+            self.send_head(method, path, query, body, extra_headers)?;
+
         let body_data = read_body(
             &mut self.stream,
             &framing,
@@ -288,6 +371,42 @@ impl<C: Connector> Client<C> {
         })
     }
 
+    /// Send one request and return a response whose body is decoded
+    /// incrementally as the caller reads it. Required for server-sent
+    /// events, where the response only ends when the server is done.
+    ///
+    /// Redirects are NOT followed. The response borrows the client
+    /// until dropped; see [`StreamingResponse`] for drop semantics.
+    /// `max_response_body` is not enforced — the caller bounds its own
+    /// consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` on serialization or connection failure.
+    pub fn execute_streaming(
+        &mut self,
+        method: Method,
+        path: &[u8],
+        query: Option<&[u8]>,
+        body: Option<&[u8]>,
+        extra_headers: &[Header<'_>],
+    ) -> Result<StreamingResponse<'_, C::Stream>, Error> {
+        self.ensure_clean()?;
+        let (head_data, framing, tail_offset) =
+            self.send_head(method, path, query, body, extra_headers)?;
+
+        let tail = self.head_buf[tail_offset..].to_vec();
+        self.dirty = true;
+        let body = StreamingBody::new(&mut self.stream, &mut self.dirty, &framing, tail);
+
+        Ok(StreamingResponse {
+            version: head_data.version,
+            status: head_data.status,
+            head: head_data,
+            body,
+        })
+    }
+
     fn execute(
         &mut self,
         method: Method,
@@ -296,6 +415,8 @@ impl<C: Connector> Client<C> {
         body: Option<&[u8]>,
         extra_headers: &[Header<'_>],
     ) -> Result<Response, Error> {
+        self.ensure_clean()?;
+
         let mut current_method = method;
         let mut current_path: Vec<u8> = path.to_vec();
         let mut current_query: Option<Vec<u8>> = query.map(<[u8]>::to_vec);

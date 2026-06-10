@@ -66,6 +66,181 @@ impl Read for BodyReader {
     }
 }
 
+/// Incremental body reader over a live connection stream.
+///
+/// Unlike [`BodyReader`], which is handed a fully-buffered body, this
+/// decodes framing (chunked / content-length / until-close) on the fly
+/// as the caller reads — required for server-sent events, where the
+/// response only ends after the server is done generating.
+///
+/// Holds `&mut` borrows of the client's stream and its dirty flag for
+/// the duration of the response. The flag is cleared when the body is
+/// read to completion; if the reader is dropped early, the flag stays
+/// set and the client reconnects before its next request instead of
+/// reading stale bytes.
+#[derive(Debug)]
+pub struct StreamingBody<'a, S: Read> {
+    stream: &'a mut S,
+    dirty: &'a mut bool,
+    state: StreamState,
+    /// Raw bytes already pulled off the socket but not yet decoded:
+    /// first the head-read overshoot, then refills from `stream`.
+    raw: Vec<u8>,
+    raw_pos: usize,
+}
+
+#[derive(Debug)]
+enum StreamState {
+    Length { remaining: u64 },
+    Chunked { decoder: xibalba_proto::response::ChunkedDecoder },
+    UntilClose,
+    Done,
+}
+
+impl<'a, S: Read> StreamingBody<'a, S> {
+    pub(crate) const fn new(
+        stream: &'a mut S,
+        dirty: &'a mut bool,
+        framing: &xibalba_proto::response::BodyFraming,
+        tail: Vec<u8>,
+    ) -> Self {
+        use xibalba_proto::response::{BodyFraming, ChunkedDecoder};
+        let state = match *framing {
+            BodyFraming::ContentLength(0) | BodyFraming::None => StreamState::Done,
+            BodyFraming::ContentLength(len) => StreamState::Length { remaining: len },
+            BodyFraming::Chunked => StreamState::Chunked {
+                decoder: ChunkedDecoder::new(),
+            },
+            BodyFraming::UntilClose => StreamState::UntilClose,
+        };
+        let mut body = Self {
+            stream,
+            dirty,
+            state,
+            raw: tail,
+            raw_pos: 0,
+        };
+        if matches!(body.state, StreamState::Done) {
+            body.finish();
+        }
+        body
+    }
+
+    /// Whether the body has been fully consumed.
+    #[must_use]
+    pub const fn is_done(&self) -> bool {
+        matches!(self.state, StreamState::Done)
+    }
+
+    const fn finish(&mut self) {
+        self.state = StreamState::Done;
+        // An until-close body ends with a dead connection; everything
+        // else leaves it positioned at the next response.
+        *self.dirty = false;
+    }
+
+    /// Bytes available without touching the socket; refills from the
+    /// socket when empty. `Ok(&[])` means clean EOF from the peer.
+    fn input(&mut self) -> std::io::Result<&[u8]> {
+        if self.raw_pos >= self.raw.len() {
+            self.raw.resize(HEAD_BUF_SIZE, 0);
+            let n = self.stream.read(&mut self.raw)?;
+            self.raw.truncate(n);
+            self.raw_pos = 0;
+        }
+        Ok(&self.raw[self.raw_pos..])
+    }
+}
+
+impl<S: Read> Read for StreamingBody<'_, S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use xibalba_proto::response::DecodeResult;
+
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            match self.state {
+                StreamState::Done => return Ok(0),
+
+                StreamState::Length { remaining } => {
+                    let input = self.input()?;
+                    if input.is_empty() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "connection closed mid-body",
+                        ));
+                    }
+                    let n = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(input.len())
+                        .min(buf.len());
+                    buf[..n].copy_from_slice(&input[..n]);
+                    self.raw_pos += n;
+                    let remaining = remaining - n as u64;
+                    if remaining == 0 {
+                        self.finish();
+                    } else {
+                        self.state = StreamState::Length { remaining };
+                    }
+                    return Ok(n);
+                }
+
+                StreamState::UntilClose => {
+                    let input = self.input()?;
+                    if input.is_empty() {
+                        self.state = StreamState::Done;
+                        // Connection is dead; leave the dirty flag set
+                        // so the client reconnects.
+                        return Ok(0);
+                    }
+                    let n = input.len().min(buf.len());
+                    buf[..n].copy_from_slice(&input[..n]);
+                    self.raw_pos += n;
+                    return Ok(n);
+                }
+
+                StreamState::Chunked { ref mut decoder } => {
+                    if self.raw_pos >= self.raw.len() {
+                        self.raw.resize(HEAD_BUF_SIZE, 0);
+                        let n = self.stream.read(&mut self.raw)?;
+                        self.raw.truncate(n);
+                        self.raw_pos = 0;
+                        if n == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "connection closed mid-chunked-body",
+                            ));
+                        }
+                    }
+                    let (result, consumed) = decoder.decode(&self.raw[self.raw_pos..], buf);
+                    self.raw_pos += consumed;
+                    match result {
+                        DecodeResult::Data(n) => {
+                            if decoder.is_done() {
+                                self.finish();
+                            }
+                            return Ok(n);
+                        }
+                        DecodeResult::Done => {
+                            self.finish();
+                            return Ok(0);
+                        }
+                        DecodeResult::NeedMore => {}
+                        DecodeResult::Error(e) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                Error::Parse(e).to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Inline read helpers ──────────────────────────────────────────────────────
 
 /// Returns `(HeadData, framing, tail_offset)`. The tail bytes (body prefix

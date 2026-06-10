@@ -246,6 +246,122 @@ fn server_sends_empty_chunked_body() {
 }
 
 #[test]
+fn streaming_chunked_delivers_incrementally() {
+    // Server sends one chunk, pauses, then sends the rest. A streaming
+    // reader must surface the first chunk before the pause ends —
+    // proving bytes flow through without waiting for the terminator.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream.set_nodelay(true).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(400));
+        stream.write_all(b"6\r\nsecond\r\n0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        // Serve a follow-up request to prove the connection stays
+        // reusable after a fully-drained stream.
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "client closed instead of reusing connection");
+            acc.extend_from_slice(&buf[..n]);
+            if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+    });
+
+    let mut client = connect(port);
+    let start = std::time::Instant::now();
+    let mut resp = client
+        .build(Method::Get, b"/")
+        .send_streaming()
+        .expect("streaming request failed");
+
+    let mut buf = [0u8; 64];
+    let n = resp.body.read(&mut buf).unwrap();
+    let first_elapsed = start.elapsed();
+    assert_eq!(&buf[..n], b"first");
+    assert!(
+        first_elapsed < Duration::from_millis(300),
+        "first chunk should arrive before the server's pause ends, took {first_elapsed:?}"
+    );
+
+    let mut rest = Vec::new();
+    resp.body.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"second");
+    assert!(resp.body.is_done());
+    drop(resp);
+
+    // Connection must be reusable without reconnecting.
+    let resp2 = client.request(Method::Get, b"/", None, None).unwrap();
+    assert_eq!(resp2.text().unwrap(), "ok");
+    server.join().unwrap();
+}
+
+#[test]
+fn streaming_dropped_midway_reconnects() {
+    // Drop the streaming response before draining it; the next request
+    // must reconnect instead of reading the stale body.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        // First connection: send a body the client will abandon.
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nstale\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        // Second connection: serve the follow-up request.
+        let (mut stream2, _) = listener.accept().unwrap();
+        read_request(&mut stream2);
+        stream2
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+        drop(stream);
+    });
+
+    let mut client = connect(port);
+    let mut resp = client
+        .build(Method::Get, b"/")
+        .send_streaming()
+        .expect("streaming request failed");
+    let mut buf = [0u8; 5];
+    resp.body.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"stale");
+    assert!(!resp.body.is_done());
+    drop(resp); // abandon mid-stream
+
+    let resp2 = client.request(Method::Get, b"/", None, None).unwrap();
+    assert_eq!(resp2.text().unwrap(), "fresh");
+    server.join().unwrap();
+}
+
+#[test]
+fn streaming_content_length_body() {
+    let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world";
+    let (port, server) = one_shot_server(response);
+    let mut client = connect(port);
+
+    let mut resp = client.build(Method::Get, b"/").send_streaming().unwrap();
+    let mut body = String::new();
+    resp.body.read_to_string(&mut body).unwrap();
+    assert_eq!(body, "hello world");
+    assert!(resp.body.is_done());
+    server.join().unwrap();
+}
+
+#[test]
 fn chunked_data_and_terminator_in_same_read() {
     // Regression: when one read delivers both chunk data and the
     // terminal "0\r\n\r\n", the decoder reaches Done internally but
