@@ -1,6 +1,6 @@
 [package]
 name = "xibalba-proto"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "HTTP/1.1 protocol primitives: zero-copy parser, chunked decoder, request serializer"

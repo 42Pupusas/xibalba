@@ -201,7 +201,10 @@ impl ChunkedDecoder {
     /// Decode chunked data from `input` into `output`.
     ///
     /// Returns `(DecodeResult, bytes_consumed_from_input)`.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "HTTP chunked transfer decoder: one state machine with 5 states — splitting would scatter the transition logic"
+    )]
     pub fn decode(&mut self, input: &[u8], output: &mut [u8]) -> (DecodeResult, usize) {
         let mut in_pos = 0;
         let mut out_pos = 0;

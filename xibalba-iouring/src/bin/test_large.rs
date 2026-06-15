@@ -21,8 +21,12 @@ fn main() {
                 let mut buf = [0u8; 4096];
                 loop {
                     let n = s.read(&mut buf).unwrap_or(0);
-                    if n == 0 { break; }
-                    if s.write_all(resp_static).is_err() { break; }
+                    if n == 0 {
+                        break;
+                    }
+                    if s.write_all(resp_static).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -33,15 +37,26 @@ fn main() {
     let conn = pool.connect(url.as_bytes()).unwrap();
 
     for i in 0..5 {
-        let id = pool.get(conn, b"/").unwrap_or_else(|e| panic!("iter {i}: get: {e}"));
-        let resp = match pool.recv(id).unwrap_or_else(|e| panic!("iter {i}: recv: {e}")) {
+        let id = pool
+            .get(conn, b"/")
+            .unwrap_or_else(|e| panic!("iter {i}: get: {e}"));
+        let resp = match pool
+            .recv(id)
+            .unwrap_or_else(|e| panic!("iter {i}: recv: {e}"))
+        {
             xibalba_iouring::driver::ConnResult::Response(r) => r,
-            xibalba_iouring::driver::ConnResult::Error { request_id, errno, .. } =>
-                panic!("iter {i}: request {request_id} failed: errno {errno}"),
+            xibalba_iouring::driver::ConnResult::Error {
+                request_id, errno, ..
+            } => panic!("iter {i}: request {request_id} failed: errno {errno}"),
             xibalba_iouring::driver::ConnResult::Timeout => panic!("iter {i}: timed out"),
         };
         assert_eq!(resp.request_id, id);
-        assert_eq!(resp.body.len(), N, "iter {i}: wrong body length {}", resp.body.len());
+        assert_eq!(
+            resp.body.len(),
+            N,
+            "iter {i}: wrong body length {}",
+            resp.body.len()
+        );
         println!("iter {i}: ok ({N} bytes)");
     }
     println!("all ok");

@@ -26,7 +26,9 @@ use std::thread::JoinHandle;
 
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc::{self, Producer as MpscProducer, RingBuffer as MpscRingBuffer};
-use quetzalcoatl::spmc::{Consumer as SpmcConsumer, Producer as SpmcProducer, RingBuffer as SpmcRingBuffer};
+use quetzalcoatl::spmc::{
+    Consumer as SpmcConsumer, Producer as SpmcProducer, RingBuffer as SpmcRingBuffer,
+};
 use ququmatz::types::{MsgFlags, SockAddrIn, TimeoutFlags, Timespec};
 use ququmatz::{Completer, ProvidedBufferRing, RawFd, Sqe, Submitter};
 
@@ -71,14 +73,16 @@ pub struct HeadData {
 impl HeadData {
     pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         let buf = &self.head_buf;
-        self.ranges[..self.header_count].iter().filter_map(move |r| {
-            let ns = r.name_start as usize;
-            let vs = r.value_start as usize;
-            Some((
-                buf.get(ns..ns + r.name_len as usize)?,
-                buf.get(vs..vs + r.value_len as usize)?,
-            ))
-        })
+        self.ranges[..self.header_count]
+            .iter()
+            .filter_map(move |r| {
+                let ns = r.name_start as usize;
+                let vs = r.value_start as usize;
+                Some((
+                    buf.get(ns..ns + r.name_len as usize)?,
+                    buf.get(vs..vs + r.value_len as usize)?,
+                ))
+            })
     }
 }
 
@@ -160,11 +164,15 @@ impl UserData {
 }
 
 impl From<UserData> for u64 {
-    fn from(ud: UserData) -> Self { ud.0 }
+    fn from(ud: UserData) -> Self {
+        ud.0
+    }
 }
 
 impl From<u64> for UserData {
-    fn from(v: u64) -> Self { Self(v) }
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
 }
 
 // ── inter-thread messages ─────────────────────────────────────────────────────
@@ -186,7 +194,11 @@ struct ResponseParser {
 
 impl ResponseParser {
     const fn new() -> Self {
-        Self { head_accum: Vec::new(), body_buf: Vec::new(), partial: None }
+        Self {
+            head_accum: Vec::new(),
+            body_buf: Vec::new(),
+            partial: None,
+        }
     }
 
     fn clear(&mut self) {
@@ -248,7 +260,6 @@ impl ConnData {
     }
 }
 
-
 struct PartialResponse {
     version: Version,
     status: StatusCode,
@@ -306,7 +317,9 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     fn drop(&mut self) {
         let _ = self.sub.push_nop(SHUTDOWN_UD);
         let _ = self.sub.submit();
-        if let Some(h) = self.complete_thread.take() { let _ = h.join(); }
+        if let Some(h) = self.complete_thread.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -316,17 +329,22 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     /// # Errors
     /// Returns an error if the `io_uring` instance or provided-buffer ring cannot be set up.
     pub fn new() -> Result<Self, Error> {
-        let mut ring = ququmatz::IoUring::builder(RING)
-            .build()
-            .map_err(|e| Error::Connection(ConnectionError::Other(format!("io_uring setup: {e}"))))?;
+        let mut ring = ququmatz::IoUring::builder(RING).build().map_err(|e| {
+            Error::Connection(ConnectionError::Other(format!("io_uring setup: {e}")))
+        })?;
 
         let pbuf = ring
             .register_provided_buffers(PBUF_BGID, BUFS, BUF_SIZE)
-            .map_err(|e| Error::Connection(ConnectionError::Other(format!("register provided buffers: {e}"))))?;
+            .map_err(|e| {
+                Error::Connection(ConnectionError::Other(format!(
+                    "register provided buffers: {e}"
+                )))
+            })?;
 
         let (submitter, completer) = ring.split();
 
-        let (response_tx, response_rx) = SpmcRingBuffer::<ConnResult>::new(Capacity::exact(128)).split();
+        let (response_tx, response_rx) =
+            SpmcRingBuffer::<ConnResult>::new(Capacity::exact(128)).split();
         let (rearm_tx, rearm_rx) = MpscRingBuffer::<RearmMsg>::new(Capacity::exact(32)).split();
 
         let complete_thread = std::thread::spawn(move || {
@@ -351,20 +369,24 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     /// Returns an error if the URL is invalid, DNS resolution fails, or TCP connect fails.
     pub fn connect(&mut self, url: &[u8]) -> Result<ConnHandle, Error> {
         let parsed = Url::parse(url)?;
-        let host_str = std::str::from_utf8(parsed.host)
-            .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
+        let host_str = std::str::from_utf8(parsed.host).map_err(|_| {
+            Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
+        })?;
         let addr = resolve(host_str, parsed.effective_port())?;
         let fd = blocking_connect_resolved(&addr)
             .map_err(|()| Error::Connection(ConnectionError::Other("TCP connect failed".into())))?;
 
         let conn_id = self.alloc_conn_id()?;
-        self.conns.insert(conn_id, CallerConn {
-            fd,
-            recv_armed: false,
-            needs_reconnect: false,
-            url: url.to_vec(),
-            send_buf: Box::new([0u8; MAX_REQ]),
-        });
+        self.conns.insert(
+            conn_id,
+            CallerConn {
+                fd,
+                recv_armed: false,
+                needs_reconnect: false,
+                url: url.to_vec(),
+                send_buf: Box::new([0u8; MAX_REQ]),
+            },
+        );
 
         Ok(ConnHandle { conn_id, fd })
     }
@@ -392,23 +414,32 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         self.drain_rearms();
 
         // Lazy reconnect: if the previous request errored, re-dial before sending.
-        if self.conns.get(&conn.conn_id).is_some_and(|c| c.needs_reconnect) {
+        if self
+            .conns
+            .get(&conn.conn_id)
+            .is_some_and(|c| c.needs_reconnect)
+        {
             let url = self.conns[&conn.conn_id].url.clone();
             let parsed = Url::parse(&url)?;
-            let host_str = std::str::from_utf8(parsed.host)
-                .map_err(|_| Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into())))?;
+            let host_str = std::str::from_utf8(parsed.host).map_err(|_| {
+                Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
+            })?;
             let addr = resolve(host_str, parsed.effective_port())?;
-            let new_fd = blocking_connect_resolved(&addr)
-                .map_err(|()| Error::Connection(ConnectionError::Other("TCP reconnect failed".into())))?;
+            let new_fd = blocking_connect_resolved(&addr).map_err(|()| {
+                Error::Connection(ConnectionError::Other("TCP reconnect failed".into()))
+            })?;
             // SAFETY: we checked is_some_and above; no removal between the two accesses.
-            let c = self.conns.get_mut(&conn.conn_id)
-                .ok_or_else(|| Error::Connection(ConnectionError::Other("unknown conn_id".into())))?;
+            let c = self.conns.get_mut(&conn.conn_id).ok_or_else(|| {
+                Error::Connection(ConnectionError::Other("unknown conn_id".into()))
+            })?;
             c.fd = new_fd;
             c.recv_armed = false;
             c.needs_reconnect = false;
         }
 
-        let c = self.conns.get_mut(&conn.conn_id)
+        let c = self
+            .conns
+            .get_mut(&conn.conn_id)
             .ok_or_else(|| Error::Connection(ConnectionError::Other("unknown conn_id".into())))?;
 
         let host = {
@@ -426,15 +457,31 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         };
 
         let headers = [
-            Header { name: HeaderName::Host, value: &host },
-            Header { name: HeaderName::Connection, value: b"keep-alive" },
-            Header { name: HeaderName::UserAgent, value: b"xibalba/0.1" },
+            Header {
+                name: HeaderName::Host,
+                value: &host,
+            },
+            Header {
+                name: HeaderName::Connection,
+                value: b"keep-alive",
+            },
+            Header {
+                name: HeaderName::UserAgent,
+                value: b"xibalba/0.1",
+            },
         ];
-        let req = Request { method, path, query, version: Version::Http11, headers: &headers };
-        let len = req.serialize_to_buf(c.send_buf.as_mut())
-            .map_err(|_| Error::Connection(ConnectionError::Other(
-                format!("request exceeds MAX_REQ ({MAX_REQ} bytes); increase the MAX_REQ const generic")
-            )))?;
+        let req = Request {
+            method,
+            path,
+            query,
+            version: Version::Http11,
+            headers: &headers,
+        };
+        let len = req.serialize_to_buf(c.send_buf.as_mut()).map_err(|_| {
+            Error::Connection(ConnectionError::Other(format!(
+                "request exceeds MAX_REQ ({MAX_REQ} bytes); increase the MAX_REQ const generic"
+            )))
+        })?;
 
         let seq = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
@@ -442,19 +489,22 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         let raw_fd = RawFd::from_raw(c.fd);
         let send = Sqe::send(raw_fd, &c.send_buf[..len], MsgFlags::default())
             .user_data(UserData::send(conn.conn_id, seq).into());
-        self.sub.push(send)
-            .map_err(|e| Error::Connection(ConnectionError::Other(format!("SQ full (send): {e}"))))?;
+        self.sub.push(send).map_err(|e| {
+            Error::Connection(ConnectionError::Other(format!("SQ full (send): {e}")))
+        })?;
 
         if !c.recv_armed {
             let recv = Sqe::recv_multishot(raw_fd, MsgFlags::default())
                 .buffer_select(PBUF_BGID)
                 .user_data(UserData::recv(c.fd, conn.conn_id).into());
-            self.sub.push(recv)
-                .map_err(|e| Error::Connection(ConnectionError::Other(format!("SQ full (recv): {e}"))))?;
+            self.sub.push(recv).map_err(|e| {
+                Error::Connection(ConnectionError::Other(format!("SQ full (recv): {e}")))
+            })?;
             c.recv_armed = true;
         }
 
-        self.sub.submit()
+        self.sub
+            .submit()
             .map_err(|e| Error::Connection(ConnectionError::Other(format!("submit: {e}"))))?;
 
         Ok(RequestId::from(seq))
@@ -473,8 +523,11 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         // Drain the ring into the stash first so we don't miss anything.
         while let Some(r) = self.response_rx.pop() {
             let r = match r {
-                ConnResult::Error { request_id, conn, errno } =>
-                    self.handle_error(request_id, conn, errno),
+                ConnResult::Error {
+                    request_id,
+                    conn,
+                    errno,
+                } => self.handle_error(request_id, conn, errno),
                 other => other,
             };
             let rid = result_id(&r);
@@ -495,11 +548,17 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             if let Some(r) = self.stash.remove(&id) {
                 return Ok(r);
             }
-            let r = self.response_rx.pop_block()
-                .ok_or_else(|| Error::Connection(ConnectionError::Other("complete thread exited unexpectedly".into())))?;
+            let r = self.response_rx.pop_block().ok_or_else(|| {
+                Error::Connection(ConnectionError::Other(
+                    "complete thread exited unexpectedly".into(),
+                ))
+            })?;
             let r = match r {
-                ConnResult::Error { request_id, conn, errno } =>
-                    self.handle_error(request_id, conn, errno),
+                ConnResult::Error {
+                    request_id,
+                    conn,
+                    errno,
+                } => self.handle_error(request_id, conn, errno),
                 other => other,
             };
             let rid = result_id(&r);
@@ -517,14 +576,16 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     ///
     /// # Errors
     /// Returns an error if the complete thread has exited unexpectedly.
-    pub fn recv_timeout(&mut self, id: RequestId, timeout: std::time::Duration) -> Result<Option<ConnResult>, Error> {
+    pub fn recv_timeout(
+        &mut self,
+        id: RequestId,
+        timeout: std::time::Duration,
+    ) -> Result<Option<ConnResult>, Error> {
         if let Some(r) = self.stash.remove(&id) {
             return Ok(Some(r));
         }
 
-        let ts = Timespec::from_millis(
-            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-        );
+        let ts = Timespec::from_millis(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
         let tsqe = Sqe::timeout(&ts, 0, TimeoutFlags::default()).user_data(TIMEOUT_UD);
         // If the SQ is full we can't submit the timeout — fall back to a
         // non-blocking poll so we don't block forever.
@@ -534,11 +595,18 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
         let _ = self.sub.submit();
 
         loop {
-            let r = self.response_rx.pop_block()
-                .ok_or_else(|| Error::Connection(ConnectionError::Other("complete thread exited unexpectedly".into())))?;
+            let r = self.response_rx.pop_block().ok_or_else(|| {
+                Error::Connection(ConnectionError::Other(
+                    "complete thread exited unexpectedly".into(),
+                ))
+            })?;
             match r {
                 ConnResult::Timeout => return Ok(None),
-                ConnResult::Error { request_id, conn, errno } => {
+                ConnResult::Error {
+                    request_id,
+                    conn,
+                    errno,
+                } => {
                     let r = self.handle_error(request_id, conn, errno);
                     let rid = result_id(&r);
                     if rid == id {
@@ -556,7 +624,8 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                     return Ok(Some(r));
                 }
                 ConnResult::Response(resp) => {
-                    self.stash.insert(resp.request_id, ConnResult::Response(resp));
+                    self.stash
+                        .insert(resp.request_id, ConnResult::Response(resp));
                 }
             }
         }
@@ -573,7 +642,11 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             c.recv_armed = false;
             c.needs_reconnect = true;
         }
-        ConnResult::Error { request_id, conn, errno }
+        ConnResult::Error {
+            request_id,
+            conn,
+            errno,
+        }
     }
 
     fn alloc_conn_id(&mut self) -> Result<u32, Error> {
@@ -582,8 +655,11 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             return Ok(id);
         }
         let id = self.next_conn_id;
-        self.next_conn_id = self.next_conn_id.checked_add(1)
-            .ok_or_else(|| Error::Connection(ConnectionError::Other("conn_id space exhausted (>4B connections)".into())))?;
+        self.next_conn_id = self.next_conn_id.checked_add(1).ok_or_else(|| {
+            Error::Connection(ConnectionError::Other(
+                "conn_id space exhausted (>4B connections)".into(),
+            ))
+        })?;
         Ok(id)
     }
 
@@ -740,7 +816,11 @@ fn drain_recv_buf(conn: &mut ConnData, data: &[u8], response_tx: &SpmcProducer<C
 
 /// Called when the socket reaches EOF.  If a `UntilClose` response is in
 /// progress, deliver it; otherwise emit an error.
-fn finish_until_close(conn_handle: ConnHandle, conn: &mut ConnData, response_tx: &SpmcProducer<ConnResult>) {
+fn finish_until_close(
+    conn_handle: ConnHandle,
+    conn: &mut ConnData,
+    response_tx: &SpmcProducer<ConnResult>,
+) {
     if let Some(ref mut partial) = conn.parser.partial
         && matches!(partial.framing, InternalFraming::UntilClose)
     {
@@ -750,7 +830,11 @@ fn finish_until_close(conn_handle: ConnHandle, conn: &mut ConnData, response_tx:
         conn.parser.clear();
         conn.recv_buf.clear();
         let _ = response_tx.push_block(ConnResult::Response(Box::new(Response {
-            request_id, version: p.version, status: p.status, head: p.head, body: p.body_buf,
+            request_id,
+            version: p.version,
+            status: p.status,
+            head: p.head,
+            body: p.body_buf,
         })));
         return;
     }
@@ -758,13 +842,23 @@ fn finish_until_close(conn_handle: ConnHandle, conn: &mut ConnData, response_tx:
     let request_id = conn.pop_pending_id().unwrap_or(0);
     conn.parser.clear();
     conn.recv_buf.clear();
-    let _ = response_tx.push_block(ConnResult::Error { request_id, conn: conn_handle, errno: 0 });
+    let _ = response_tx.push_block(ConnResult::Error {
+        request_id,
+        conn: conn_handle,
+        errno: 0,
+    });
 }
 
 // ── CQE data processing ───────────────────────────────────────────────────────
 
-fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestId) -> Option<(Response, usize)> {
-    let head_end = parser.head_accum.windows(4).position(|w| w == b"\r\n\r\n")?;
+fn parse_head_and_maybe_finish(
+    parser: &mut ResponseParser,
+    request_id: RequestId,
+) -> Option<(Response, usize)> {
+    let head_end = parser
+        .head_accum
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")?;
     let head_bytes_len = head_end + 4;
 
     let mut hdr_buf = [const { xibalba_proto::header::Header::empty() }; MAX_HEADERS];
@@ -772,10 +866,16 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
         parse_response_head(&parser.head_accum[..head_bytes_len], &mut hdr_buf).ok()?;
 
     let framing = determine_body_framing(
-        head.status, false, &hdr_buf[..head.header_count], head.header_count,
+        head.status,
+        false,
+        &hdr_buf[..head.header_count],
+        head.header_count,
     );
-    let ranges =
-        build_ranges(&hdr_buf[..head.header_count], &parser.head_accum[..head_bytes_len]).ok()?;
+    let ranges = build_ranges(
+        &hdr_buf[..head.header_count],
+        &parser.head_accum[..head_bytes_len],
+    )
+    .ok()?;
     let (version, status, header_count) = (head.version, head.status, head.header_count);
 
     // Split head bytes out of head_accum without a fresh allocation: drain the
@@ -785,12 +885,21 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
     // remaining bytes start at what was index `head_bytes_len`, so adjust.
     let consumed_after_drain = consumed - head_bytes_len;
 
-    let head_data = HeadData { head_buf, ranges, header_count };
+    let head_data = HeadData {
+        head_buf,
+        ranges,
+        header_count,
+    };
 
     let (internal_framing, body_done) = match framing {
         BodyFraming::None => (InternalFraming::Done, true),
         BodyFraming::ContentLength(n) => (InternalFraming::ContentLength { remaining: n }, n == 0),
-        BodyFraming::Chunked => (InternalFraming::Chunked { decoder: ChunkedDecoder::new() }, false),
+        BodyFraming::Chunked => (
+            InternalFraming::Chunked {
+                decoder: ChunkedDecoder::new(),
+            },
+            false,
+        ),
         BodyFraming::UntilClose => (InternalFraming::UntilClose, false),
     };
 
@@ -802,8 +911,12 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
         body_buf.reserve(n as usize);
     }
     let mut partial = PartialResponse {
-        version, status, head: head_data,
-        body_buf, body_done, framing: internal_framing,
+        version,
+        status,
+        head: head_data,
+        body_buf,
+        body_done,
+        framing: internal_framing,
     };
 
     let after_head = &parser.head_accum[consumed_after_drain..];
@@ -818,13 +931,16 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
         // Shift leftover bytes to the front of head_accum (no new allocation).
         parser.head_accum.drain(..total_consumed);
         parser.partial = None;
-        Some((Response {
-            request_id,
-            version: partial.version,
-            status: partial.status,
-            head: partial.head,
-            body: partial.body_buf,
-        }, body_consumed))
+        Some((
+            Response {
+                request_id,
+                version: partial.version,
+                status: partial.status,
+                head: partial.head,
+                body: partial.body_buf,
+            },
+            body_consumed,
+        ))
     } else {
         // Trim consumed head bytes from head_accum; body bytes stay in partial.
         parser.head_accum.drain(..consumed_after_drain);
@@ -837,13 +953,18 @@ fn parse_head_and_maybe_finish(parser: &mut ResponseParser, request_id: RequestI
 fn pump_partial(resp: &mut PartialResponse, data: &[u8]) -> usize {
     let mut out = [0u8; BLOCK_SIZE];
     match &mut resp.framing {
-        InternalFraming::Done => { resp.body_done = true; 0 }
+        InternalFraming::Done => {
+            resp.body_done = true;
+            0
+        }
         InternalFraming::ContentLength { remaining } => {
             #[allow(clippy::cast_possible_truncation)]
             let to_take = data.len().min(*remaining as usize);
             resp.body_buf.extend_from_slice(&data[..to_take]);
             *remaining -= to_take as u64;
-            if *remaining == 0 { resp.body_done = true; }
+            if *remaining == 0 {
+                resp.body_done = true;
+            }
             to_take
         }
         InternalFraming::Chunked { decoder } => {
@@ -854,13 +975,21 @@ fn pump_partial(resp: &mut PartialResponse, data: &[u8]) -> usize {
                 match result {
                     DecodeResult::Data(n) => {
                         resp.body_buf.extend_from_slice(&out[..n]);
-                        if decoder.is_done() { resp.body_done = true; break; }
+                        if decoder.is_done() {
+                            resp.body_done = true;
+                            break;
+                        }
                     }
-                    DecodeResult::Done | DecodeResult::Error(_) => { resp.body_done = true; break; }
+                    DecodeResult::Done | DecodeResult::Error(_) => {
+                        resp.body_done = true;
+                        break;
+                    }
                     DecodeResult::NeedMore => break,
                 }
             }
-            if decoder.is_done() { resp.body_done = true; }
+            if decoder.is_done() {
+                resp.body_done = true;
+            }
             pos
         }
         // UntilClose body is accumulated but only marked done on EOF.
@@ -886,10 +1015,20 @@ fn blocking_connect(addr: std::net::SocketAddr) -> Result<usize, ()> {
 fn resolve(host: &str, port: u16) -> Result<ResolvedAddr, Error> {
     let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
-        .map_err(|e| Error::Connection(ConnectionError::Other(format!("DNS resolution failed: {e}"))))?
+        .map_err(|e| {
+            Error::Connection(ConnectionError::Other(format!(
+                "DNS resolution failed: {e}"
+            )))
+        })?
         .collect();
 
-    if let Some(v4) = addrs.iter().find_map(|a| if let std::net::SocketAddr::V4(v4) = a { Some(*v4) } else { None }) {
+    if let Some(v4) = addrs.iter().find_map(|a| {
+        if let std::net::SocketAddr::V4(v4) = a {
+            Some(*v4)
+        } else {
+            None
+        }
+    }) {
         return Ok(ResolvedAddr::V4(SockAddrIn {
             sin_family: 2,
             sin_port: v4.port().to_be(),
@@ -898,11 +1037,19 @@ fn resolve(host: &str, port: u16) -> Result<ResolvedAddr, Error> {
         }));
     }
 
-    if let Some(v6) = addrs.iter().find_map(|a| if let std::net::SocketAddr::V6(v6) = a { Some(*v6) } else { None }) {
+    if let Some(v6) = addrs.iter().find_map(|a| {
+        if let std::net::SocketAddr::V6(v6) = a {
+            Some(*v6)
+        } else {
+            None
+        }
+    }) {
         return Ok(ResolvedAddr::V6(v6));
     }
 
-    Err(Error::Connection(ConnectionError::Other("no address found".into())))
+    Err(Error::Connection(ConnectionError::Other(
+        "no address found".into(),
+    )))
 }
 
 enum ResolvedAddr {
@@ -915,7 +1062,9 @@ fn blocking_connect_resolved(addr: &ResolvedAddr) -> Result<usize, ()> {
         ResolvedAddr::V4(a) => {
             let ip = std::net::Ipv4Addr::from(u32::from_be(a.sin_addr));
             let port = u16::from_be(a.sin_port);
-            blocking_connect(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+            blocking_connect(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                ip, port,
+            )))
         }
         ResolvedAddr::V6(a) => blocking_connect(std::net::SocketAddr::V6(*a)),
     }
@@ -959,12 +1108,16 @@ mod tests {
                     let mut acc: Vec<u8> = Vec::new();
                     loop {
                         let n = s.read(&mut buf).unwrap_or(0);
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         acc.extend_from_slice(&buf[..n]);
                         // Send one response per complete request header block found.
                         while let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
                             acc.drain(..pos + 4);
-                            if s.write_all(resp).is_err() { return; }
+                            if s.write_all(resp).is_err() {
+                                return;
+                            }
                         }
                     }
                 });
@@ -986,9 +1139,14 @@ mod tests {
                     let mut buf = [0u8; 4096];
                     loop {
                         let n = s.read(&mut buf).unwrap_or(0);
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         if buf[..n].windows(4).any(|w| w == b"\r\n\r\n")
-                            && s.write_all(resp).is_err() { break; }
+                            && s.write_all(resp).is_err()
+                        {
+                            break;
+                        }
                     }
                 });
             }
@@ -1008,7 +1166,9 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
                     let n = s.read(&mut buf).unwrap_or(0);
-                    if n == 0 { return; }
+                    if n == 0 {
+                        return;
+                    }
                     let _ = s.write_all(resp);
                     // drop s → closes connection
                 });
@@ -1048,7 +1208,9 @@ mod tests {
     fn test_happy_path() {
         let port = keep_alive_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         for _ in 0..3 {
             let id = pool.get(conn, b"/").unwrap();
             match pool.recv(id).unwrap() {
@@ -1063,7 +1225,9 @@ mod tests {
     fn test_pipelined_requests() {
         let port = keep_alive_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         // Submit 3 requests before reading any response.
         let id1 = pool.get(conn, b"/").unwrap();
         let id2 = pool.get(conn, b"/").unwrap();
@@ -1096,7 +1260,9 @@ mod tests {
     fn test_chunked_body() {
         let port = chunked_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         let id = pool.get(conn, b"/").unwrap();
         match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"hello"),
@@ -1109,7 +1275,9 @@ mod tests {
     fn test_until_close_body() {
         let port = until_close_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         let id = pool.get(conn, b"/").unwrap();
         match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"hello"),
@@ -1130,7 +1298,9 @@ mod tests {
         // "same handle still works" without a server that closes once then stays
         // up — use keep_alive_server and just verify happy path still holds.
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         let id = pool.get(conn, b"/").unwrap();
         match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
@@ -1148,7 +1318,9 @@ mod tests {
         let live_port = keep_alive_server();
 
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{drop_port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{drop_port}").as_bytes())
+            .unwrap();
         let id = pool.get(conn, b"/").unwrap();
         // Drop server closes immediately — we get an error (not a panic).
         match pool.recv(id).unwrap() {
@@ -1161,7 +1333,9 @@ mod tests {
             ConnResult::Timeout => panic!("timeout"),
         }
         // The pool is still alive and can open a fresh connection to a live server.
-        let conn2 = pool.connect(format!("http://127.0.0.1:{live_port}").as_bytes()).unwrap();
+        let conn2 = pool
+            .connect(format!("http://127.0.0.1:{live_port}").as_bytes())
+            .unwrap();
         let id2 = pool.get(conn2, b"/").unwrap();
         match pool.recv(id2).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
@@ -1174,9 +1348,13 @@ mod tests {
     fn test_recv_timeout_fires() {
         let port = silent_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         let id = pool.get(conn, b"/").unwrap();
-        let result = pool.recv_timeout(id, std::time::Duration::from_millis(200)).unwrap();
+        let result = pool
+            .recv_timeout(id, std::time::Duration::from_millis(200))
+            .unwrap();
         assert!(result.is_none(), "expected timeout, got a result");
     }
 
@@ -1184,9 +1362,13 @@ mod tests {
     fn test_recv_timeout_succeeds_when_server_responds() {
         let port = keep_alive_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         let id = pool.get(conn, b"/").unwrap();
-        let result = pool.recv_timeout(id, std::time::Duration::from_secs(5)).unwrap();
+        let result = pool
+            .recv_timeout(id, std::time::Duration::from_secs(5))
+            .unwrap();
         match result {
             Some(ConnResult::Response(r)) => assert_eq!(&r.body, b"ok"),
             Some(ConnResult::Error { errno, .. }) => panic!("error errno={errno}"),
@@ -1207,14 +1389,18 @@ mod tests {
                     let mut buf = [0u8; 4096];
                     loop {
                         let n = s.read(&mut buf).unwrap_or(0);
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         // Extract Host header value.
-                        let host = req.windows(6)
+                        let host = req
+                            .windows(6)
                             .position(|w| w == b"Host: ")
                             .and_then(|i| {
                                 let rest = &req[i + 6..];
-                                rest.windows(2).position(|w| w == b"\r\n")
+                                rest.windows(2)
+                                    .position(|w| w == b"\r\n")
                                     .map(|end| rest[..end].to_vec())
                             })
                             .unwrap_or_default();
@@ -1237,7 +1423,12 @@ mod tests {
         match pool.recv(id).unwrap() {
             ConnResult::Response(r) => {
                 let expected = format!("127.0.0.1:{port}");
-                assert_eq!(r.body, expected.as_bytes(), "Host header was {:?}", std::str::from_utf8(&r.body));
+                assert_eq!(
+                    r.body,
+                    expected.as_bytes(),
+                    "Host header was {:?}",
+                    std::str::from_utf8(&r.body)
+                );
             }
             ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
             ConnResult::Timeout => panic!("timeout"),
@@ -1249,12 +1440,17 @@ mod tests {
         let port = keep_alive_server();
         // Use a tiny MAX_REQ so a normal request overflows it.
         let mut pool = Pool::<256, 64, 8192, 64>::new().unwrap();
-        let conn = pool.connect(format!("http://127.0.0.1:{port}").as_bytes()).unwrap();
+        let conn = pool
+            .connect(format!("http://127.0.0.1:{port}").as_bytes())
+            .unwrap();
         // A path long enough to exceed 64 bytes total serialized.
         let long_path: Vec<u8> = std::iter::repeat_n(b'a', 60).collect();
         let result = pool.get(conn, &long_path);
         assert!(result.is_err(), "expected error for oversized request");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("MAX_REQ"), "error should mention MAX_REQ, got: {msg}");
+        assert!(
+            msg.contains("MAX_REQ"),
+            "error should mention MAX_REQ, got: {msg}"
+        );
     }
 }

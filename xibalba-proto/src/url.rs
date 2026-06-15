@@ -163,7 +163,10 @@ fn parse_port(bytes: &[u8]) -> Result<u16, Error> {
             return Err(UrlError::InvalidPort.into());
         }
     }
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "result is checked > u16::MAX just above; value is guaranteed in range"
+    )]
     Ok(result as u16)
 }
 

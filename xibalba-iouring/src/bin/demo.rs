@@ -7,7 +7,8 @@ fn spawn_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!";
+        let resp =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!";
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
             std::thread::spawn(move || {
@@ -17,12 +18,18 @@ fn spawn_server() -> u16 {
                 'conn: loop {
                     loop {
                         let n = s.read(&mut buf).unwrap_or(0);
-                        if n == 0 { break 'conn; }
+                        if n == 0 {
+                            break 'conn;
+                        }
                         acc.extend_from_slice(&buf[..n]);
-                        if acc.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
                     }
                     eprintln!("[server] sending response {req_num}");
-                    if s.write_all(resp).is_err() { break; }
+                    if s.write_all(resp).is_err() {
+                        break;
+                    }
                     req_num += 1;
                     acc.clear();
                 }
@@ -44,11 +51,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let id = pool.get(conn, b"/")?;
         let resp = match pool.recv(id).unwrap_or_else(|e| panic!("recv: {e}")) {
             ConnResult::Response(r) => r,
-            ConnResult::Error { request_id, errno, .. } =>
-                panic!("request {request_id} failed: errno {errno}"),
+            ConnResult::Error {
+                request_id, errno, ..
+            } => panic!("request {request_id} failed: errno {errno}"),
             ConnResult::Timeout => panic!("request timed out"),
         };
-        eprintln!("response {i}: {} bytes, body={:?}", resp.body.len(), String::from_utf8_lossy(&resp.body));
+        eprintln!(
+            "response {i}: {} bytes, body={:?}",
+            resp.body.len(),
+            String::from_utf8_lossy(&resp.body)
+        );
     }
     eprintln!("done");
     Ok(())

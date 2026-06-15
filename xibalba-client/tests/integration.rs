@@ -121,7 +121,10 @@ fn get_no_body_204() {
     let mut client = connect(port);
 
     let resp = client.request(Method::Get, b"/", None, None).unwrap();
-    assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::NO_CONTENT);
+    assert_eq!(
+        resp.status,
+        xibalba_client::proto::status::StatusCode::NO_CONTENT
+    );
     assert!(resp.text().unwrap().is_empty());
     server.join().unwrap();
 }

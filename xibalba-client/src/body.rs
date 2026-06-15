@@ -91,8 +91,12 @@ pub struct StreamingBody<'a, S: Read> {
 
 #[derive(Debug)]
 enum StreamState {
-    Length { remaining: u64 },
-    Chunked { decoder: xibalba_proto::response::ChunkedDecoder },
+    Length {
+        remaining: u64,
+    },
+    Chunked {
+        decoder: xibalba_proto::response::ChunkedDecoder,
+    },
     UntilClose,
     Done,
 }

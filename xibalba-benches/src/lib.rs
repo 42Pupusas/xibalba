@@ -44,8 +44,7 @@ pub const RESP_ALL_UNKNOWN: &[u8] = b"HTTP/1.1 200 OK\r\n\
 
 pub const CHUNKED_SINGLE: &[u8] = b"b\r\nhello world\r\n0\r\n\r\n";
 
-pub const CHUNKED_MULTI: &[u8] =
-    b"7\r\nMozilla\r\n9\r\nDeveloper\r\n7\r\nNetwork\r\n0\r\n\r\n";
+pub const CHUNKED_MULTI: &[u8] = b"7\r\nMozilla\r\n9\r\nDeveloper\r\n7\r\nNetwork\r\n0\r\n\r\n";
 
 #[must_use]
 pub fn chunked_large() -> Vec<u8> {
@@ -62,8 +61,7 @@ pub fn chunked_large() -> Vec<u8> {
 pub const REQ_PATH_SHORT: &[u8] = b"/";
 pub const REQ_PATH_LONG: &[u8] =
     b"/api/v2/organizations/acme-corp/projects/main/environments/production/deployments";
-pub const REQ_QUERY_LONG: &[u8] =
-    b"filter=active&sort=created_at&order=desc&page=3&per_page=100\
+pub const REQ_QUERY_LONG: &[u8] = b"filter=active&sort=created_at&order=desc&page=3&per_page=100\
       &include=metadata&expand=owner,team&format=json&locale=en-US&token=abc123xyz";
 
 // ── URL fixtures ───────────────────────────────────────────────────────────
@@ -72,16 +70,14 @@ pub const URL_SIMPLE: &[u8] = b"http://example.com/";
 pub const URL_FULL: &[u8] =
     b"https://user.example.com:8443/api/v2/resource?q=hello&page=2&sort=desc#section-3";
 pub const URL_IPV6: &[u8] = b"http://[2001:db8::1]:8080/path";
-pub const URL_MANY_PARAMS: &[u8] =
-    b"http://example.com/search?\
+pub const URL_MANY_PARAMS: &[u8] = b"http://example.com/search?\
       a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10&\
       k=11&l=12&m=13&n=14&o=15&p=16&q=17&r=18&s=19&t=20&\
       u=21&v=22&w=23&x=24&y=25&z=26&aa=27&ab=28&ac=29&ad=30&\
       ae=31&af=32&ag=33&ah=34&ai=35&af2=36&ag2=37&ah2=38&ai2=39&aj=40&\
       ak=41&al=42&am=43&an=44&ao=45&ap=46&aq=47&ar=48&as=49&at=50";
 pub const URL_ONE_PARAM: &[u8] = b"http://example.com/?only=value";
-pub const URL_TEN_PARAMS: &[u8] =
-    b"http://example.com/?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10";
+pub const URL_TEN_PARAMS: &[u8] = b"http://example.com/?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9&j=10";
 
 // ── Header name fixtures ───────────────────────────────────────────────────
 
