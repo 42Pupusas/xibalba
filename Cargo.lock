@@ -470,6 +470,12 @@ name = "quetzalcoatl"
 version = "0.13.0"
 
 [[package]]
+name = "quetzalcoatl"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c8a842e5c2e6a41c29708cd358b832ed3787446f96b3cd7569640a9f22022fd"
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -899,8 +905,9 @@ dependencies = [
 
 [[package]]
 name = "xibalba-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
+ "quetzalcoatl 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "xibalba-proto",
 ]
 
@@ -908,14 +915,14 @@ dependencies = [
 name = "xibalba-iouring"
 version = "0.1.0"
 dependencies = [
- "quetzalcoatl",
+ "quetzalcoatl 0.13.0",
  "ququmatz",
  "xibalba-proto",
 ]
 
 [[package]]
 name = "xibalba-proto"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "yoke"

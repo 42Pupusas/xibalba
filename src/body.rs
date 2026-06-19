@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use quetzalcoatl::spsc::{Consumer, Producer};
@@ -13,7 +13,8 @@ const BLOCK_SIZE: usize = 8192;
 #[derive(Clone, Debug)]
 pub struct IoBlock {
     pub data: [u8; BLOCK_SIZE],
-    pub len: usize, // 0 = EOF sentinel
+    pub len: usize, // 0 = EOF sentinel (when error is None)
+    pub error: Option<IoError>, // terminal error, mutually exclusive with data
 }
 
 impl Default for IoBlock {
@@ -21,6 +22,7 @@ impl Default for IoBlock {
         Self {
             data: [0; BLOCK_SIZE],
             len: 0,
+            error: None,
         }
     }
 }
@@ -29,7 +31,6 @@ pub(crate) fn reader_thread(
     mut stream: Stream,
     producer: &Producer<IoBlock>,
     stop: &Arc<AtomicBool>,
-    error: &Arc<Mutex<Option<IoError>>>,
 ) {
     use std::io::Read;
 
@@ -57,14 +58,18 @@ pub(crate) fn reader_thread(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => {
-                if let Ok(mut guard) = error.lock() {
-                    *guard = Some(IoError {
+                // Terminal error block: EOF sentinel plus the error payload.
+                // The consumer receives this through the same SPSC channel,
+                // so no Mutex is needed for error propagation.
+                let error_block = IoBlock {
+                    data: [0; BLOCK_SIZE],
+                    len: 0,
+                    error: Some(IoError {
                         kind: e.kind(),
                         message: e.to_string(),
-                    });
-                }
-                // Push EOF sentinel so consumer knows we're done
-                push_with_backoff(producer, IoBlock::default(), stop);
+                    }),
+                };
+                push_with_backoff(producer, error_block, stop);
                 break;
             }
         }
@@ -94,7 +99,7 @@ pub struct BodyReader {
     leftover_pos: usize,
     remaining: u64,
     chunked: Option<ChunkedDecoder>,
-    error: Arc<Mutex<Option<IoError>>>,
+    error: Option<IoError>,
     stop: Arc<AtomicBool>,
     done: bool,
 }
@@ -105,7 +110,6 @@ impl BodyReader {
         consumer: Consumer<IoBlock>,
         framing: BodyFraming,
         leftover: Vec<u8>,
-        error: Arc<Mutex<Option<IoError>>>,
         stop: Arc<AtomicBool>,
     ) -> Self {
         let remaining = match &framing {
@@ -124,16 +128,14 @@ impl BodyReader {
             leftover_pos: 0,
             remaining,
             chunked,
-            error,
+            error: None,
             stop,
             done,
         }
     }
 
     fn check_error(&self) -> std::io::Result<()> {
-        if let Ok(guard) = self.error.lock()
-            && let Some(e) = guard.as_ref()
-        {
+        if let Some(e) = &self.error {
             return Err(std::io::Error::new(e.kind, e.message.clone()));
         }
         Ok(())
@@ -170,6 +172,10 @@ impl BodyReader {
     fn next_block_data(&mut self) -> Option<Vec<u8>> {
         loop {
             if let Some(block) = self.consumer.pop() {
+                if let Some(e) = block.error {
+                    self.error = Some(e);
+                    return None; // terminal error
+                }
                 if block.len == 0 {
                     return None; // EOF
                 }
@@ -330,13 +336,11 @@ mod tests {
     fn content_length_exact() {
         let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
         let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
         producer.push(make_block(b"hello")).unwrap();
         producer.push(eof_block()).unwrap();
 
-        let mut reader =
-            BodyReader::new(consumer, BodyFraming::ContentLength(5), vec![], error, stop);
+        let mut reader = BodyReader::new(consumer, BodyFraming::ContentLength(5), vec![], stop);
 
         let mut buf = vec![0u8; 64];
         let n = reader.read(&mut buf).unwrap();
@@ -350,7 +354,6 @@ mod tests {
     fn content_length_with_leftover() {
         let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
         let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
         producer.push(eof_block()).unwrap();
 
@@ -358,7 +361,6 @@ mod tests {
             consumer,
             BodyFraming::ContentLength(5),
             b"helloextra".to_vec(),
-            error,
             stop,
         );
 
@@ -374,14 +376,13 @@ mod tests {
     fn chunked_body() {
         let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
         let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
         producer
             .push(make_block(b"5\r\nhello\r\n0\r\n\r\n"))
             .unwrap();
         producer.push(eof_block()).unwrap();
 
-        let mut reader = BodyReader::new(consumer, BodyFraming::Chunked, vec![], error, stop);
+        let mut reader = BodyReader::new(consumer, BodyFraming::Chunked, vec![], stop);
 
         let mut buf = vec![0u8; 64];
         let n = reader.read(&mut buf).unwrap();
@@ -395,7 +396,6 @@ mod tests {
     fn chunked_with_leftover() {
         let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
         let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
         producer.push(eof_block()).unwrap();
 
@@ -403,7 +403,6 @@ mod tests {
             consumer,
             BodyFraming::Chunked,
             b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
-            error,
             stop,
         );
 
@@ -419,13 +418,12 @@ mod tests {
     fn until_close() {
         let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
         let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
         producer.push(make_block(b"hello")).unwrap();
         producer.push(make_block(b" world")).unwrap();
         producer.push(eof_block()).unwrap();
 
-        let mut reader = BodyReader::new(consumer, BodyFraming::UntilClose, vec![], error, stop);
+        let mut reader = BodyReader::new(consumer, BodyFraming::UntilClose, vec![], stop);
 
         let mut result = Vec::new();
         let mut buf = vec![0u8; 64];
@@ -443,9 +441,8 @@ mod tests {
     fn no_body() {
         let (_, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
         let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
-        let mut reader = BodyReader::new(consumer, BodyFraming::None, vec![], error, stop);
+        let mut reader = BodyReader::new(consumer, BodyFraming::None, vec![], stop);
 
         let mut buf = vec![0u8; 64];
         let n = reader.read(&mut buf).unwrap();
@@ -456,16 +453,31 @@ mod tests {
     fn drop_sets_stop_flag() {
         let (_, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
         let stop = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
-        let reader = BodyReader::new(
-            consumer,
-            BodyFraming::None,
-            vec![],
-            error,
-            Arc::clone(&stop),
-        );
+        let reader = BodyReader::new(consumer, BodyFraming::None, vec![], Arc::clone(&stop));
         drop(reader);
         assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn read_error_propagated_through_channel() {
+        let (producer, consumer) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        producer
+            .push(IoBlock {
+                data: [0; BLOCK_SIZE],
+                len: 0,
+                error: Some(IoError {
+                    kind: std::io::ErrorKind::UnexpectedEof,
+                    message: "peer reset".into(),
+                }),
+            })
+            .unwrap();
+
+        let mut reader = BodyReader::new(consumer, BodyFraming::UntilClose, vec![], stop);
+        let mut buf = vec![0u8; 64];
+        let e = reader.read(&mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

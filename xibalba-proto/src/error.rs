@@ -31,6 +31,8 @@ pub enum ConnectionError {
     BodyTooLarge,
     HeadTooLarge,
     TooManyRedirects,
+    /// The async client's background reader thread has exited.
+    ReaderGone,
     Other(String),
 }
 
@@ -103,6 +105,7 @@ impl fmt::Display for ConnectionError {
             Self::BodyTooLarge => f.write_str("response body exceeds size limit"),
             Self::HeadTooLarge => f.write_str("response head exceeds size limit"),
             Self::TooManyRedirects => f.write_str("too many redirects"),
+            Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::Other(msg) => f.write_str(msg),
         }
     }

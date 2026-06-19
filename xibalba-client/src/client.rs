@@ -152,17 +152,17 @@ impl<'a, C: Connector> RequestBuilder<'a, C> {
 
 pub struct Client<C: Connector> {
     tls_config: C::TlsConfig,
-    stream: C::Stream,
-    config: Config,
+    pub(crate) stream: C::Stream,
+    pub(crate) config: Config,
     host: Vec<u8>,
     port: u16,
     scheme: xibalba_proto::scheme::Scheme,
     write_buf: Vec<u8>,
-    head_buf: Vec<u8>,
+    pub(crate) head_buf: Vec<u8>,
     /// Set while a streaming response is in flight; stays set if the
     /// reader is dropped before the body is fully consumed. The next
     /// request reconnects instead of reading a stale body.
-    dirty: bool,
+    pub(crate) dirty: bool,
 }
 
 impl<C: Connector> Client<C> {
@@ -252,7 +252,7 @@ impl<C: Connector> Client<C> {
 
     /// Reconnect to the current host if a previous streaming response
     /// was dropped before its body was fully consumed.
-    fn ensure_clean(&mut self) -> Result<(), Error> {
+    pub(crate) fn ensure_clean(&mut self) -> Result<(), Error> {
         if !self.dirty {
             return Ok(());
         }
@@ -333,7 +333,11 @@ impl<C: Connector> Client<C> {
     /// request much later hit exactly that. Retry is safe here: the
     /// failure is detected before any response byte reaches the caller,
     /// so the request was never processed.
-    fn send_head(
+    ///
+    /// `pub(crate)` so [`crate::async_client::AsyncClient`]'s reader
+    /// thread can submit requests without going through
+    /// `RequestBuilder`.
+    pub(crate) fn send_head(
         &mut self,
         method: Method,
         path: &[u8],
@@ -354,7 +358,7 @@ impl<C: Connector> Client<C> {
     /// Write one request and read the response head, leaving the body
     /// unread on the stream. Returns the head, its framing, and the
     /// offset of the body's first byte within `self.head_buf`.
-    fn send_head_once(
+    pub(crate) fn send_head_once(
         &mut self,
         method: Method,
         path: &[u8],

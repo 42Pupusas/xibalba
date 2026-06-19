@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use rustls::ClientConfig;
 
 use crate::body::{BodyReader, IoBlock, reader_thread};
 use crate::connection::connect;
-use crate::error::{ConnectionError, Error, IoError};
+use crate::error::{ConnectionError, Error};
 use crate::header::{Header, HeaderName};
 use crate::method::Method;
 use crate::request::Request;
@@ -111,12 +111,10 @@ impl Client {
         let (producer, mut ringbuf_rx) = RingBuffer::<IoBlock>::new(Capacity::exact(16)).split();
 
         let stop = Arc::new(AtomicBool::new(false));
-        let error: Arc<Mutex<Option<IoError>>> = Arc::new(Mutex::new(None));
 
         let stop_for_thread = Arc::clone(&stop);
-        let error_for_thread = Arc::clone(&error);
         let handle = std::thread::spawn(move || {
-            reader_thread(stream, &producer, &stop_for_thread, &error_for_thread);
+            reader_thread(stream, &producer, &stop_for_thread);
         });
 
         // Accumulate data until we find \r\n\r\n
@@ -127,12 +125,10 @@ impl Client {
             }
             match ringbuf_rx.pop() {
                 Some(block) => {
+                    if let Some(e) = &block.error {
+                        return Err(Error::Io(e.clone()));
+                    }
                     if block.len == 0 {
-                        if let Ok(guard) = error.lock()
-                            && let Some(e) = guard.as_ref()
-                        {
-                            return Err(Error::Io(e.clone()));
-                        }
                         return Err(Error::Connection(
                             "connection closed before headers complete".into(),
                         ));
@@ -162,7 +158,7 @@ impl Client {
         // Leftover bytes after the head
         let leftover = head_buf[head_len..].to_vec();
 
-        let body = BodyReader::new(ringbuf_rx, framing, leftover, error, Arc::clone(&stop));
+        let body = BodyReader::new(ringbuf_rx, framing, leftover, Arc::clone(&stop));
 
         Ok(Response {
             version: head.version,

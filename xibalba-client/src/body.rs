@@ -148,7 +148,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
     fn input(&mut self) -> std::io::Result<&[u8]> {
         if self.raw_pos >= self.raw.len() {
             self.raw.resize(HEAD_BUF_SIZE, 0);
-            let n = self.stream.read(&mut self.raw)?;
+            let n = read_retry(&mut self.stream, &mut self.raw)?;
             self.raw.truncate(n);
             self.raw_pos = 0;
         }
@@ -182,7 +182,7 @@ impl<S: Read> Read for StreamingBody<'_, S> {
                         .min(buf.len());
                     buf[..n].copy_from_slice(&input[..n]);
                     self.raw_pos += n;
-                    let remaining = remaining - n as u64;
+                    let remaining = remaining - u64::try_from(n).unwrap_or(u64::MAX);
                     if remaining == 0 {
                         self.finish();
                     } else {
@@ -208,7 +208,7 @@ impl<S: Read> Read for StreamingBody<'_, S> {
                 StreamState::Chunked { ref mut decoder } => {
                     if self.raw_pos >= self.raw.len() {
                         self.raw.resize(HEAD_BUF_SIZE, 0);
-                        let n = self.stream.read(&mut self.raw)?;
+                        let n = read_retry(&mut self.stream, &mut self.raw)?;
                         self.raw.truncate(n);
                         self.raw_pos = 0;
                         if n == 0 {
@@ -247,6 +247,54 @@ impl<S: Read> Read for StreamingBody<'_, S> {
 
 // ── Inline read helpers ──────────────────────────────────────────────────────
 
+/// How many consecutive [`std::io::ErrorKind::WouldBlock`] timeouts to
+/// tolerate before giving up. A slow API that takes 8s to send headers
+/// with a 5s per-read ceiling needs one retry; a genuinely stalled
+/// server exhausts these quickly (3 × timeout).
+const MAX_WOULDBLOCK_RETRIES: u32 = 3;
+
+/// Read from `stream`, retrying on [`std::io::ErrorKind::WouldBlock`]
+/// up to [`MAX_WOULDBLOCK_RETRIES`] times.
+///
+/// A blocking socket with `SO_RCVTIMEO` returns `EAGAIN`/`WouldBlock` when
+/// no data arrives within the timeout window. The timeout is a ceiling, not
+/// a failure — retrying resets the timer and waits for the next window.
+/// This is what [`super::CancellableStream`] already does for the streaming
+/// body path; this helper extends the same treatment to the head-read and
+/// synchronous body-read paths, with a cap so a dead server doesn't hang
+/// the caller forever.
+fn read_retry(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut attempts = 0u32;
+    loop {
+        match stream.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                attempts += 1;
+                if attempts > MAX_WOULDBLOCK_RETRIES {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Like [`std::io::Read::read_exact`] but retries on `WouldBlock`.
+fn read_exact_retry(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = read_retry(stream, &mut buf[off..])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed mid-body",
+            ));
+        }
+        off += n;
+    }
+    Ok(())
+}
+
 /// Returns `(HeadData, framing, tail_offset)`. The tail bytes (body prefix
 /// that arrived with the head read) live in `head_acc[tail_offset..]`.
 pub(crate) fn read_response_head<S: Read>(
@@ -261,7 +309,7 @@ pub(crate) fn read_response_head<S: Read>(
     let mut raw = [0u8; HEAD_BUF_SIZE];
 
     let head_end = loop {
-        let n = stream.read(&mut raw)?;
+        let n = read_retry(stream, &mut raw)?;
         if n == 0 {
             return Err(ConnectionError::ConnectionClosed.into());
         }
@@ -321,7 +369,7 @@ pub(crate) fn read_body<S: Read>(
             body.extend_from_slice(&tail[..from_tail]);
             if body.len() < len {
                 body.resize(len, 0);
-                stream.read_exact(&mut body[from_tail..])?;
+                read_exact_retry(stream, &mut body[from_tail..])?;
             }
             Ok(body)
         }
@@ -357,7 +405,7 @@ pub(crate) fn read_body<S: Read>(
             }
 
             loop {
-                let n = stream.read(&mut raw)?;
+                let n = read_retry(stream, &mut raw)?;
                 if n == 0 {
                     return Err(ConnectionError::ConnectionClosed.into());
                 }
@@ -390,7 +438,7 @@ pub(crate) fn read_body<S: Read>(
             let mut body = tail.to_vec();
             let mut raw = [0u8; HEAD_BUF_SIZE];
             loop {
-                let n = stream.read(&mut raw)?;
+                let n = read_retry(stream, &mut raw)?;
                 if n == 0 {
                     return Ok(body);
                 }

@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
+use xibalba_client::async_client::{AsyncClient, Chunk};
 use xibalba_client::client::{Client, Config};
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_client::proto::error::{ConnectionError, Error};
@@ -87,6 +88,127 @@ fn connect(port: u16) -> Client<PlainConnector> {
 fn connect_with_config(port: u16, config: Config) -> Client<PlainConnector> {
     let url = format!("http://127.0.0.1:{port}/");
     Client::<PlainConnector>::connect(url.as_bytes(), (), config).unwrap()
+}
+
+fn connect_async(port: u16) -> AsyncClient {
+    let url = format!("http://127.0.0.1:{port}/");
+    AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), Config::default()).unwrap()
+}
+
+// ── AsyncClient tests ────────────────────────────────────────────────────────
+
+#[test]
+fn async_cancel_mid_stream_then_next_request_is_clean() {
+    // Regression test for the mid-stream cancel corruption bug.
+    // Cancelling (dropping) a StreamHandle before the response body is
+    // fully consumed must mark the underlying connection dirty so the
+    // next request reconnects. Otherwise the next response is parsed
+    // from leftover body bytes of the previous response and is corrupted.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        // First request: long chunked body; client will cancel after the first chunk.
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n",
+            )
+            .unwrap();
+        stream.flush().unwrap();
+
+        // Stall. If the client reuses this connection without reconnecting,
+        // it will read this leftover body as the next response head.
+        thread::sleep(Duration::from_millis(200));
+        let _ = stream.write_all(b"5\r\nstale\r\n0\r\n\r\n");
+        let _ = stream.flush();
+        drop(stream);
+
+        // Second connection: the follow-up request after the cancel.
+        let (mut stream2, _) = listener.accept().unwrap();
+        read_request(&mut stream2);
+        stream2
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+        stream2.flush().unwrap();
+    });
+
+    let client = connect_async(port);
+
+    // Submit first request, read the head and first chunk, then cancel.
+    let mut handle = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    let chunk = handle.next_block().unwrap();
+    assert!(
+        matches!(chunk, Chunk::Head { status: 200, .. }),
+        "expected 200 head, got {chunk:?}"
+    );
+    assert_eq!(handle.next_block(), Some(Chunk::Body(b"first".to_vec())));
+    handle.cancel().unwrap(); // cancel mid-stream
+
+    // Submit second request. With the bug, this reads stale body bytes as a head.
+    let mut handle2 = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    let chunk = handle2.next_block().unwrap();
+    assert!(
+        matches!(chunk, Chunk::Head { status: 200, .. }),
+        "expected 200 head on second request, got {chunk:?}"
+    );
+    assert_eq!(
+        handle2.next_block(),
+        Some(Chunk::Body(b"fresh".to_vec())),
+        "second response body was corrupted by first response leftovers"
+    );
+    assert_eq!(handle2.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
+}
+
+#[test]
+fn async_drained_stream_is_reused() {
+    // Fully draining a streaming response must leave the connection clean
+    // and reusable, exactly like the synchronous path. Dropping the handle
+    // does not cancel.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+            .unwrap();
+        stream.flush().unwrap();
+
+        // Same connection must be reused.
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+            .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let client = connect_async(port);
+
+    let mut handle = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(handle.next_block(), Some(Chunk::Head { status: 200, .. })));
+    assert_eq!(handle.next_block(), Some(Chunk::Body(b"first".to_vec())));
+    assert_eq!(handle.next_block(), Some(Chunk::Eof));
+    drop(handle);
+
+    let mut handle2 = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(handle2.next_block(), Some(Chunk::Head { status: 200, .. })));
+    assert_eq!(handle2.next_block(), Some(Chunk::Body(b"second".to_vec())));
+    assert_eq!(handle2.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
 }
 
 // ── Original tests (updated API) ─────────────────────────────────────────────
