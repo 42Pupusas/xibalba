@@ -209,18 +209,16 @@ impl ChunkedDecoder {
             match self.state {
                 ChunkedState::ReadingSize
                 | ChunkedState::ReadingExtension
-                | ChunkedState::ReadingSizeLf => {
-                    match self.read_size_line(&input[in_pos..]) {
-                        Step::Advance(n) => in_pos += n,
-                        Step::Yield((result, consumed)) => return (result, in_pos + consumed),
-                        Step::EmitAndContinue(n) => {
-                            in_pos += n;
-                            if out_pos > 0 {
-                                return (DecodeResult::Data(out_pos), in_pos);
-                            }
+                | ChunkedState::ReadingSizeLf => match self.read_size_line(&input[in_pos..]) {
+                    Step::Advance(n) => in_pos += n,
+                    Step::Yield((result, consumed)) => return (result, in_pos + consumed),
+                    Step::EmitAndContinue(n) => {
+                        in_pos += n;
+                        if out_pos > 0 {
+                            return (DecodeResult::Data(out_pos), in_pos);
                         }
                     }
-                }
+                },
                 ChunkedState::ReadingData => {
                     match self.read_data(&input[in_pos..], &mut output[out_pos..]) {
                         DataStep::Copied(n) => {
@@ -271,7 +269,10 @@ impl ChunkedDecoder {
                         {
                             Some(v) => v,
                             None => {
-                                return Step::Yield((DecodeResult::Error(ParseError::InvalidChunkSize), i));
+                                return Step::Yield((
+                                    DecodeResult::Error(ParseError::InvalidChunkSize),
+                                    i,
+                                ));
                             }
                         };
                     } else if b == b'\r' {
@@ -492,7 +493,6 @@ impl HeaderRange {
             value_len: u16::try_from(value_len).map_err(overflow)?,
         })
     }
-
 }
 
 /// Single-pass header line parser.

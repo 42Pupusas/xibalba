@@ -597,8 +597,14 @@ mod tests {
 
     #[test]
     fn raw_vs_known_equality() {
-        assert_eq!(HeaderName::raw(b"content-length"), HeaderName::ContentLength);
-        assert_eq!(HeaderName::raw(b"CONTENT-LENGTH"), HeaderName::ContentLength);
+        assert_eq!(
+            HeaderName::raw(b"content-length"),
+            HeaderName::ContentLength
+        );
+        assert_eq!(
+            HeaderName::raw(b"CONTENT-LENGTH"),
+            HeaderName::ContentLength
+        );
         assert_eq!(HeaderName::raw(b"host"), HeaderName::Host);
     }
 
@@ -626,7 +632,7 @@ mod tests {
             assert!(is_tchar(b), "expected tchar: {}", b as char);
         }
         for &b in b" \t\r\n\"(),/:;<=>?@[\\]{}\x7f" {
-            assert!(!is_tchar(b), "unexpected tchar: {:02x}", b);
+            assert!(!is_tchar(b), "unexpected tchar: {b:02x}");
         }
     }
 

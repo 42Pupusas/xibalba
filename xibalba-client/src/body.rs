@@ -164,16 +164,12 @@ impl<S: Read> Read for StreamingBody<'_, S> {
 
         match self.state {
             StreamState::Done => Ok(0),
-            StreamState::Length { remaining } => {
-                self.read_content_length(buf, remaining)
-            }
+            StreamState::Length { remaining } => self.read_content_length(buf, remaining),
             StreamState::UntilClose => self.read_until_close(buf),
-            StreamState::Chunked { .. } => {
-                match self.read_chunked(buf)? {
-                    ChunkedRead::Progress(n) => Ok(n),
-                    ChunkedRead::NeedMore => Ok(0),
-                }
-            }
+            StreamState::Chunked { .. } => match self.read_chunked(buf)? {
+                ChunkedRead::Progress(n) => Ok(n),
+                ChunkedRead::NeedMore => Ok(0),
+            },
         }
     }
 }
@@ -431,7 +427,7 @@ pub(crate) fn read_body<S: Read>(
     tail: &[u8],
     max_body: usize,
 ) -> Result<Vec<u8>, Error> {
-    use xibalba_proto::response::{BodyFraming as ProtoFraming};
+    use xibalba_proto::response::BodyFraming as ProtoFraming;
 
     match *framing {
         ProtoFraming::None => Ok(Vec::new()),

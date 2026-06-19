@@ -215,11 +215,7 @@ impl AsyncClient {
     /// # Errors
     /// Returns `Error` if the connection cannot be established or
     /// the thread cannot be spawned.
-    pub fn connect<C>(
-        url: &[u8],
-        tls_config: C::TlsConfig,
-        config: Config,
-    ) -> Result<Self, Error>
+    pub fn connect<C>(url: &[u8], tls_config: C::TlsConfig, config: Config) -> Result<Self, Error>
     where
         C: crate::connector::Connector + Send + 'static,
         C::Stream: Send + 'static,
@@ -227,10 +223,8 @@ impl AsyncClient {
     {
         let client = Client::<C>::connect(url, tls_config, config)?;
 
-        let (control_tx, control_rx) = mpsc::RingBuffer::<Control>::new(
-            Capacity::at_least(CONTROL_RING_CAP),
-        )
-        .split();
+        let (control_tx, control_rx) =
+            mpsc::RingBuffer::<Control>::new(Capacity::at_least(CONTROL_RING_CAP)).split();
 
         let join = thread::Builder::new()
             .name("xibalba-reader".to_owned())

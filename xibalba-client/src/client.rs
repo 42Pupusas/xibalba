@@ -78,7 +78,7 @@ pub struct Response {
 }
 
 /// A response whose body is decoded incrementally from the live
-/// connection. Produced by [`RequestBuilder::send_streaming`].
+/// connection. Produced by [`Client::send_streaming`].
 ///
 /// Borrows the client mutably until dropped. Reading the body to
 /// completion leaves the connection reusable; dropping early marks it
@@ -127,8 +127,12 @@ pub(crate) struct RequestParams<'a> {
 
 // ── RequestBuilder ───────────────────────────────────────────────────────────
 
-pub struct RequestBuilder<'a, C: Connector> {
-    client: &'a mut Client<C>,
+/// Collects request parameters for deferred execution.
+///
+/// Created by [`Client::build`]; consumed by [`Client::send`] or
+/// [`Client::send_streaming`].  The builder borrows only the request
+/// data (path, headers, body), never the client.
+pub struct RequestBuilder<'a> {
     method: Method,
     path: &'a [u8],
     query: Option<&'a [u8]>,
@@ -136,7 +140,7 @@ pub struct RequestBuilder<'a, C: Connector> {
     extra_headers: Vec<(&'a [u8], &'a [u8])>,
 }
 
-impl<'a, C: Connector> RequestBuilder<'a, C> {
+impl<'a> RequestBuilder<'a> {
     #[must_use]
     pub fn header(mut self, name: &'a [u8], value: &'a [u8]) -> Self {
         self.extra_headers.push((name, value));
@@ -155,27 +159,17 @@ impl<'a, C: Connector> RequestBuilder<'a, C> {
         self
     }
 
-    /// # Errors
-    ///
-    /// Returns `Error` on serialization failure, connection error, or if
-    /// the redirect limit is exceeded.
-    pub fn send(self) -> Result<Response, Error> {
-        let (client, params) = self.into_params();
-        client.execute(&params)
-    }
-
-    /// Like [`send`](Self::send), but the response body is decoded
-    /// incrementally as it is read. See [`Client::execute_streaming`].
+    /// Execute this request on `client` and return the full response.
     ///
     /// # Errors
     ///
     /// Returns `Error` on serialization or connection failure.
-    pub fn send_streaming(self) -> Result<StreamingResponse<'a, C::Stream>, Error> {
-        let (client, params) = self.into_params();
-        client.execute_streaming(&params)
+    pub fn send<C: Connector>(self, client: &mut Client<C>) -> Result<Response, Error> {
+        client.execute(&self.into_params())
     }
 
-    fn into_params(self) -> (&'a mut Client<C>, RequestParams<'a>) {
+    /// Materialize the collected parameters into [`RequestParams`].
+    pub(crate) fn into_params(self) -> RequestParams<'a> {
         let extra_headers = self
             .extra_headers
             .iter()
@@ -184,14 +178,13 @@ impl<'a, C: Connector> RequestBuilder<'a, C> {
                 value: v,
             })
             .collect();
-        let params = RequestParams {
+        RequestParams {
             method: self.method,
             path: self.path,
             query: self.query,
             body: self.body,
             extra_headers,
-        };
-        (self.client, params)
+        }
     }
 }
 
@@ -249,11 +242,12 @@ impl<C: Connector> Client<C> {
         Self::connect(url_bytes, tls_config, Config::default())
     }
 
-    /// Start building a request. Chain `.header()`, `.body()`, `.query()`,
-    /// then call `.send()`.
-    pub const fn build<'a>(&'a mut self, method: Method, path: &'a [u8]) -> RequestBuilder<'a, C> {
+    /// Start building a request.  Chain `.header()`, `.body()`,
+    /// `.query()`, then call [`Client::send`] or
+    /// [`Client::send_streaming`].
+    #[must_use]
+    pub const fn build<'a>(&self, method: Method, path: &'a [u8]) -> RequestBuilder<'a> {
         RequestBuilder {
-            client: self,
             method,
             path,
             query: None,
@@ -262,9 +256,39 @@ impl<C: Connector> Client<C> {
         }
     }
 
+    /// Execute a fully-buffered request built with [`Client::build`].
+    /// Follows redirects up to `Config::max_redirects`.
+    ///
     /// # Errors
     ///
-    /// See [`RequestBuilder::send`].
+    /// Returns `Error` on connection failure, serialization error,
+    /// or too many redirects.
+    pub fn send(&mut self, builder: RequestBuilder<'_>) -> Result<Response, Error> {
+        let params = builder.into_params();
+        self.execute(&params)
+    }
+
+    /// Execute a streaming request built with [`Client::build`].
+    /// The response body is decoded incrementally as the caller reads
+    /// it. Redirects are NOT followed.
+    ///
+    /// Borrows the client mutably until the `StreamingResponse` is
+    /// dropped; see [`StreamingResponse`] for drop semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` on connection failure or serialization error.
+    pub fn send_streaming(
+        &mut self,
+        builder: RequestBuilder<'_>,
+    ) -> Result<StreamingResponse<'_, C::Stream>, Error> {
+        let params = builder.into_params();
+        self.execute_streaming(&params)
+    }
+
+    /// # Errors
+    ///
+    /// See [`send`](Self::send).
     pub fn request(
         &mut self,
         method: Method,
@@ -552,9 +576,8 @@ impl<C: Connector> Client<C> {
         if location.starts_with(b"http://") || location.starts_with(b"https://") {
             let url = Url::parse(location)?;
             let target_port = url.effective_port();
-            let same_origin = url.host == &self.host[..]
-                && target_port == self.port
-                && url.scheme == self.scheme;
+            let same_origin =
+                url.host == &self.host[..] && target_port == self.port && url.scheme == self.scheme;
             if !same_origin {
                 self.reconnect(&url)?;
             }

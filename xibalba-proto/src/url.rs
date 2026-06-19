@@ -16,7 +16,7 @@ impl<'a> Url<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Url` variants for malformed input.
+    /// Returns `Error::UrlParse` variants for malformed input.
     pub fn parse(input: &'a [u8]) -> Result<Self, Error> {
         if input.is_empty() {
             return Err(UrlError::Empty.into());
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn rejects_empty() {
-        assert_eq!(Url::parse(b"").unwrap_err(), Error::Url(UrlError::Empty));
+        assert_eq!(Url::parse(b"").unwrap_err(), Error::UrlParse(UrlError::Empty));
     }
 
     #[test]
@@ -279,7 +279,7 @@ mod tests {
     fn rejects_missing_host() {
         assert_eq!(
             Url::parse(b"http:///path").unwrap_err(),
-            Error::Url(UrlError::MissingHost)
+            Error::UrlParse(UrlError::MissingHost)
         );
     }
 
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn empty_port() {
         let err = Url::parse(b"http://host:/path").unwrap_err();
-        assert_eq!(err, Error::Url(UrlError::InvalidPort));
+        assert_eq!(err, Error::UrlParse(UrlError::InvalidPort));
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn scheme_only_no_host() {
         let err = Url::parse(b"http://").unwrap_err();
-        assert_eq!(err, Error::Url(UrlError::MissingHost));
+        assert_eq!(err, Error::UrlParse(UrlError::MissingHost));
     }
 
     #[test]

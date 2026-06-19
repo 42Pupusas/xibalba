@@ -112,9 +112,7 @@ fn async_cancel_mid_stream_then_next_request_is_clean() {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
         stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n",
-            )
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
             .unwrap();
         stream.flush().unwrap();
 
@@ -196,7 +194,10 @@ fn async_drained_stream_is_reused() {
     let mut handle = client
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
-    assert!(matches!(handle.next_block(), Some(Chunk::Head { status: 200, .. })));
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
     assert_eq!(handle.next_block(), Some(Chunk::Body(b"first".to_vec())));
     assert_eq!(handle.next_block(), Some(Chunk::Eof));
     drop(handle);
@@ -204,7 +205,10 @@ fn async_drained_stream_is_reused() {
     let mut handle2 = client
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
-    assert!(matches!(handle2.next_block(), Some(Chunk::Head { status: 200, .. })));
+    assert!(matches!(
+        handle2.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
     assert_eq!(handle2.next_block(), Some(Chunk::Body(b"second".to_vec())));
     assert_eq!(handle2.next_block(), Some(Chunk::Eof));
 
@@ -480,8 +484,7 @@ fn streaming_chunked_delivers_incrementally() {
     let mut client = connect(port);
     let start = std::time::Instant::now();
     let mut resp = client
-        .build(Method::Get, b"/")
-        .send_streaming()
+        .send_streaming(client.build(Method::Get, b"/"))
         .expect("streaming request failed");
 
     let mut buf = [0u8; 64];
@@ -493,9 +496,9 @@ fn streaming_chunked_delivers_incrementally() {
         "first chunk should arrive before the server's pause ends, took {first_elapsed:?}"
     );
 
-    let mut rest = Vec::new();
-    resp.body.read_to_end(&mut rest).unwrap();
-    assert_eq!(rest, b"second");
+    let mut remainder = Vec::new();
+    resp.body.read_to_end(&mut remainder).unwrap();
+    assert_eq!(remainder, b"second");
     assert!(resp.body.is_done());
     drop(resp);
 
@@ -530,8 +533,7 @@ fn streaming_dropped_midway_reconnects() {
 
     let mut client = connect(port);
     let mut resp = client
-        .build(Method::Get, b"/")
-        .send_streaming()
+        .send_streaming(client.build(Method::Get, b"/"))
         .expect("streaming request failed");
     let mut buf = [0u8; 5];
     resp.body.read_exact(&mut buf).unwrap();
@@ -550,7 +552,7 @@ fn streaming_content_length_body() {
     let (port, server) = one_shot_server(response);
     let mut client = connect(port);
 
-    let mut resp = client.build(Method::Get, b"/").send_streaming().unwrap();
+    let mut resp = client.send_streaming(client.build(Method::Get, b"/")).unwrap();
     let mut body = String::new();
     resp.body.read_to_string(&mut body).unwrap();
     assert_eq!(body, "hello world");
@@ -682,8 +684,7 @@ fn multiple_requests_same_connection() {
 fn very_large_header_value() {
     let big_value = "X".repeat(4096);
     let response_str = format!(
-        "HTTP/1.1 200 OK\r\nX-Big: {}\r\nContent-Length: 2\r\n\r\nok",
-        big_value
+        "HTTP/1.1 200 OK\r\nX-Big: {big_value}\r\nContent-Length: 2\r\n\r\nok"
     );
     let response_bytes: &'static [u8] = Box::leak(response_str.into_bytes().into_boxed_slice());
     let (port, server) = one_shot_server(response_bytes);
@@ -694,7 +695,7 @@ fn very_large_header_value() {
         .headers()
         .find(|(name, _)| *name == b"X-Big")
         .map(|(_, v)| v);
-    assert_eq!(big_hdr.map(|v| v.len()), Some(4096));
+    assert_eq!(big_hdr.map(<[u8]>::len), Some(4096));
     assert_eq!(resp.text().unwrap(), "ok");
     server.join().unwrap();
 }
@@ -1038,10 +1039,12 @@ fn builder_sends_custom_headers() {
     let mut client = connect(port);
 
     client
-        .build(Method::Get, b"/api")
-        .header(b"Authorization", b"Bearer tok123")
-        .header(b"Content-Type", b"application/json")
-        .send()
+        .send(
+            client
+                .build(Method::Get, b"/api")
+                .header(b"Authorization", b"Bearer tok123")
+                .header(b"Content-Type", b"application/json"),
+        )
         .unwrap();
 
     let req = server.join().unwrap();
@@ -1062,10 +1065,12 @@ fn builder_with_body_and_headers() {
     let mut client = connect(port);
 
     let resp = client
-        .build(Method::Put, b"/upload")
-        .header(b"Content-Type", b"text/plain")
-        .body(b"file contents")
-        .send()
+        .send(
+            client
+                .build(Method::Put, b"/upload")
+                .header(b"Content-Type", b"text/plain")
+                .body(b"file contents"),
+        )
         .unwrap();
 
     assert_eq!(resp.text().unwrap(), "file contents");
@@ -1077,7 +1082,7 @@ fn builder_no_hardcoded_user_agent() {
     let (port, server) = echo_request_server();
     let mut client = connect(port);
 
-    client.build(Method::Get, b"/check").send().unwrap();
+    client.send(client.build(Method::Get, b"/check")).unwrap();
 
     let req = server.join().unwrap();
     let req_str = String::from_utf8_lossy(&req);

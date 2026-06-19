@@ -13,7 +13,7 @@ pub struct TlsError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    Url(UrlError),
+    UrlParse(UrlError),
     Parse(ParseError),
     Serialize(SerializeError),
     Io(IoError),
@@ -114,7 +114,7 @@ impl fmt::Display for ConnectionError {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Url(e) => write!(f, "url error: {e}"),
+            Self::UrlParse(e) => write!(f, "url error: {e}"),
             Self::Parse(e) => write!(f, "parse error: {e}"),
             Self::Serialize(e) => write!(f, "serialize error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
@@ -165,7 +165,7 @@ impl fmt::Display for SerializeError {
 
 impl From<UrlError> for Error {
     fn from(e: UrlError) -> Self {
-        Self::Url(e)
+        Self::UrlParse(e)
     }
 }
 
@@ -218,7 +218,7 @@ impl std::error::Error for ConnectionError {}
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Url(e) => Some(e),
+            Self::UrlParse(e) => Some(e),
             Self::Parse(e) => Some(e),
             Self::Serialize(e) => Some(e),
             Self::Io(e) => Some(e),
@@ -258,15 +258,39 @@ mod tests {
     #[test]
     fn connection_error_display() {
         let cases = [
-            (ConnectionError::ConnectionClosed, "connection closed unexpectedly"),
-            (ConnectionError::ContentLengthOverflow, "content-length exceeds usize"),
-            (ConnectionError::InvalidUtf8Body, "response body is not valid UTF-8"),
-            (ConnectionError::HeaderRangeOverflow, "header offset/length overflows u16"),
-            (ConnectionError::HeaderNotInBuffer, "header name not in head buffer"),
-            (ConnectionError::BodyTooLarge, "response body exceeds size limit"),
-            (ConnectionError::HeadTooLarge, "response head exceeds size limit"),
+            (
+                ConnectionError::ConnectionClosed,
+                "connection closed unexpectedly",
+            ),
+            (
+                ConnectionError::ContentLengthOverflow,
+                "content-length exceeds usize",
+            ),
+            (
+                ConnectionError::InvalidUtf8Body,
+                "response body is not valid UTF-8",
+            ),
+            (
+                ConnectionError::HeaderRangeOverflow,
+                "header offset/length overflows u16",
+            ),
+            (
+                ConnectionError::HeaderNotInBuffer,
+                "header name not in head buffer",
+            ),
+            (
+                ConnectionError::BodyTooLarge,
+                "response body exceeds size limit",
+            ),
+            (
+                ConnectionError::HeadTooLarge,
+                "response head exceeds size limit",
+            ),
             (ConnectionError::TooManyRedirects, "too many redirects"),
-            (ConnectionError::ReaderGone, "background reader thread has exited"),
+            (
+                ConnectionError::ReaderGone,
+                "background reader thread has exited",
+            ),
             (ConnectionError::Other("custom".into()), "custom"),
         ];
         for (err, expected) in cases {
@@ -285,7 +309,10 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(display(err.clone()), expected);
         }
-        assert_eq!(display(UrlError::InvalidByte(7)), "invalid byte at offset 7");
+        assert_eq!(
+            display(UrlError::InvalidByte(7)),
+            "invalid byte at offset 7"
+        );
     }
 
     #[test]
@@ -298,10 +325,19 @@ mod tests {
             (ParseError::MissingColon, "missing colon in header line"),
             (ParseError::InvalidHeaderName, "invalid header name byte"),
             (ParseError::InvalidHeaderValue, "invalid header value byte"),
-            (ParseError::TooManyHeaders, "caller header buffer is too small"),
-            (ParseError::InvalidContentLength, "invalid Content-Length value"),
+            (
+                ParseError::TooManyHeaders,
+                "caller header buffer is too small",
+            ),
+            (
+                ParseError::InvalidContentLength,
+                "invalid Content-Length value",
+            ),
             (ParseError::InvalidChunkSize, "invalid chunk size"),
-            (ParseError::InvalidChunkTerminator, "invalid chunk terminator"),
+            (
+                ParseError::InvalidChunkTerminator,
+                "invalid chunk terminator",
+            ),
         ];
         for (err, expected) in cases {
             assert_eq!(display(err), expected);
@@ -310,15 +346,18 @@ mod tests {
 
     #[test]
     fn serialize_error_display() {
-        assert_eq!(display(SerializeError::BufferTooSmall), "output buffer too small");
+        assert_eq!(
+            display(SerializeError::BufferTooSmall),
+            "output buffer too small"
+        );
     }
 
     #[test]
     fn error_display_wraps_variants() {
         assert!(
-            display(Error::Url(UrlError::Empty)).contains("url error"),
+            display(Error::UrlParse(UrlError::Empty)).contains("url error"),
             "{}",
-            display(Error::Url(UrlError::Empty))
+            display(Error::UrlParse(UrlError::Empty))
         );
         assert!(
             display(Error::Parse(ParseError::Incomplete)).contains("parse error"),
@@ -361,7 +400,7 @@ mod tests {
 
     #[test]
     fn error_source_delegates_to_inner() {
-        let err = Error::Url(UrlError::Empty);
+        let err = Error::UrlParse(UrlError::Empty);
         assert!(StdError::source(&err).is_some());
 
         let err = Error::Parse(ParseError::Incomplete);

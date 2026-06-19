@@ -1,6 +1,6 @@
 use core::fmt;
 
-use crate::error::{Error, UrlError};
+use crate::error::UrlError;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Scheme {
@@ -53,7 +53,7 @@ impl fmt::Display for Scheme {
 }
 
 impl TryFrom<&[u8]> for Scheme {
-    type Error = Error;
+    type Error = UrlError;
 
     /// Case-insensitive match per RFC 3986.
     /// Uses the `| 0x20` bit trick to normalize ASCII alpha to lowercase.
@@ -74,7 +74,7 @@ impl TryFrom<&[u8]> for Scheme {
         {
             Ok(Self::Https)
         } else {
-            Err(UrlError::InvalidScheme.into())
+            Err(UrlError::InvalidScheme)
         }
     }
 }
