@@ -43,6 +43,7 @@
 //! wrap the `AsyncClient` in `Arc<Mutex<_>>` at a higher layer —
 //! but the in-tree design keeps it single-owner.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::thread::{self, JoinHandle};
 
@@ -331,28 +332,53 @@ fn run_reader<C>(mut client: Client<C>, mut control_rx: MpscConsumer<Control>)
 where
     C: crate::connector::Connector,
 {
-    while let Some(control) = control_rx.pop_block() {
-        match control {
-            Control::Request(request) => {
-                process_request(&mut client, request, &mut control_rx);
+    // Requests popped off the control ring while polling for a cancel
+    // (during the start-of-request drain or mid-stream) are stashed here
+    // rather than dropped, then processed in submission order.
+    let mut pending: VecDeque<AsyncRequest> = VecDeque::new();
+    loop {
+        if let Some(request) = pending.pop_front() {
+            process_request(&mut client, request, &mut control_rx, &mut pending);
+            continue;
+        }
+        match control_rx.pop_block() {
+            Some(Control::Request(request)) => {
+                process_request(&mut client, request, &mut control_rx, &mut pending);
             }
-            Control::Cancel => {
+            Some(Control::Cancel) => {
                 // No request in flight; cancel is a no-op.
             }
+            None => break,
         }
     }
 }
 
-/// Check whether a cancel message has arrived on the control channel.
-/// Returns `true` if the caller wants the current request aborted.
-fn cancel_pending(control_rx: &mut MpscConsumer<Control>) -> bool {
-    matches!(control_rx.pop(), Some(Control::Cancel))
+/// Poll the control channel without blocking, returning `true` if a
+/// `Cancel` was observed.
+///
+/// The control ring multiplexes cancels and new requests, and the
+/// consumer has no non-destructive peek — checking for a cancel must
+/// `pop`. Any `Request` popped while hunting for a cancel is moved into
+/// `pending` (processed later in order) instead of being discarded; that
+/// is what stops a request submitted mid-stream from vanishing.
+fn poll_control(
+    control_rx: &mut MpscConsumer<Control>,
+    pending: &mut VecDeque<AsyncRequest>,
+) -> bool {
+    loop {
+        match control_rx.pop() {
+            Some(Control::Cancel) => return true,
+            Some(Control::Request(request)) => pending.push_back(request),
+            None => return false,
+        }
+    }
 }
 
 fn process_request<C>(
     client: &mut Client<C>,
     request: AsyncRequest,
     control_rx: &mut MpscConsumer<Control>,
+    pending: &mut VecDeque<AsyncRequest>,
 ) where
     C: crate::connector::Connector,
 {
@@ -366,8 +392,9 @@ fn process_request<C>(
     }
 
     // Drain any stale cancel messages that may have accumulated while
-    // no request was in flight.
-    while cancel_pending(control_rx) {}
+    // no request was in flight, stashing any queued requests so they
+    // are not dropped.
+    while poll_control(control_rx, pending) {}
 
     let AsyncRequest {
         method,
@@ -392,13 +419,14 @@ fn process_request<C>(
     // Send the head. `send_head` handles the stale-keep-alive
     // reconnect internally (the read failure was before any
     // response byte reached the caller, so retry is safe).
-    let send_result = client.send_head(
+    let request_params = crate::client::RequestParams {
         method,
-        &path,
-        query.as_deref(),
-        body.as_deref(),
-        &header_refs,
-    );
+        path: &path,
+        query: query.as_deref(),
+        body: body.as_deref(),
+        extra_headers: header_refs,
+    };
+    let send_result = client.send_head(&request_params);
 
     let (head_data, framing, tail_offset) = match send_result {
         Ok(parts) => parts,
@@ -460,7 +488,7 @@ fn process_request<C>(
     // will reconnect from.
     let tail = client.head_buf[tail_offset..].to_vec();
     client.dirty = true;
-    let mut cancellable = CancellableStream::new(&mut client.stream, control_rx);
+    let mut cancellable = CancellableStream::new(&mut client.stream, control_rx, pending);
     let mut body = StreamingBody::new(&mut cancellable, &mut client.dirty, &framing, tail);
     let mut buf = vec![0u8; HEAD_BUF_SIZE];
     loop {
@@ -496,18 +524,27 @@ fn process_request<C>(
 pub struct CancellableStream<'a, S: Read> {
     inner: &'a mut S,
     control_rx: &'a mut MpscConsumer<Control>,
+    pending: &'a mut VecDeque<AsyncRequest>,
 }
 
 impl<'a, S: Read> CancellableStream<'a, S> {
-    const fn new(inner: &'a mut S, control_rx: &'a mut MpscConsumer<Control>) -> Self {
-        Self { inner, control_rx }
+    const fn new(
+        inner: &'a mut S,
+        control_rx: &'a mut MpscConsumer<Control>,
+        pending: &'a mut VecDeque<AsyncRequest>,
+    ) -> Self {
+        Self {
+            inner,
+            control_rx,
+            pending,
+        }
     }
 }
 
 impl<S: Read> Read for CancellableStream<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            if cancel_pending(self.control_rx) {
+            if poll_control(self.control_rx, self.pending) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "request cancelled",

@@ -1,4 +1,6 @@
 pub mod error;
+
+pub use method::Token;
 pub mod header;
 pub mod method;
 pub mod request;

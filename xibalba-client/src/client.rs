@@ -34,6 +34,39 @@ impl Default for Config {
     }
 }
 
+// ── Redirect state ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct RedirectState<'a> {
+    method: Method,
+    path: Vec<u8>,
+    query: Option<Vec<u8>>,
+    body: Option<Vec<u8>>,
+    extra_headers: &'a [Header<'a>],
+}
+
+impl<'a> RedirectState<'a> {
+    fn new(params: &'a RequestParams<'a>) -> Self {
+        Self {
+            method: params.method,
+            path: params.path.to_vec(),
+            query: params.query.map(<[u8]>::to_vec),
+            body: params.body.map(<[u8]>::to_vec),
+            extra_headers: params.extra_headers.as_slice(),
+        }
+    }
+
+    fn to_params(&self) -> RequestParams<'_> {
+        RequestParams {
+            method: self.method,
+            path: &self.path,
+            query: self.query.as_deref(),
+            body: self.body.as_deref(),
+            extra_headers: self.extra_headers.to_vec(),
+        }
+    }
+}
+
 // ── Response ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -81,6 +114,17 @@ impl Response {
     }
 }
 
+// ── Request params ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub(crate) struct RequestParams<'a> {
+    pub(crate) method: Method,
+    pub(crate) path: &'a [u8],
+    pub(crate) query: Option<&'a [u8]>,
+    pub(crate) body: Option<&'a [u8]>,
+    pub(crate) extra_headers: Vec<Header<'a>>,
+}
+
 // ── RequestBuilder ───────────────────────────────────────────────────────────
 
 pub struct RequestBuilder<'a, C: Connector> {
@@ -116,16 +160,8 @@ impl<'a, C: Connector> RequestBuilder<'a, C> {
     /// Returns `Error` on serialization failure, connection error, or if
     /// the redirect limit is exceeded.
     pub fn send(self) -> Result<Response, Error> {
-        let extra: Vec<Header<'_>> = self
-            .extra_headers
-            .iter()
-            .map(|(n, v)| Header {
-                name: HeaderName::from_bytes(n),
-                value: v,
-            })
-            .collect();
-        self.client
-            .execute(self.method, self.path, self.query, self.body, &extra)
+        let (client, params) = self.into_params();
+        client.execute(&params)
     }
 
     /// Like [`send`](Self::send), but the response body is decoded
@@ -135,7 +171,12 @@ impl<'a, C: Connector> RequestBuilder<'a, C> {
     ///
     /// Returns `Error` on serialization or connection failure.
     pub fn send_streaming(self) -> Result<StreamingResponse<'a, C::Stream>, Error> {
-        let extra: Vec<Header<'_>> = self
+        let (client, params) = self.into_params();
+        client.execute_streaming(&params)
+    }
+
+    fn into_params(self) -> (&'a mut Client<C>, RequestParams<'a>) {
+        let extra_headers = self
             .extra_headers
             .iter()
             .map(|(n, v)| Header {
@@ -143,8 +184,14 @@ impl<'a, C: Connector> RequestBuilder<'a, C> {
                 value: v,
             })
             .collect();
-        self.client
-            .execute_streaming(self.method, self.path, self.query, self.body, &extra)
+        let params = RequestParams {
+            method: self.method,
+            path: self.path,
+            query: self.query,
+            body: self.body,
+            extra_headers,
+        };
+        (self.client, params)
     }
 }
 
@@ -225,21 +272,28 @@ impl<C: Connector> Client<C> {
         query: Option<&[u8]>,
         body: Option<&[u8]>,
     ) -> Result<Response, Error> {
-        self.execute(method, path, query, body, &[])
+        let params = RequestParams {
+            method,
+            path,
+            query,
+            body,
+            extra_headers: Vec::new(),
+        };
+        self.execute(&params)
     }
 
     /// # Errors
     ///
     /// See [`request`](Self::request).
     pub fn get(&mut self, path: &[u8]) -> Result<Response, Error> {
-        self.execute(Method::Get, path, None, None, &[])
+        self.request(Method::Get, path, None, None)
     }
 
     /// # Errors
     ///
     /// See [`request`](Self::request).
     pub fn post(&mut self, path: &[u8], body: &[u8]) -> Result<Response, Error> {
-        self.execute(Method::Post, path, None, Some(body), &[])
+        self.request(Method::Post, path, None, Some(body))
     }
 
     // ── internals ────────────────────────────────────────────────────────────
@@ -339,17 +393,13 @@ impl<C: Connector> Client<C> {
     /// `RequestBuilder`.
     pub(crate) fn send_head(
         &mut self,
-        method: Method,
-        path: &[u8],
-        query: Option<&[u8]>,
-        body: Option<&[u8]>,
-        extra_headers: &[Header<'_>],
+        params: &RequestParams<'_>,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
-        match self.send_head_once(method, path, query, body, extra_headers) {
+        match self.send_head_once(params) {
             Ok(head) => Ok(head),
             Err(e) if Self::is_stale_connection(&e) => {
                 self.reconnect_same_host()?;
-                self.send_head_once(method, path, query, body, extra_headers)
+                self.send_head_once(params)
             }
             Err(e) => Err(e),
         }
@@ -360,23 +410,19 @@ impl<C: Connector> Client<C> {
     /// offset of the body's first byte within `self.head_buf`.
     pub(crate) fn send_head_once(
         &mut self,
-        method: Method,
-        path: &[u8],
-        query: Option<&[u8]>,
-        body: Option<&[u8]>,
-        extra_headers: &[Header<'_>],
+        params: &RequestParams<'_>,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
         let host_value = self.host_header_value();
         let content_len_str;
-        let mut headers = Vec::with_capacity(1 + extra_headers.len() + 1);
+        let mut headers = Vec::with_capacity(1 + params.extra_headers.len() + 1);
 
         headers.push(Header {
             name: HeaderName::Host,
             value: &host_value,
         });
-        headers.extend_from_slice(extra_headers);
+        headers.extend_from_slice(&params.extra_headers);
 
-        if let Some(data) = body {
+        if let Some(data) = params.body {
             content_len_str = data.len().to_string();
             headers.push(Header {
                 name: HeaderName::ContentLength,
@@ -385,9 +431,9 @@ impl<C: Connector> Client<C> {
         }
 
         let req = Request {
-            method,
-            path,
-            query,
+            method: params.method,
+            path: params.path,
+            query: params.query,
             version: Version::Http11,
             headers: &headers,
         };
@@ -395,7 +441,7 @@ impl<C: Connector> Client<C> {
         req.serialize_to_writer(&mut self.write_buf)?;
 
         self.stream.write_all(&self.write_buf)?;
-        if let Some(data) = body {
+        if let Some(data) = params.body {
             self.stream.write_all(data)?;
         }
         self.stream.flush()?;
@@ -409,16 +455,8 @@ impl<C: Connector> Client<C> {
         Ok((head_data, framing, tail_offset))
     }
 
-    fn send_one(
-        &mut self,
-        method: Method,
-        path: &[u8],
-        query: Option<&[u8]>,
-        body: Option<&[u8]>,
-        extra_headers: &[Header<'_>],
-    ) -> Result<Response, Error> {
-        let (head_data, framing, tail_offset) =
-            self.send_head(method, path, query, body, extra_headers)?;
+    fn send_one(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
+        let (head_data, framing, tail_offset) = self.send_head(params)?;
 
         let body_data = read_body(
             &mut self.stream,
@@ -447,17 +485,12 @@ impl<C: Connector> Client<C> {
     /// # Errors
     ///
     /// Returns `Error` on serialization or connection failure.
-    pub fn execute_streaming(
+    pub(crate) fn execute_streaming(
         &mut self,
-        method: Method,
-        path: &[u8],
-        query: Option<&[u8]>,
-        body: Option<&[u8]>,
-        extra_headers: &[Header<'_>],
+        params: &RequestParams<'_>,
     ) -> Result<StreamingResponse<'_, C::Stream>, Error> {
         self.ensure_clean()?;
-        let (head_data, framing, tail_offset) =
-            self.send_head(method, path, query, body, extra_headers)?;
+        let (head_data, framing, tail_offset) = self.send_head(params)?;
 
         let tail = self.head_buf[tail_offset..].to_vec();
         self.dirty = true;
@@ -471,29 +504,13 @@ impl<C: Connector> Client<C> {
         })
     }
 
-    fn execute(
-        &mut self,
-        method: Method,
-        path: &[u8],
-        query: Option<&[u8]>,
-        body: Option<&[u8]>,
-        extra_headers: &[Header<'_>],
-    ) -> Result<Response, Error> {
+    fn execute(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
         self.ensure_clean()?;
 
-        let mut current_method = method;
-        let mut current_path: Vec<u8> = path.to_vec();
-        let mut current_query: Option<Vec<u8>> = query.map(<[u8]>::to_vec);
-        let mut current_body = body.map(<[u8]>::to_vec);
+        let mut current = RedirectState::new(params);
 
         for _ in 0..=self.config.max_redirects {
-            let resp = self.send_one(
-                current_method,
-                &current_path,
-                current_query.as_deref(),
-                current_body.as_deref(),
-                extra_headers,
-            )?;
+            let resp = self.send_one(&current.to_params())?;
 
             if !resp.status.is_redirect() {
                 return Ok(resp);
@@ -509,46 +526,58 @@ impl<C: Connector> Client<C> {
                 None => return Ok(resp),
             };
 
-            match resp.status {
-                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND | StatusCode::SEE_OTHER => {
-                    current_method = Method::Get;
-                    current_body = None;
-                }
-                StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {}
-                _ => return Ok(resp),
+            if !Self::is_redirect_method_preserving(resp.status) {
+                current.method = Method::Get;
+                current.body = None;
             }
 
-            if location.starts_with(b"http://") || location.starts_with(b"https://") {
-                let url = Url::parse(&location)?;
-                let target_port = url.effective_port();
-                let same_origin = url.host == &self.host[..]
-                    && target_port == self.port
-                    && url.scheme == self.scheme;
-                if !same_origin {
-                    self.reconnect(&url)?;
-                }
-                current_path = if url.path.is_empty() {
-                    b"/".to_vec()
-                } else {
-                    url.path.to_vec()
-                };
-                current_query = url.query.map(<[u8]>::to_vec);
-            } else {
-                let (path_part, query_part) = location
-                    .iter()
-                    .position(|&b| b == b'?')
-                    .map_or((location.as_slice(), None), |pos| {
-                        (&location[..pos], Some(location[pos + 1..].to_vec()))
-                    });
-                current_path = if path_part.is_empty() {
-                    b"/".to_vec()
-                } else {
-                    path_part.to_vec()
-                };
-                current_query = query_part;
-            }
+            self.apply_redirect_location(&location, &mut current)?;
         }
 
         Err(ConnectionError::TooManyRedirects.into())
+    }
+
+    const fn is_redirect_method_preserving(status: StatusCode) -> bool {
+        matches!(
+            status,
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+        )
+    }
+
+    fn apply_redirect_location(
+        &mut self,
+        location: &[u8],
+        current: &mut RedirectState<'_>,
+    ) -> Result<(), Error> {
+        if location.starts_with(b"http://") || location.starts_with(b"https://") {
+            let url = Url::parse(location)?;
+            let target_port = url.effective_port();
+            let same_origin = url.host == &self.host[..]
+                && target_port == self.port
+                && url.scheme == self.scheme;
+            if !same_origin {
+                self.reconnect(&url)?;
+            }
+            current.path = normalize_path(url.path);
+            current.query = url.query.map(<[u8]>::to_vec);
+        } else {
+            let (path_part, query_part) = location
+                .iter()
+                .position(|&b| b == b'?')
+                .map_or((location, None), |pos| {
+                    (&location[..pos], Some(location[pos + 1..].to_vec()))
+                });
+            current.path = normalize_path(path_part);
+            current.query = query_part;
+        }
+        Ok(())
+    }
+}
+
+fn normalize_path(path: &[u8]) -> Vec<u8> {
+    if path.is_empty() {
+        b"/".to_vec()
+    } else {
+        path.to_vec()
     }
 }

@@ -211,6 +211,78 @@ fn async_drained_stream_is_reused() {
     server.join().unwrap();
 }
 
+#[test]
+fn async_request_queued_during_stream_is_not_dropped() {
+    // Regression test for the dropped-request bug. While a streaming
+    // response is being read, the reader polls the control ring for a
+    // cancel before every socket read. That poll used a destructive
+    // `pop()`, so a `Control::Request` submitted mid-stream sat at the
+    // head of the ring, got popped by the cancel check, and was silently
+    // discarded — the second request vanished and its handle never
+    // produced a head.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+
+        // Request 1: chunked. Send the first chunk, then stall so the
+        // client reads it and submits request 2 while the reader is
+        // parked in a socket read; then send the rest.
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(200));
+        stream.write_all(b"6\r\nsecond\r\n").unwrap();
+        stream.flush().unwrap();
+        stream.write_all(b"0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+
+        // Request 2 reuses the same keep-alive connection.
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let client = connect_async(port);
+
+    // Start streaming request 1 and read its head + first chunk.
+    let mut handle1 = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle1.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle1.next_block(), Some(Chunk::Body(b"first".to_vec())));
+
+    // Submit request 2 while request 1 is still streaming. The reader is
+    // parked in a socket read for request 1, so this Request lands on the
+    // control ring and is seen by the next cancel poll.
+    let mut handle2 = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+
+    // Drain the rest of request 1.
+    assert_eq!(handle1.next_block(), Some(Chunk::Body(b"second".to_vec())));
+    assert_eq!(handle1.next_block(), Some(Chunk::Eof));
+
+    // Request 2 must still be served, not silently dropped.
+    let chunk = handle2.next_block();
+    assert!(
+        matches!(chunk, Some(Chunk::Head { status: 200, .. })),
+        "second request was dropped mid-stream: expected 200 head, got {chunk:?}"
+    );
+    assert_eq!(handle2.next_block(), Some(Chunk::Body(b"hello".to_vec())));
+    assert_eq!(handle2.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
+}
+
 // ── Original tests (updated API) ─────────────────────────────────────────────
 
 #[test]

@@ -15,24 +15,20 @@ pub enum Method {
     Patch,
 }
 
+/// Types that can render themselves as a fixed byte slice and as a UTF-8 str.
+pub trait Token {
+    /// Fixed byte representation of this token.
+    #[allow(clippy::wrong_self_convention)]
+    fn as_bytes(self) -> &'static [u8];
+
+    /// UTF-8 representation of this token.
+    #[allow(clippy::wrong_self_convention)]
+    fn as_str(self) -> &'static str;
+}
+
 impl Method {
     #[must_use]
-    pub const fn as_bytes(self) -> &'static [u8] {
-        match self {
-            Self::Get => b"GET",
-            Self::Head => b"HEAD",
-            Self::Post => b"POST",
-            Self::Put => b"PUT",
-            Self::Delete => b"DELETE",
-            Self::Connect => b"CONNECT",
-            Self::Options => b"OPTIONS",
-            Self::Trace => b"TRACE",
-            Self::Patch => b"PATCH",
-        }
-    }
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    const fn token(self) -> &'static str {
         match self {
             Self::Get => "GET",
             Self::Head => "HEAD",
@@ -47,21 +43,31 @@ impl Method {
     }
 }
 
+impl Token for Method {
+    fn as_str(self) -> &'static str {
+        self.token()
+    }
+
+    fn as_bytes(self) -> &'static [u8] {
+        self.token().as_bytes()
+    }
+}
+
 impl AsRef<str> for Method {
     fn as_ref(&self) -> &str {
-        self.as_str()
+        Token::as_str(*self)
     }
 }
 
 impl AsRef<[u8]> for Method {
     fn as_ref(&self) -> &[u8] {
-        self.as_bytes()
+        Token::as_bytes(*self)
     }
 }
 
 impl fmt::Display for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(Token::as_str(*self))
     }
 }
 

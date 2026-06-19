@@ -227,3 +227,161 @@ impl std::error::Error for Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+
+    use super::*;
+
+    fn display<E: fmt::Display>(e: E) -> String {
+        e.to_string()
+    }
+
+    #[test]
+    fn io_error_display() {
+        let e = IoError {
+            kind: std::io::ErrorKind::NotFound,
+            message: "oops".into(),
+        };
+        assert_eq!(display(e), "oops: entity not found");
+    }
+
+    #[test]
+    fn tls_error_display() {
+        let e = TlsError {
+            message: "handshake failed".into(),
+        };
+        assert_eq!(display(e), "handshake failed");
+    }
+
+    #[test]
+    fn connection_error_display() {
+        let cases = [
+            (ConnectionError::ConnectionClosed, "connection closed unexpectedly"),
+            (ConnectionError::ContentLengthOverflow, "content-length exceeds usize"),
+            (ConnectionError::InvalidUtf8Body, "response body is not valid UTF-8"),
+            (ConnectionError::HeaderRangeOverflow, "header offset/length overflows u16"),
+            (ConnectionError::HeaderNotInBuffer, "header name not in head buffer"),
+            (ConnectionError::BodyTooLarge, "response body exceeds size limit"),
+            (ConnectionError::HeadTooLarge, "response head exceeds size limit"),
+            (ConnectionError::TooManyRedirects, "too many redirects"),
+            (ConnectionError::ReaderGone, "background reader thread has exited"),
+            (ConnectionError::Other("custom".into()), "custom"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(display(err), expected);
+        }
+    }
+
+    #[test]
+    fn url_error_display() {
+        let cases = [
+            (UrlError::Empty, "input is empty"),
+            (UrlError::InvalidScheme, "invalid or missing scheme"),
+            (UrlError::MissingHost, "missing host"),
+            (UrlError::InvalidPort, "invalid port number"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(display(err.clone()), expected);
+        }
+        assert_eq!(display(UrlError::InvalidByte(7)), "invalid byte at offset 7");
+    }
+
+    #[test]
+    fn parse_error_display() {
+        let cases = [
+            (ParseError::Incomplete, "incomplete input"),
+            (ParseError::InvalidVersion, "invalid HTTP version"),
+            (ParseError::InvalidStatusCode, "invalid status code"),
+            (ParseError::InvalidMethod, "invalid HTTP method"),
+            (ParseError::MissingColon, "missing colon in header line"),
+            (ParseError::InvalidHeaderName, "invalid header name byte"),
+            (ParseError::InvalidHeaderValue, "invalid header value byte"),
+            (ParseError::TooManyHeaders, "caller header buffer is too small"),
+            (ParseError::InvalidContentLength, "invalid Content-Length value"),
+            (ParseError::InvalidChunkSize, "invalid chunk size"),
+            (ParseError::InvalidChunkTerminator, "invalid chunk terminator"),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(display(err), expected);
+        }
+    }
+
+    #[test]
+    fn serialize_error_display() {
+        assert_eq!(display(SerializeError::BufferTooSmall), "output buffer too small");
+    }
+
+    #[test]
+    fn error_display_wraps_variants() {
+        assert!(
+            display(Error::Url(UrlError::Empty)).contains("url error"),
+            "{}",
+            display(Error::Url(UrlError::Empty))
+        );
+        assert!(
+            display(Error::Parse(ParseError::Incomplete)).contains("parse error"),
+            "{}",
+            display(Error::Parse(ParseError::Incomplete))
+        );
+        assert!(
+            display(Error::Serialize(SerializeError::BufferTooSmall)).contains("serialize error"),
+            "{}",
+            display(Error::Serialize(SerializeError::BufferTooSmall))
+        );
+        assert!(
+            display(Error::Io(IoError {
+                kind: std::io::ErrorKind::Other,
+                message: "x".into(),
+            }))
+            .contains("io error"),
+            "{}",
+            display(Error::Io(IoError {
+                kind: std::io::ErrorKind::Other,
+                message: "x".into(),
+            }))
+        );
+        assert!(
+            display(Error::Tls(TlsError {
+                message: "x".into(),
+            }))
+            .contains("tls error"),
+            "{}",
+            display(Error::Tls(TlsError {
+                message: "x".into(),
+            }))
+        );
+        assert!(
+            display(Error::Connection(ConnectionError::ReaderGone)).contains("connection error"),
+            "{}",
+            display(Error::Connection(ConnectionError::ReaderGone))
+        );
+    }
+
+    #[test]
+    fn error_source_delegates_to_inner() {
+        let err = Error::Url(UrlError::Empty);
+        assert!(StdError::source(&err).is_some());
+
+        let err = Error::Parse(ParseError::Incomplete);
+        assert!(StdError::source(&err).is_some());
+
+        let err = Error::Serialize(SerializeError::BufferTooSmall);
+        assert!(StdError::source(&err).is_some());
+
+        let err = Error::Io(IoError {
+            kind: std::io::ErrorKind::Other,
+            message: "x".into(),
+        });
+        assert!(StdError::source(&err).is_some());
+
+        let err = Error::Tls(TlsError {
+            message: "x".into(),
+        });
+        assert!(StdError::source(&err).is_some());
+
+        let err = Error::Connection(ConnectionError::ReaderGone);
+        assert!(StdError::source(&err).is_some());
+    }
+}

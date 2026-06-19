@@ -84,7 +84,7 @@ pub fn parse_response_head<'a>(
             return Err(ParseError::TooManyHeaders.into());
         }
         headers[count] = Header {
-            name: HeaderName::Raw(name_bytes),
+            name: HeaderName::raw(name_bytes),
             value,
         };
         count += 1;
@@ -201,143 +201,51 @@ impl ChunkedDecoder {
     /// Decode chunked data from `input` into `output`.
     ///
     /// Returns `(DecodeResult, bytes_consumed_from_input)`.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "HTTP chunked transfer decoder: one state machine with 5 states — splitting would scatter the transition logic"
-    )]
     pub fn decode(&mut self, input: &[u8], output: &mut [u8]) -> (DecodeResult, usize) {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
         while in_pos < input.len() {
-            let b = input[in_pos];
-
             match self.state {
-                ChunkedState::ReadingSize => {
-                    if let Some(digit) = hex_digit(b) {
-                        self.chunk_size = match self
-                            .chunk_size
-                            .checked_mul(16)
-                            .and_then(|v| v.checked_add(u64::from(digit)))
-                        {
-                            Some(v) => v,
-                            None => {
-                                return (DecodeResult::Error(ParseError::InvalidChunkSize), in_pos);
+                ChunkedState::ReadingSize
+                | ChunkedState::ReadingExtension
+                | ChunkedState::ReadingSizeLf => {
+                    match self.read_size_line(&input[in_pos..]) {
+                        Step::Advance(n) => in_pos += n,
+                        Step::Yield((result, consumed)) => return (result, in_pos + consumed),
+                        Step::EmitAndContinue(n) => {
+                            in_pos += n;
+                            if out_pos > 0 {
+                                return (DecodeResult::Data(out_pos), in_pos);
                             }
-                        };
-                        in_pos += 1;
-                    } else if b == b'\r' {
-                        self.remaining = self.chunk_size;
-                        self.state = ChunkedState::ReadingSizeLf;
-                        in_pos += 1;
-                    } else if b == b';' {
-                        self.state = ChunkedState::ReadingExtension;
-                        in_pos += 1;
-                    } else {
-                        return (DecodeResult::Error(ParseError::InvalidChunkSize), in_pos);
+                        }
                     }
                 }
-
-                ChunkedState::ReadingExtension => {
-                    if b == b'\r' {
-                        self.remaining = self.chunk_size;
-                        self.state = ChunkedState::ReadingSizeLf;
-                    }
-                    in_pos += 1;
-                }
-
-                ChunkedState::ReadingSizeLf => {
-                    if b != b'\n' {
-                        return (
-                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
-                            in_pos,
-                        );
-                    }
-                    in_pos += 1;
-                    if self.chunk_size == 0 {
-                        self.state = ChunkedState::ReadingTrailer;
-                        self.trailer_line_empty = true;
-                    } else {
-                        self.state = ChunkedState::ReadingData;
-                        if out_pos > 0 {
+                ChunkedState::ReadingData => {
+                    match self.read_data(&input[in_pos..], &mut output[out_pos..]) {
+                        DataStep::Copied(n) => {
+                            in_pos += n;
+                            out_pos += n;
+                        }
+                        DataStep::BufferFull => {
                             return (DecodeResult::Data(out_pos), in_pos);
                         }
                     }
                 }
-
-                ChunkedState::ReadingData => {
-                    let available_in = input.len() - in_pos;
-                    let available_out = output.len() - out_pos;
-                    let remaining_usize = usize::try_from(self.remaining).unwrap_or(usize::MAX);
-                    let to_copy = available_in.min(available_out).min(remaining_usize);
-
-                    if to_copy == 0 && available_out == 0 {
-                        return (DecodeResult::Data(out_pos), in_pos);
-                    }
-
-                    output[out_pos..out_pos + to_copy]
-                        .copy_from_slice(&input[in_pos..in_pos + to_copy]);
-                    in_pos += to_copy;
-                    out_pos += to_copy;
-                    self.remaining -= to_copy as u64;
-
-                    if self.remaining == 0 {
-                        self.state = ChunkedState::ReadingDataCr;
-                    }
-
-                    if out_pos == output.len() {
-                        return (DecodeResult::Data(out_pos), in_pos);
+                ChunkedState::ReadingDataCr | ChunkedState::ReadingDataLf => {
+                    match self.read_data_terminator(&input[in_pos..]) {
+                        Step::Advance(n) => in_pos += n,
+                        Step::Yield((result, consumed)) => return (result, in_pos + consumed),
+                        Step::EmitAndContinue(_) => unreachable!(),
                     }
                 }
-
-                ChunkedState::ReadingDataCr => {
-                    if b != b'\r' {
-                        return (
-                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
-                            in_pos,
-                        );
+                ChunkedState::ReadingTrailer | ChunkedState::ReadingTrailerLf => {
+                    match self.read_trailer(&input[in_pos..]) {
+                        Step::Advance(n) => in_pos += n,
+                        Step::Yield((result, consumed)) => return (result, in_pos + consumed),
+                        Step::EmitAndContinue(_) => unreachable!(),
                     }
-                    self.state = ChunkedState::ReadingDataLf;
-                    in_pos += 1;
                 }
-
-                ChunkedState::ReadingDataLf => {
-                    if b != b'\n' {
-                        return (
-                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
-                            in_pos,
-                        );
-                    }
-                    self.chunk_size = 0;
-                    self.state = ChunkedState::ReadingSize;
-                    in_pos += 1;
-                }
-
-                ChunkedState::ReadingTrailer => {
-                    if b == b'\r' {
-                        self.state = ChunkedState::ReadingTrailerLf;
-                    } else {
-                        self.trailer_line_empty = false;
-                    }
-                    in_pos += 1;
-                }
-
-                ChunkedState::ReadingTrailerLf => {
-                    if b != b'\n' {
-                        return (
-                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
-                            in_pos,
-                        );
-                    }
-                    in_pos += 1;
-                    if self.trailer_line_empty {
-                        self.state = ChunkedState::Done;
-                        break;
-                    }
-                    self.state = ChunkedState::ReadingTrailer;
-                    self.trailer_line_empty = true;
-                }
-
                 ChunkedState::Done => break,
             }
         }
@@ -350,6 +258,157 @@ impl ChunkedDecoder {
             (DecodeResult::NeedMore, in_pos)
         }
     }
+
+    fn read_size_line(&mut self, input: &[u8]) -> Step {
+        for (i, &b) in input.iter().enumerate() {
+            match self.state {
+                ChunkedState::ReadingSize => {
+                    if let Some(digit) = hex_digit(b) {
+                        self.chunk_size = match self
+                            .chunk_size
+                            .checked_mul(16)
+                            .and_then(|v| v.checked_add(u64::from(digit)))
+                        {
+                            Some(v) => v,
+                            None => {
+                                return Step::Yield((DecodeResult::Error(ParseError::InvalidChunkSize), i));
+                            }
+                        };
+                    } else if b == b'\r' {
+                        self.remaining = self.chunk_size;
+                        self.state = ChunkedState::ReadingSizeLf;
+                    } else if b == b';' {
+                        self.state = ChunkedState::ReadingExtension;
+                    } else {
+                        return Step::Yield((DecodeResult::Error(ParseError::InvalidChunkSize), i));
+                    }
+                }
+                ChunkedState::ReadingExtension => {
+                    if b == b'\r' {
+                        self.remaining = self.chunk_size;
+                        self.state = ChunkedState::ReadingSizeLf;
+                    }
+                }
+                ChunkedState::ReadingSizeLf => {
+                    if b != b'\n' {
+                        return Step::Yield((
+                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
+                            i,
+                        ));
+                    }
+                    if self.chunk_size == 0 {
+                        self.state = ChunkedState::ReadingTrailer;
+                        self.trailer_line_empty = true;
+                        // Hand control back to `decode`, which routes the
+                        // remaining bytes to `read_trailer`. Falling through
+                        // would re-enter this loop in `ReadingTrailer`, a
+                        // state this function does not handle.
+                        return Step::Advance(i + 1);
+                    }
+                    self.state = ChunkedState::ReadingData;
+                    return Step::EmitAndContinue(i + 1);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Step::Advance(input.len())
+    }
+
+    fn read_data(&mut self, input: &[u8], output: &mut [u8]) -> DataStep {
+        if output.is_empty() {
+            return DataStep::BufferFull;
+        }
+        let to_copy = input
+            .len()
+            .min(output.len())
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        if to_copy == 0 {
+            // Remaining is zero; next state should have been ReadingDataCr.
+            self.state = ChunkedState::ReadingDataCr;
+            return DataStep::Copied(0);
+        }
+        output[..to_copy].copy_from_slice(&input[..to_copy]);
+        self.remaining -= u64::try_from(to_copy).unwrap_or(u64::MAX);
+        if self.remaining == 0 {
+            self.state = ChunkedState::ReadingDataCr;
+        }
+        DataStep::Copied(to_copy)
+    }
+
+    fn read_data_terminator(&mut self, input: &[u8]) -> Step {
+        for (i, &b) in input.iter().enumerate() {
+            match self.state {
+                ChunkedState::ReadingDataCr => {
+                    if b != b'\r' {
+                        return Step::Yield((
+                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
+                            i,
+                        ));
+                    }
+                    self.state = ChunkedState::ReadingDataLf;
+                }
+                ChunkedState::ReadingDataLf => {
+                    if b != b'\n' {
+                        return Step::Yield((
+                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
+                            i,
+                        ));
+                    }
+                    self.chunk_size = 0;
+                    self.state = ChunkedState::ReadingSize;
+                    return Step::Advance(i + 1);
+                }
+                _ => unreachable!(),
+            }
+        }
+        Step::Advance(input.len())
+    }
+
+    fn read_trailer(&mut self, input: &[u8]) -> Step {
+        for (i, &b) in input.iter().enumerate() {
+            match self.state {
+                ChunkedState::ReadingTrailer => {
+                    if b == b'\r' {
+                        self.state = ChunkedState::ReadingTrailerLf;
+                    } else {
+                        self.trailer_line_empty = false;
+                    }
+                }
+                ChunkedState::ReadingTrailerLf => {
+                    if b != b'\n' {
+                        return Step::Yield((
+                            DecodeResult::Error(ParseError::InvalidChunkTerminator),
+                            i,
+                        ));
+                    }
+                    if self.trailer_line_empty {
+                        self.state = ChunkedState::Done;
+                        // Return control to `decode` instead of yielding
+                        // `Done` directly: data decoded earlier in the same
+                        // call must take precedence (`Data` before `Done`),
+                        // which `decode`'s final `out_pos > 0` check handles.
+                        // Yielding here would discard that pending data.
+                        return Step::Advance(i + 1);
+                    }
+                    self.state = ChunkedState::ReadingTrailer;
+                    self.trailer_line_empty = true;
+                }
+                _ => unreachable!(),
+            }
+        }
+        Step::Advance(input.len())
+    }
+}
+
+enum Step {
+    Advance(usize),
+    Yield((DecodeResult, usize)),
+    EmitAndContinue(usize),
+}
+
+enum DataStep {
+    Copied(usize),
+    BufferFull,
 }
 
 const fn hex_digit(b: u8) -> Option<u8> {
@@ -383,6 +442,15 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+fn offset_in_or_find(src: &[u8], src_base: usize, src_end: usize, part: &[u8]) -> Option<usize> {
+    let ptr = part.as_ptr().addr();
+    if (src_base..src_end).contains(&ptr) {
+        Some(ptr - src_base)
+    } else {
+        find_subsequence(src, part)
+    }
+}
+
 /// Compute byte-offset ranges for each parsed header against the raw `src` buffer.
 ///
 /// # Errors
@@ -394,29 +462,37 @@ pub fn build_ranges(
     headers: &[Header<'_>],
     src: &[u8],
 ) -> Result<[HeaderRange; MAX_HEADERS], Error> {
-    let src_base = src.as_ptr() as usize;
+    let src_base = src.as_ptr().addr();
     let src_end = src_base + src.len();
     let mut ranges = [HeaderRange::default(); MAX_HEADERS];
     for (i, h) in headers.iter().enumerate() {
         let name = h.name.as_bytes();
         let value = h.value;
-        let vs_off = value.as_ptr() as usize - src_base;
-        let name_ptr = name.as_ptr() as usize;
-        let ns_off = if name_ptr >= src_base && name_ptr < src_end {
-            name_ptr - src_base
-        } else {
-            find_subsequence(src, name)
-                .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?
-        };
-        let overflow = |_| Error::from(ConnectionError::HeaderRangeOverflow);
-        ranges[i] = HeaderRange {
-            name_start: u16::try_from(ns_off).map_err(overflow)?,
-            name_len: u16::try_from(name.len()).map_err(overflow)?,
-            value_start: u16::try_from(vs_off).map_err(overflow)?,
-            value_len: u16::try_from(value.len()).map_err(overflow)?,
-        };
+        let ns_off = offset_in_or_find(src, src_base, src_end, name)
+            .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?;
+        let vs_off = offset_in_or_find(src, src_base, src_end, value)
+            .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?;
+        ranges[i] = HeaderRange::from_parts(ns_off, name.len(), vs_off, value.len())?;
     }
     Ok(ranges)
+}
+
+impl HeaderRange {
+    fn from_parts(
+        name_start: usize,
+        name_len: usize,
+        value_start: usize,
+        value_len: usize,
+    ) -> Result<Self, Error> {
+        let overflow = |_| Error::from(ConnectionError::HeaderRangeOverflow);
+        Ok(Self {
+            name_start: u16::try_from(name_start).map_err(overflow)?,
+            name_len: u16::try_from(name_len).map_err(overflow)?,
+            value_start: u16::try_from(value_start).map_err(overflow)?,
+            value_len: u16::try_from(value_len).map_err(overflow)?,
+        })
+    }
+
 }
 
 /// Single-pass header line parser.
@@ -1068,5 +1144,54 @@ mod tests {
         let (result, _) = decoder.decode(input, &mut output);
         assert_eq!(result, DecodeResult::Done);
         assert!(decoder.is_done());
+    }
+
+    #[test]
+    fn build_ranges_matches_header_slices() {
+        let src = b"Content-Length: 42\r\nServer: test\r\n\r\n";
+        let headers = [
+            Header {
+                name: HeaderName::from_bytes(b"Content-Length"),
+                value: &src[16..18],
+            },
+            Header {
+                name: HeaderName::from_bytes(b"Server"),
+                value: &src[28..32],
+            },
+        ];
+        let ranges = build_ranges(&headers, src).unwrap();
+        assert_eq!(
+            &src[usize::from(ranges[0].name_start)
+                ..usize::from(ranges[0].name_start) + usize::from(ranges[0].name_len)],
+            b"Content-Length"
+        );
+        assert_eq!(
+            &src[usize::from(ranges[0].value_start)
+                ..usize::from(ranges[0].value_start) + usize::from(ranges[0].value_len)],
+            b"42"
+        );
+        assert_eq!(
+            &src[usize::from(ranges[1].name_start)
+                ..usize::from(ranges[1].name_start) + usize::from(ranges[1].name_len)],
+            b"Server"
+        );
+        assert_eq!(
+            &src[usize::from(ranges[1].value_start)
+                ..usize::from(ranges[1].value_start) + usize::from(ranges[1].value_len)],
+            b"test"
+        );
+    }
+
+    #[test]
+    fn build_ranges_overflow_fails() {
+        let oversized = usize::from(u16::MAX) + 1;
+        assert_eq!(
+            HeaderRange::from_parts(oversized, 1, 0, 0).unwrap_err(),
+            Error::Connection(ConnectionError::HeaderRangeOverflow)
+        );
+        assert_eq!(
+            HeaderRange::from_parts(0, oversized, 0, 0).unwrap_err(),
+            Error::Connection(ConnectionError::HeaderRangeOverflow)
+        );
     }
 }

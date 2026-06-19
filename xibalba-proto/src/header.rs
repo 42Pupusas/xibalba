@@ -103,8 +103,98 @@ pub(crate) const fn is_tchar(b: u8) -> bool {
     TCHAR_TABLE[b as usize] != 0
 }
 
-#[derive(Debug, Clone)]
-pub enum HeaderName<'a> {
+/// A parsed or constructed HTTP header name.
+///
+/// Internally either a well-known header (looked up case-insensitively) or
+/// an arbitrary byte slice. The public API preserves the original enum-like
+/// usage through associated constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HeaderName<'a> {
+    inner: HeaderNameInner<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HeaderNameInner<'a> {
+    Known(KnownHeader),
+    Unknown(&'a [u8]),
+    Raw(&'a [u8]),
+}
+
+impl HeaderName<'_> {
+    #[allow(non_upper_case_globals)]
+    pub const Host: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Host),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const ContentLength: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::ContentLength),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const ContentType: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::ContentType),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const TransferEncoding: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::TransferEncoding),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Connection: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Connection),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Accept: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Accept),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const UserAgent: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::UserAgent),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const AcceptEncoding: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::AcceptEncoding),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Location: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Location),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const CacheControl: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::CacheControl),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Date: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Date),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Server: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Server),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const ContentEncoding: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::ContentEncoding),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const SetCookie: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::SetCookie),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Cookie: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Cookie),
+    };
+    #[allow(non_upper_case_globals)]
+    pub const Authorization: HeaderName<'static> = HeaderName {
+        inner: HeaderNameInner::Known(KnownHeader::Authorization),
+    };
+}
+
+/// Internal lookup table for well-known header names.
+///
+/// Each entry carries its own canonical byte representation, so we can parse
+/// case-insensitively and render back to the canonical form without a giant
+/// literal match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(usize)]
+enum KnownHeader {
     Host,
     ContentLength,
     ContentType,
@@ -121,162 +211,95 @@ pub enum HeaderName<'a> {
     SetCookie,
     Cookie,
     Authorization,
-    /// A header name not in the well-known set.
-    Unknown(&'a [u8]),
-    /// Raw unparsed bytes from the wire — compared case-insensitively.
-    /// Used by the parser to defer classification until the name is actually needed.
-    Raw(&'a [u8]),
 }
 
-impl PartialEq for HeaderName<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            // Raw participates in case-insensitive comparison against canonical bytes.
-            (Self::Raw(a), Self::Raw(b)) => ascii_eq_ignore_case(a, b),
-            (Self::Raw(raw), known) | (known, Self::Raw(raw)) => {
-                ascii_eq_ignore_case(raw, known.as_bytes())
-            }
-            // Unknown is exact-bytes equality (caller controls casing).
-            (Self::Unknown(a), Self::Unknown(b)) => a == b,
-            // Two known variants are equal iff they are the same variant.
-            _ => self.as_bytes() == other.as_bytes(),
-        }
+const KNOWN_CANONICAL: [&[u8]; 16] = [
+    b"Host",
+    b"Content-Length",
+    b"Content-Type",
+    b"Transfer-Encoding",
+    b"Connection",
+    b"Accept",
+    b"User-Agent",
+    b"Accept-Encoding",
+    b"Location",
+    b"Cache-Control",
+    b"Date",
+    b"Server",
+    b"Content-Encoding",
+    b"Set-Cookie",
+    b"Cookie",
+    b"Authorization",
+];
+
+impl KnownHeader {
+    const fn canonical(self) -> &'static [u8] {
+        KNOWN_CANONICAL[self as usize]
     }
 }
 
-impl Eq for HeaderName<'_> {}
-
-impl core::hash::Hash for HeaderName<'_> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        // Hash the lowercased canonical bytes so Raw and known variants hash the same.
-        match self {
-            Self::Raw(b) | Self::Unknown(b) => {
-                for byte in *b {
-                    state.write_u8(byte.to_ascii_lowercase());
-                }
-            }
-            known => {
-                for byte in known.as_bytes() {
-                    state.write_u8(byte.to_ascii_lowercase());
-                }
-            }
-        }
-    }
-}
+const KNOWN_HEADERS: &[(KnownHeader, &[u8])] = &[
+    (KnownHeader::Host, b"host"),
+    (KnownHeader::ContentLength, b"content-length"),
+    (KnownHeader::ContentType, b"content-type"),
+    (KnownHeader::TransferEncoding, b"transfer-encoding"),
+    (KnownHeader::Connection, b"connection"),
+    (KnownHeader::Accept, b"accept"),
+    (KnownHeader::UserAgent, b"user-agent"),
+    (KnownHeader::AcceptEncoding, b"accept-encoding"),
+    (KnownHeader::Location, b"location"),
+    (KnownHeader::CacheControl, b"cache-control"),
+    (KnownHeader::Date, b"date"),
+    (KnownHeader::Server, b"server"),
+    (KnownHeader::ContentEncoding, b"content-encoding"),
+    (KnownHeader::SetCookie, b"set-cookie"),
+    (KnownHeader::Cookie, b"cookie"),
+    (KnownHeader::Authorization, b"authorization"),
+];
 
 impl<'a> HeaderName<'a> {
     /// Canonical wire-format name as bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Host => b"Host",
-            Self::ContentLength => b"Content-Length",
-            Self::ContentType => b"Content-Type",
-            Self::TransferEncoding => b"Transfer-Encoding",
-            Self::Connection => b"Connection",
-            Self::Accept => b"Accept",
-            Self::UserAgent => b"User-Agent",
-            Self::AcceptEncoding => b"Accept-Encoding",
-            Self::Location => b"Location",
-            Self::CacheControl => b"Cache-Control",
-            Self::Date => b"Date",
-            Self::Server => b"Server",
-            Self::ContentEncoding => b"Content-Encoding",
-            Self::SetCookie => b"Set-Cookie",
-            Self::Cookie => b"Cookie",
-            Self::Authorization => b"Authorization",
-            Self::Unknown(raw) | Self::Raw(raw) => raw,
+        match self.inner {
+            HeaderNameInner::Known(k) => k.canonical(),
+            HeaderNameInner::Unknown(raw) | HeaderNameInner::Raw(raw) => raw,
         }
     }
 
     /// Canonical wire-format name as str.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        match self {
-            Self::Host => "Host",
-            Self::ContentLength => "Content-Length",
-            Self::ContentType => "Content-Type",
-            Self::TransferEncoding => "Transfer-Encoding",
-            Self::Connection => "Connection",
-            Self::Accept => "Accept",
-            Self::UserAgent => "User-Agent",
-            Self::AcceptEncoding => "Accept-Encoding",
-            Self::Location => "Location",
-            Self::CacheControl => "Cache-Control",
-            Self::Date => "Date",
-            Self::Server => "Server",
-            Self::ContentEncoding => "Content-Encoding",
-            Self::SetCookie => "Set-Cookie",
-            Self::Cookie => "Cookie",
-            Self::Authorization => "Authorization",
-            Self::Unknown(raw) | Self::Raw(raw) => core::str::from_utf8(raw).unwrap_or("<invalid>"),
+        match self.inner {
+            HeaderNameInner::Known(k) => core::str::from_utf8(k.canonical()).unwrap_or("<invalid>"),
+            HeaderNameInner::Unknown(raw) | HeaderNameInner::Raw(raw) => {
+                core::str::from_utf8(raw).unwrap_or("<invalid>")
+            }
         }
     }
 
     /// Parse a header name from raw bytes, case-insensitively.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
-        match bytes.len() {
-            4 => {
-                if ascii_eq_ignore_case(bytes, b"Host") {
-                    return Self::Host;
-                }
-                if ascii_eq_ignore_case(bytes, b"Date") {
-                    return Self::Date;
-                }
-            }
-            6 => {
-                if ascii_eq_ignore_case(bytes, b"Accept") {
-                    return Self::Accept;
-                }
-                if ascii_eq_ignore_case(bytes, b"Cookie") {
-                    return Self::Cookie;
-                }
-                if ascii_eq_ignore_case(bytes, b"Server") {
-                    return Self::Server;
-                }
-            }
-            8 if ascii_eq_ignore_case(bytes, b"Location") => {
-                return Self::Location;
-            }
-            10 => {
-                if ascii_eq_ignore_case(bytes, b"User-Agent") {
-                    return Self::UserAgent;
-                }
-                if ascii_eq_ignore_case(bytes, b"Connection") {
-                    return Self::Connection;
-                }
-                if ascii_eq_ignore_case(bytes, b"Set-Cookie") {
-                    return Self::SetCookie;
-                }
-            }
-            12 if ascii_eq_ignore_case(bytes, b"Content-Type") => {
-                return Self::ContentType;
-            }
-            13 => {
-                if ascii_eq_ignore_case(bytes, b"Authorization") {
-                    return Self::Authorization;
-                }
-                if ascii_eq_ignore_case(bytes, b"Cache-Control") {
-                    return Self::CacheControl;
-                }
-            }
-            14 if ascii_eq_ignore_case(bytes, b"Content-Length") => {
-                return Self::ContentLength;
-            }
-            15 if ascii_eq_ignore_case(bytes, b"Accept-Encoding") => {
-                return Self::AcceptEncoding;
-            }
-            16 if ascii_eq_ignore_case(bytes, b"Content-Encoding") => {
-                return Self::ContentEncoding;
-            }
-            17 if ascii_eq_ignore_case(bytes, b"Transfer-Encoding") => {
-                return Self::TransferEncoding;
-            }
-            _ => {}
+        KNOWN_HEADERS
+            .iter()
+            .find(|(_, lower)| ascii_eq_ignore_case(bytes, lower))
+            .map_or_else(
+                || Self {
+                    inner: HeaderNameInner::Unknown(bytes),
+                },
+                |(known, _)| Self {
+                    inner: HeaderNameInner::Known(*known),
+                },
+            )
+    }
+
+    /// Wrap raw bytes from the wire; comparison is case-insensitive.
+    #[must_use]
+    pub const fn raw(bytes: &'a [u8]) -> Self {
+        Self {
+            inner: HeaderNameInner::Raw(bytes),
         }
-        Self::Unknown(bytes)
     }
 }
 
@@ -295,6 +318,39 @@ impl AsRef<[u8]> for HeaderName<'_> {
 impl fmt::Display for HeaderName<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq for HeaderNameInner<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Known variants are equal iff they are the same variant.
+            (Self::Known(a), Self::Known(b)) => a == b,
+            // Raw participates in case-insensitive comparison against canonical bytes.
+            (Self::Raw(a), Self::Raw(b)) => ascii_eq_ignore_case(a, b),
+            (Self::Raw(raw), Self::Known(k)) | (Self::Known(k), Self::Raw(raw)) => {
+                ascii_eq_ignore_case(raw, k.canonical())
+            }
+            // Unknown is exact-bytes equality (caller controls casing).
+            (Self::Unknown(a), Self::Unknown(b)) => a == b,
+            (Self::Unknown(_), Self::Known(_) | Self::Raw(_))
+            | (Self::Known(_) | Self::Raw(_), Self::Unknown(_)) => false,
+        }
+    }
+}
+
+impl Eq for HeaderNameInner<'_> {}
+
+impl core::hash::Hash for HeaderNameInner<'_> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        // Hash the lowercased canonical bytes so Raw and known variants hash the same.
+        let bytes = match self {
+            Self::Known(k) => k.canonical(),
+            Self::Unknown(b) | Self::Raw(b) => b,
+        };
+        for byte in bytes {
+            state.write_u8(byte.to_ascii_lowercase());
+        }
     }
 }
 
@@ -474,8 +530,8 @@ mod tests {
     #[test]
     fn header_name_unknown_preserved() {
         let name = HeaderName::from_bytes(b"X-Custom");
-        assert_eq!(name, HeaderName::Unknown(b"X-Custom"));
         assert_eq!(name.as_bytes(), b"X-Custom");
+        assert_eq!(name, HeaderName::from_bytes(b"X-Custom"));
     }
 
     // ── Adversarial tests ────────────────────────────────────────────────────
@@ -533,7 +589,7 @@ mod tests {
     fn header_name_length_collision() {
         assert_eq!(
             HeaderName::from_bytes(b"Vary"),
-            HeaderName::Unknown(b"Vary")
+            HeaderName::from_bytes(b"Vary")
         );
         assert_eq!(HeaderName::from_bytes(b"Host"), HeaderName::Host);
         assert_eq!(HeaderName::from_bytes(b"Date"), HeaderName::Date);
@@ -541,32 +597,26 @@ mod tests {
 
     #[test]
     fn raw_vs_known_equality() {
-        assert_eq!(
-            HeaderName::Raw(b"content-length"),
-            HeaderName::ContentLength
-        );
-        assert_eq!(
-            HeaderName::Raw(b"CONTENT-LENGTH"),
-            HeaderName::ContentLength
-        );
-        assert_eq!(HeaderName::Raw(b"host"), HeaderName::Host);
+        assert_eq!(HeaderName::raw(b"content-length"), HeaderName::ContentLength);
+        assert_eq!(HeaderName::raw(b"CONTENT-LENGTH"), HeaderName::ContentLength);
+        assert_eq!(HeaderName::raw(b"host"), HeaderName::Host);
     }
 
     #[test]
     fn raw_vs_raw_case_insensitive() {
-        assert_eq!(HeaderName::Raw(b"FOO"), HeaderName::Raw(b"foo"));
-        assert_ne!(HeaderName::Raw(b"FOO"), HeaderName::Raw(b"BAR"));
+        assert_eq!(HeaderName::raw(b"FOO"), HeaderName::raw(b"foo"));
+        assert_ne!(HeaderName::raw(b"FOO"), HeaderName::raw(b"BAR"));
     }
 
     #[test]
     fn unknown_vs_unknown_exact_match() {
         assert_eq!(
-            HeaderName::Unknown(b"X-Custom"),
-            HeaderName::Unknown(b"X-Custom")
+            HeaderName::from_bytes(b"X-Custom"),
+            HeaderName::from_bytes(b"X-Custom")
         );
         assert_ne!(
-            HeaderName::Unknown(b"X-Custom"),
-            HeaderName::Unknown(b"x-custom")
+            HeaderName::from_bytes(b"X-Custom"),
+            HeaderName::from_bytes(b"x-custom")
         );
     }
 
@@ -584,5 +634,51 @@ mod tests {
     fn contains_token_partial_match_not_accepted() {
         assert!(!contains_token_ignore_case(b"chunked", b"chunk"));
         assert!(!contains_token_ignore_case(b"chunk", b"chunked"));
+    }
+
+    #[test]
+    fn known_header_name_as_str() {
+        assert_eq!(HeaderName::Host.as_str(), "Host");
+        assert_eq!(HeaderName::ContentLength.as_str(), "Content-Length");
+        assert_eq!(HeaderName::TransferEncoding.as_str(), "Transfer-Encoding");
+        assert_eq!(HeaderName::Authorization.as_str(), "Authorization");
+    }
+
+    #[test]
+    fn unknown_header_name_as_str_preserved() {
+        assert_eq!(HeaderName::from_bytes(b"X-Custom").as_str(), "X-Custom");
+    }
+
+    #[test]
+    fn raw_header_name_as_bytes_case_preserved() {
+        assert_eq!(HeaderName::raw(b"x-raw").as_bytes(), b"x-raw");
+    }
+
+    #[test]
+    fn header_name_hash_known_equals_raw() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash(name: &HeaderName<'_>) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        assert_eq!(hash(&HeaderName::Host), hash(&HeaderName::raw(b"host")));
+        assert_eq!(
+            hash(&HeaderName::ContentLength),
+            hash(&HeaderName::raw(b"content-length"))
+        );
+        assert_eq!(
+            hash(&HeaderName::from_bytes(b"x-custom")),
+            hash(&HeaderName::raw(b"x-custom"))
+        );
+    }
+
+    #[test]
+    fn display_uses_canonical_name() {
+        assert_eq!(HeaderName::UserAgent.to_string(), "User-Agent");
+        assert_eq!(HeaderName::from_bytes(b"X-Thing").to_string(), "X-Thing");
     }
 }

@@ -61,7 +61,7 @@ const fn large_headers() -> [Header<'static>; 10] {
             value: b"close",
         },
         Header {
-            name: HeaderName::Unknown(b"X-Request-Id"),
+            name: HeaderName::raw(b"X-Request-Id"),
             value: b"550e8400-e29b-41d4",
         },
     ]
@@ -253,7 +253,7 @@ mod compare {
                 value: b"close",
             },
             Header {
-                name: HeaderName::Unknown(b"X-Request-Id"),
+                name: HeaderName::raw(b"X-Request-Id"),
                 value: b"550e8400-e29b-41d4",
             },
         ];

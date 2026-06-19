@@ -1,6 +1,6 @@
 use crate::error::{Error, SerializeError};
 use crate::header::Header;
-use crate::method::Method;
+use crate::method::{Method, Token};
 use crate::version::Version;
 
 /// A request to be serialized. All data is borrowed.
