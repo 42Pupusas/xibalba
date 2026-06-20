@@ -377,7 +377,7 @@ pub(crate) fn read_response_head<S: Read>(
     max_head: usize,
 ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
     use xibalba_proto::header::Header;
-    use xibalba_proto::response::{build_ranges, determine_body_framing, parse_response_head};
+    use xibalba_proto::response::{BodyFraming, HeaderRange, ResponseHead};
 
     head_acc.clear();
     let mut raw = [0u8; HEAD_BUF_SIZE];
@@ -397,10 +397,10 @@ pub(crate) fn read_response_head<S: Read>(
     };
 
     let mut hdr_buf = [const { Header::empty() }; MAX_HEADERS];
-    let (head, consumed) = parse_response_head(&head_acc[..head_end], &mut hdr_buf)?;
+    let (head, consumed) = ResponseHead::parse(&head_acc[..head_end], &mut hdr_buf)?;
 
     let copy_len = head_end.min(HEAD_BUF_SIZE);
-    let ranges = build_ranges(&hdr_buf[..head.header_count], &head_acc[..copy_len])?;
+    let ranges = HeaderRange::build_ranges(&hdr_buf[..head.header_count], &head_acc[..copy_len])?;
     let mut head_data = HeadData {
         version: head.version,
         status: head.status,
@@ -411,7 +411,7 @@ pub(crate) fn read_response_head<S: Read>(
     };
     head_data.head_buf[..copy_len].copy_from_slice(&head_acc[..copy_len]);
 
-    let framing = determine_body_framing(
+    let framing = BodyFraming::from_response(
         head.status,
         false,
         &hdr_buf[..head.header_count],

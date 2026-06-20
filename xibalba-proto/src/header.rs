@@ -1,65 +1,7 @@
 use core::fmt;
 
+use crate::bytes::ByteSliceExt;
 use crate::error::ParseError;
-
-/// Compare two byte slices for ASCII-case-insensitive equality.
-#[inline]
-#[must_use]
-pub fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).all(|(&x, &y)| {
-        if x == y {
-            return true;
-        }
-        let xl = x | 0x20;
-        let yl = y | 0x20;
-        xl == yl && xl.is_ascii_lowercase()
-    })
-}
-
-/// Trim optional whitespace (SP, HTAB) from both ends of a byte slice.
-#[must_use]
-pub fn trim_ows(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|&b| b != b' ' && b != b'\t')
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|&b| b != b' ' && b != b'\t')
-        .map_or(start, |p| p + 1);
-    &bytes[start..end]
-}
-
-/// Parse a `u64` from ASCII digit bytes without going through str.
-/// Skips leading/trailing OWS.
-#[must_use]
-pub fn parse_u64_from_bytes(bytes: &[u8]) -> Option<u64> {
-    let bytes = trim_ows(bytes);
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut result: u64 = 0;
-    for &b in bytes {
-        let digit = b.wrapping_sub(b'0');
-        if digit > 9 {
-            return None;
-        }
-        result = result.checked_mul(10)?.checked_add(u64::from(digit))?;
-    }
-    Some(result)
-}
-
-/// Check if a comma-separated header value contains a token (case-insensitive).
-#[must_use]
-pub fn contains_token_ignore_case(value: &[u8], token: &[u8]) -> bool {
-    value.split(|&b| b == b',').any(|part| {
-        let trimmed = trim_ows(part);
-        ascii_eq_ignore_case(trimmed, token)
-    })
-}
 
 /// RFC 7230 token character validation.
 ///
@@ -99,8 +41,13 @@ const TCHAR_TABLE: [u8; 256] = {
     table
 };
 
-pub(crate) const fn is_tchar(b: u8) -> bool {
-    TCHAR_TABLE[b as usize] != 0
+/// RFC 7230 token character validation.
+pub(crate) struct Tchar;
+
+impl Tchar {
+    pub(crate) const fn is_valid(b: u8) -> bool {
+        TCHAR_TABLE[b as usize] != 0
+    }
 }
 
 /// A parsed or constructed HTTP header name.
@@ -283,7 +230,7 @@ impl<'a> HeaderName<'a> {
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
         KNOWN_HEADERS
             .iter()
-            .find(|(_, lower)| ascii_eq_ignore_case(bytes, lower))
+            .find(|(_, lower)| bytes.ascii_eq_ignore_case(lower))
             .map_or_else(
                 || Self {
                     inner: HeaderNameInner::Unknown(bytes),
@@ -327,9 +274,9 @@ impl PartialEq for HeaderNameInner<'_> {
             // Known variants are equal iff they are the same variant.
             (Self::Known(a), Self::Known(b)) => a == b,
             // Raw participates in case-insensitive comparison against canonical bytes.
-            (Self::Raw(a), Self::Raw(b)) => ascii_eq_ignore_case(a, b),
+            (Self::Raw(a), Self::Raw(b)) => a.ascii_eq_ignore_case(b),
             (Self::Raw(raw), Self::Known(k)) | (Self::Known(k), Self::Raw(raw)) => {
-                ascii_eq_ignore_case(raw, k.canonical())
+                raw.ascii_eq_ignore_case(k.canonical())
             }
             // Unknown is exact-bytes equality (caller controls casing).
             (Self::Unknown(a), Self::Unknown(b)) => a == b,
@@ -416,14 +363,14 @@ impl<'buf, 'data> Headers<'buf, 'data> {
     #[must_use]
     pub fn content_length(&self) -> Option<Result<u64, ParseError>> {
         self.get(&HeaderName::ContentLength)
-            .map(|val| parse_u64_from_bytes(val).ok_or(ParseError::InvalidContentLength))
+            .map(|val| val.parse_u64().ok_or(ParseError::InvalidContentLength))
     }
 
     /// Check if `Transfer-Encoding` includes "chunked" (case-insensitive).
     #[must_use]
     pub fn is_chunked(&self) -> bool {
         self.get(&HeaderName::TransferEncoding)
-            .is_some_and(|val| contains_token_ignore_case(val, b"chunked"))
+            .is_some_and(|val| val.contains_token_ignore_case(b"chunked"))
     }
 }
 
@@ -433,76 +380,76 @@ mod tests {
 
     #[test]
     fn ascii_eq_exact_match() {
-        assert!(ascii_eq_ignore_case(b"hello", b"hello"));
+        assert!(b"hello".ascii_eq_ignore_case(b"hello"));
     }
 
     #[test]
     fn ascii_eq_case_insensitive() {
-        assert!(ascii_eq_ignore_case(b"Host", b"host"));
-        assert!(ascii_eq_ignore_case(b"HOST", b"host"));
-        assert!(ascii_eq_ignore_case(b"Content-Length", b"content-length"));
+        assert!(b"Host".ascii_eq_ignore_case(b"host"));
+        assert!(b"HOST".ascii_eq_ignore_case(b"host"));
+        assert!(b"Content-Length".ascii_eq_ignore_case(b"content-length"));
     }
 
     #[test]
     fn ascii_eq_different_lengths() {
-        assert!(!ascii_eq_ignore_case(b"Host", b"Hosts"));
+        assert!(!b"Host".ascii_eq_ignore_case(b"Hosts"));
     }
 
     #[test]
     fn ascii_eq_non_alpha_no_alias() {
-        assert!(!ascii_eq_ignore_case(b"@", b"`"));
+        assert!(!b"@".ascii_eq_ignore_case(b"`"));
     }
 
     #[test]
     fn trim_ows_both_ends() {
-        assert_eq!(trim_ows(b"  hello  "), b"hello");
-        assert_eq!(trim_ows(b"\thello\t"), b"hello");
-        assert_eq!(trim_ows(b"hello"), b"hello");
-        assert_eq!(trim_ows(b""), b"");
-        assert_eq!(trim_ows(b"   "), b"");
+        assert_eq!(b"  hello  ".trim_ows(), b"hello");
+        assert_eq!(b"\thello\t".trim_ows(), b"hello");
+        assert_eq!(b"hello".trim_ows(), b"hello");
+        assert_eq!(b"".trim_ows(), b"");
+        assert_eq!(b"   ".trim_ows(), b"");
     }
 
     #[test]
     fn parse_u64_valid() {
-        assert_eq!(parse_u64_from_bytes(b"0"), Some(0));
-        assert_eq!(parse_u64_from_bytes(b"12345"), Some(12345));
-        assert_eq!(parse_u64_from_bytes(b" 42 "), Some(42));
+        assert_eq!(b"0".parse_u64(), Some(0));
+        assert_eq!(b"12345".parse_u64(), Some(12345));
+        assert_eq!(b" 42 ".parse_u64(), Some(42));
     }
 
     #[test]
     fn parse_u64_invalid() {
-        assert_eq!(parse_u64_from_bytes(b""), None);
-        assert_eq!(parse_u64_from_bytes(b"abc"), None);
-        assert_eq!(parse_u64_from_bytes(b"12x"), None);
+        assert_eq!(b"".parse_u64(), None);
+        assert_eq!(b"abc".parse_u64(), None);
+        assert_eq!(b"12x".parse_u64(), None);
     }
 
     #[test]
     fn contains_token_single() {
-        assert!(contains_token_ignore_case(b"chunked", b"chunked"));
-        assert!(contains_token_ignore_case(b"Chunked", b"chunked"));
+        assert!(b"chunked".contains_token_ignore_case(b"chunked"));
+        assert!(b"Chunked".contains_token_ignore_case(b"chunked"));
     }
 
     #[test]
     fn contains_token_in_list() {
-        assert!(contains_token_ignore_case(b"gzip, chunked", b"chunked"));
-        assert!(contains_token_ignore_case(b"gzip , Chunked ", b"chunked"));
+        assert!(b"gzip, chunked".contains_token_ignore_case(b"chunked"));
+        assert!(b"gzip , Chunked ".contains_token_ignore_case(b"chunked"));
     }
 
     #[test]
     fn contains_token_missing() {
-        assert!(!contains_token_ignore_case(b"gzip, deflate", b"chunked"));
+        assert!(!b"gzip, deflate".contains_token_ignore_case(b"chunked"));
     }
 
     #[test]
     fn tchar_validation() {
-        assert!(is_tchar(b'a'));
-        assert!(is_tchar(b'Z'));
-        assert!(is_tchar(b'0'));
-        assert!(is_tchar(b'-'));
-        assert!(is_tchar(b'!'));
-        assert!(!is_tchar(b' '));
-        assert!(!is_tchar(b':'));
-        assert!(!is_tchar(b'\0'));
+        assert!(Tchar::is_valid(b'a'));
+        assert!(Tchar::is_valid(b'Z'));
+        assert!(Tchar::is_valid(b'0'));
+        assert!(Tchar::is_valid(b'-'));
+        assert!(Tchar::is_valid(b'!'));
+        assert!(!Tchar::is_valid(b' '));
+        assert!(!Tchar::is_valid(b':'));
+        assert!(!Tchar::is_valid(b'\0'));
     }
 
     #[test]
@@ -538,51 +485,48 @@ mod tests {
 
     #[test]
     fn ascii_eq_digits_not_case_folded() {
-        assert!(ascii_eq_ignore_case(b"Content-1", b"content-1"));
-        assert!(!ascii_eq_ignore_case(b"Content-1", b"content-2"));
+        assert!(b"Content-1".ascii_eq_ignore_case(b"content-1"));
+        assert!(!b"Content-1".ascii_eq_ignore_case(b"content-2"));
     }
 
     #[test]
     fn ascii_eq_hyphens_not_case_folded() {
-        assert!(ascii_eq_ignore_case(b"X-My-Header", b"x-my-header"));
+        assert!(b"X-My-Header".ascii_eq_ignore_case(b"x-my-header"));
     }
 
     #[test]
     fn parse_u64_overflow() {
-        assert_eq!(parse_u64_from_bytes(b"99999999999999999999"), None);
+        assert_eq!(b"99999999999999999999".parse_u64(), None);
     }
 
     #[test]
     fn parse_u64_leading_zeros() {
-        assert_eq!(parse_u64_from_bytes(b"007"), Some(7));
+        assert_eq!(b"007".parse_u64(), Some(7));
     }
 
     #[test]
     fn parse_u64_max() {
-        assert_eq!(
-            parse_u64_from_bytes(b"18446744073709551615"),
-            Some(u64::MAX)
-        );
+        assert_eq!(b"18446744073709551615".parse_u64(), Some(u64::MAX));
     }
 
     #[test]
     fn parse_u64_just_past_max() {
-        assert_eq!(parse_u64_from_bytes(b"18446744073709551616"), None);
+        assert_eq!(b"18446744073709551616".parse_u64(), None);
     }
 
     #[test]
     fn parse_u64_only_whitespace() {
-        assert_eq!(parse_u64_from_bytes(b"   "), None);
+        assert_eq!(b"   ".parse_u64(), None);
     }
 
     #[test]
     fn contains_token_empty_value() {
-        assert!(!contains_token_ignore_case(b"", b"chunked"));
+        assert!(!b"".contains_token_ignore_case(b"chunked"));
     }
 
     #[test]
     fn contains_token_whitespace_only_commas() {
-        assert!(!contains_token_ignore_case(b"  ,  ,  ", b"chunked"));
+        assert!(!b"  ,  ,  ".contains_token_ignore_case(b"chunked"));
     }
 
     #[test]
@@ -629,17 +573,17 @@ mod tests {
     #[test]
     fn tchar_boundary_exhaustive() {
         for &b in b"!#$%&'*+-.^_`|~" {
-            assert!(is_tchar(b), "expected tchar: {}", b as char);
+            assert!(Tchar::is_valid(b), "expected tchar: {}", b as char);
         }
         for &b in b" \t\r\n\"(),/:;<=>?@[\\]{}\x7f" {
-            assert!(!is_tchar(b), "unexpected tchar: {b:02x}");
+            assert!(!Tchar::is_valid(b), "unexpected tchar: {b:02x}");
         }
     }
 
     #[test]
     fn contains_token_partial_match_not_accepted() {
-        assert!(!contains_token_ignore_case(b"chunked", b"chunk"));
-        assert!(!contains_token_ignore_case(b"chunk", b"chunked"));
+        assert!(!b"chunked".contains_token_ignore_case(b"chunk"));
+        assert!(!b"chunk".contains_token_ignore_case(b"chunked"));
     }
 
     #[test]

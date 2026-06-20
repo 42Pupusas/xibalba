@@ -1,7 +1,6 @@
+use crate::bytes::ByteSliceExt;
 use crate::error::{ConnectionError, Error, ParseError};
-use crate::header::{
-    Header, HeaderName, contains_token_ignore_case, is_tchar, parse_u64_from_bytes,
-};
+use crate::header::{Header, HeaderName, Tchar};
 use crate::status::StatusCode;
 use crate::version::Version;
 
@@ -13,6 +12,137 @@ pub struct ResponseHead<'a> {
     pub reason: &'a [u8],
     /// Number of headers parsed into the caller's buffer.
     pub header_count: usize,
+}
+
+impl<'a> ResponseHead<'a> {
+    /// Parse the response head from `buf`.
+    ///
+    /// `headers` is a caller-provided buffer that will be filled with parsed headers.
+    ///
+    /// On success, returns `(ResponseHead, bytes_consumed)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError::Incomplete` if the buffer doesn't contain a complete
+    /// response head. Returns other `ParseError` variants for malformed input.
+    pub fn parse(buf: &'a [u8], headers: &mut [Header<'a>]) -> Result<(Self, usize), Error> {
+        let status_line_end = buf.find_crlf().ok_or(ParseError::Incomplete)?;
+        let status_line = &buf[..status_line_end];
+
+        if status_line.len() < 12 {
+            return Err(ParseError::InvalidVersion.into());
+        }
+
+        let version = Version::try_from(&status_line[..8])?;
+
+        if status_line[8] != b' ' {
+            return Err(ParseError::InvalidVersion.into());
+        }
+
+        let status = StatusCode::try_from(&status_line[9..12])?;
+
+        let reason = if status_line.len() > 13 && status_line[12] == b' ' {
+            &status_line[13..]
+        } else {
+            b""
+        };
+
+        let mut pos = status_line_end + 2;
+        let mut count = 0;
+
+        loop {
+            if pos >= buf.len() {
+                return Err(ParseError::Incomplete.into());
+            }
+
+            if pos + 1 < buf.len() && buf[pos] == b'\r' && buf[pos + 1] == b'\n' {
+                pos += 2;
+                break;
+            }
+
+            // Single left-to-right scan: validate name tchar-by-tchar, find ':', then
+            // scan value bytes until \r\n — all in one pass with no restarts.
+            let (name_bytes, value, line_end) = Self::parse_header_line(&buf[pos..])?;
+
+            if count >= headers.len() {
+                return Err(ParseError::TooManyHeaders.into());
+            }
+            headers[count] = Header {
+                name: HeaderName::raw(name_bytes),
+                value,
+            };
+            count += 1;
+
+            pos += line_end;
+        }
+
+        Ok((
+            Self {
+                version,
+                status,
+                reason,
+                header_count: count,
+            },
+            pos,
+        ))
+    }
+
+    /// Single-pass header line parser.
+    ///
+    /// Scans `line` left-to-right once: validates name tchars, finds ':', then
+    /// finds the terminating CRLF, trimming OWS from the value along the way.
+    /// Returns `(name_bytes, value, bytes_consumed_including_crlf)`.
+    fn parse_header_line(line: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
+        if line.is_empty() {
+            return Err(ParseError::InvalidHeaderName.into());
+        }
+
+        // Phase 1: scan name, validating tchars and stopping at ':'
+        let mut i = 0;
+        loop {
+            if i >= line.len() {
+                return Err(ParseError::MissingColon.into());
+            }
+            let b = line[i];
+            if b == b':' {
+                break;
+            }
+            if !Tchar::is_valid(b) {
+                return Err(ParseError::InvalidHeaderName.into());
+            }
+            i += 1;
+        }
+        if i == 0 {
+            return Err(ParseError::InvalidHeaderName.into());
+        }
+        let name_bytes = &line[..i];
+        i += 1; // skip ':'
+
+        // Phase 2: skip leading OWS
+        while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
+            i += 1;
+        }
+        let value_start = i;
+
+        // Phase 3: use iterator position so LLVM can auto-vectorize the \r scan
+        let cr_pos = line[i..]
+            .iter()
+            .position(|&b| b == b'\r')
+            .ok_or(ParseError::Incomplete)?;
+        let crlf = i + cr_pos;
+        if crlf + 1 >= line.len() || line[crlf + 1] != b'\n' {
+            return Err(ParseError::Incomplete.into());
+        }
+
+        // Trim trailing OWS in one backward pass — only paid when OWS is present
+        let raw_value = &line[value_start..crlf];
+        let value_end = raw_value
+            .iter()
+            .rposition(|&b| b != b' ' && b != b'\t')
+            .map_or(0, |p| p + 1);
+
+        Ok((name_bytes, &raw_value[..value_end], crlf + 2))
+    }
 }
 
 /// How the response body is framed.
@@ -28,115 +158,43 @@ pub enum BodyFraming {
     None,
 }
 
-/// Parse the response head from `buf`.
-///
-/// `headers` is a caller-provided buffer that will be filled with parsed headers.
-///
-/// On success, returns `(ResponseHead, bytes_consumed)`.
-///
-/// # Errors
-///
-/// Returns `ParseError::Incomplete` if the buffer doesn't contain a complete
-/// response head. Returns other `ParseError` variants for malformed input.
-pub fn parse_response_head<'a>(
-    buf: &'a [u8],
-    headers: &mut [Header<'a>],
-) -> Result<(ResponseHead<'a>, usize), Error> {
-    let status_line_end = find_crlf(buf).ok_or(ParseError::Incomplete)?;
-    let status_line = &buf[..status_line_end];
-
-    if status_line.len() < 12 {
-        return Err(ParseError::InvalidVersion.into());
-    }
-
-    let version = Version::try_from(&status_line[..8])?;
-
-    if status_line[8] != b' ' {
-        return Err(ParseError::InvalidVersion.into());
-    }
-
-    let status = StatusCode::try_from(&status_line[9..12])?;
-
-    let reason = if status_line.len() > 13 && status_line[12] == b' ' {
-        &status_line[13..]
-    } else {
-        b""
-    };
-
-    let mut pos = status_line_end + 2;
-    let mut count = 0;
-
-    loop {
-        if pos >= buf.len() {
-            return Err(ParseError::Incomplete.into());
-        }
-
-        if pos + 1 < buf.len() && buf[pos] == b'\r' && buf[pos + 1] == b'\n' {
-            pos += 2;
-            break;
-        }
-
-        // Single left-to-right scan: validate name tchar-by-tchar, find ':', then
-        // scan value bytes until \r\n — all in one pass with no restarts.
-        let (name_bytes, value, line_end) = parse_header_line(&buf[pos..])?;
-
-        if count >= headers.len() {
-            return Err(ParseError::TooManyHeaders.into());
-        }
-        headers[count] = Header {
-            name: HeaderName::raw(name_bytes),
-            value,
-        };
-        count += 1;
-
-        pos += line_end;
-    }
-
-    Ok((
-        ResponseHead {
-            version,
-            status,
-            reason,
-            header_count: count,
-        },
-        pos,
-    ))
-}
-
-/// Determine body framing from the response status and headers.
-#[must_use]
-pub fn determine_body_framing(
-    status: StatusCode,
-    request_method_is_head: bool,
-    headers: &[Header<'_>],
-    header_count: usize,
-) -> BodyFraming {
-    if status.is_informational()
-        || status == StatusCode::NO_CONTENT
-        || status == StatusCode::NOT_MODIFIED
-        || request_method_is_head
-    {
-        return BodyFraming::None;
-    }
-
-    let hdrs = &headers[..header_count];
-
-    for h in hdrs {
-        if h.name == HeaderName::TransferEncoding && contains_token_ignore_case(h.value, b"chunked")
+impl BodyFraming {
+    /// Determine body framing from the response status and headers.
+    #[must_use]
+    pub fn from_response(
+        status: StatusCode,
+        request_method_is_head: bool,
+        headers: &[Header<'_>],
+        header_count: usize,
+    ) -> Self {
+        if status.is_informational()
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_MODIFIED
+            || request_method_is_head
         {
-            return BodyFraming::Chunked;
+            return Self::None;
         }
-    }
 
-    for h in hdrs {
-        if h.name == HeaderName::ContentLength
-            && let Some(len) = parse_u64_from_bytes(h.value)
-        {
-            return BodyFraming::ContentLength(len);
+        let hdrs = &headers[..header_count];
+
+        for h in hdrs {
+            if h.name == HeaderName::TransferEncoding
+                && h.value.contains_token_ignore_case(b"chunked")
+            {
+                return Self::Chunked;
+            }
         }
-    }
 
-    BodyFraming::UntilClose
+        for h in hdrs {
+            if h.name == HeaderName::ContentLength
+                && let Some(len) = h.value.parse_u64()
+            {
+                return Self::ContentLength(len);
+            }
+        }
+
+        Self::UntilClose
+    }
 }
 
 // --- Chunked transfer decoder state machine ---
@@ -261,7 +319,7 @@ impl ChunkedDecoder {
         for (i, &b) in input.iter().enumerate() {
             match self.state {
                 ChunkedState::ReadingSize => {
-                    if let Some(digit) = hex_digit(b) {
+                    if let Some(digit) = HexDigit::decode(b) {
                         self.chunk_size = match self
                             .chunk_size
                             .checked_mul(16)
@@ -412,12 +470,17 @@ enum DataStep {
     BufferFull,
 }
 
-const fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
+/// Single hex-digit decoder used by the chunked decoder.
+struct HexDigit;
+
+impl HexDigit {
+    const fn decode(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
     }
 }
 
@@ -431,54 +494,45 @@ pub struct HeaderRange {
     pub value_len: u16,
 }
 
-#[must_use]
-pub fn find_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\r\n")
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-fn offset_in_or_find(src: &[u8], src_base: usize, src_end: usize, part: &[u8]) -> Option<usize> {
-    let ptr = part.as_ptr().addr();
-    if (src_base..src_end).contains(&ptr) {
-        Some(ptr - src_base)
-    } else {
-        find_subsequence(src, part)
-    }
-}
-
-/// Compute byte-offset ranges for each parsed header against the raw `src` buffer.
-///
-/// # Errors
-///
-/// Returns [`ConnectionError::HeaderNotInBuffer`] if a header name cannot be
-/// located in `src`, or [`ConnectionError::HeaderRangeOverflow`] if any offset
-/// or length overflows `u16`.
-pub fn build_ranges(
-    headers: &[Header<'_>],
-    src: &[u8],
-) -> Result<[HeaderRange; MAX_HEADERS], Error> {
-    let src_base = src.as_ptr().addr();
-    let src_end = src_base + src.len();
-    let mut ranges = [HeaderRange::default(); MAX_HEADERS];
-    for (i, h) in headers.iter().enumerate() {
-        let name = h.name.as_bytes();
-        let value = h.value;
-        let ns_off = offset_in_or_find(src, src_base, src_end, name)
-            .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?;
-        let vs_off = offset_in_or_find(src, src_base, src_end, value)
-            .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?;
-        ranges[i] = HeaderRange::from_parts(ns_off, name.len(), vs_off, value.len())?;
-    }
-    Ok(ranges)
-}
-
 impl HeaderRange {
+    /// Compute byte-offset ranges for each parsed header against the raw `src` buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectionError::HeaderNotInBuffer`] if a header name cannot be
+    /// located in `src`, or [`ConnectionError::HeaderRangeOverflow`] if any offset
+    /// or length overflows `u16`.
+    pub fn build_ranges(headers: &[Header<'_>], src: &[u8]) -> Result<[Self; MAX_HEADERS], Error> {
+        let src_base = src.as_ptr().addr();
+        let src_end = src_base + src.len();
+        let mut ranges = [Self::default(); MAX_HEADERS];
+        for (i, h) in headers.iter().enumerate() {
+            let name = h.name.as_bytes();
+            let value = h.value;
+            let ns_off = Self::offset_in_or_find(src, src_base, src_end, name)
+                .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?;
+            let vs_off = Self::offset_in_or_find(src, src_base, src_end, value)
+                .ok_or(Error::Connection(ConnectionError::HeaderNotInBuffer))?;
+            ranges[i] = Self::from_parts(ns_off, name.len(), vs_off, value.len())?;
+        }
+        Ok(ranges)
+    }
+
+    #[must_use]
+    fn offset_in_or_find(
+        src: &[u8],
+        src_base: usize,
+        src_end: usize,
+        part: &[u8],
+    ) -> Option<usize> {
+        let ptr = part.as_ptr().addr();
+        if (src_base..src_end).contains(&ptr) {
+            Some(ptr - src_base)
+        } else {
+            src.find_subsequence(part)
+        }
+    }
+
     fn from_parts(
         name_start: usize,
         name_len: usize,
@@ -495,70 +549,13 @@ impl HeaderRange {
     }
 }
 
-/// Single-pass header line parser.
-///
-/// Scans `line` left-to-right once: validates name tchars, finds ':', then
-/// finds the terminating CRLF, trimming OWS from the value along the way.
-/// Returns `(name_bytes, value, bytes_consumed_including_crlf)`.
-fn parse_header_line(line: &[u8]) -> Result<(&[u8], &[u8], usize), Error> {
-    if line.is_empty() {
-        return Err(ParseError::InvalidHeaderName.into());
-    }
-
-    // Phase 1: scan name, validating tchars and stopping at ':'
-    let mut i = 0;
-    loop {
-        if i >= line.len() {
-            return Err(ParseError::MissingColon.into());
-        }
-        let b = line[i];
-        if b == b':' {
-            break;
-        }
-        if !is_tchar(b) {
-            return Err(ParseError::InvalidHeaderName.into());
-        }
-        i += 1;
-    }
-    if i == 0 {
-        return Err(ParseError::InvalidHeaderName.into());
-    }
-    let name_bytes = &line[..i];
-    i += 1; // skip ':'
-
-    // Phase 2: skip leading OWS
-    while i < line.len() && (line[i] == b' ' || line[i] == b'\t') {
-        i += 1;
-    }
-    let value_start = i;
-
-    // Phase 3: use iterator position so LLVM can auto-vectorize the \r scan
-    let cr_pos = line[i..]
-        .iter()
-        .position(|&b| b == b'\r')
-        .ok_or(ParseError::Incomplete)?;
-    let crlf = i + cr_pos;
-    if crlf + 1 >= line.len() || line[crlf + 1] != b'\n' {
-        return Err(ParseError::Incomplete.into());
-    }
-
-    // Trim trailing OWS in one backward pass — only paid when OWS is present
-    let raw_value = &line[value_start..crlf];
-    let value_end = raw_value
-        .iter()
-        .rposition(|&b| b != b' ' && b != b'\t')
-        .map_or(0, |p| p + 1);
-
-    Ok((name_bytes, &raw_value[..value_end], crlf + 2))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_response(text: &[u8]) -> (ResponseHead<'_>, usize, Vec<Header<'_>>) {
         let mut headers = vec![Header::empty(); 32];
-        let (head, consumed) = parse_response_head(text, &mut headers).unwrap();
+        let (head, consumed) = ResponseHead::parse(text, &mut headers).unwrap();
         headers.truncate(head.header_count);
         (head, consumed, headers)
     }
@@ -599,7 +596,7 @@ mod tests {
     fn incomplete_returns_error() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n";
         let mut headers = [const { Header::empty() }; 32];
-        let result = parse_response_head(raw, &mut headers);
+        let result = ResponseHead::parse(raw, &mut headers);
         assert_eq!(result.unwrap_err(), Error::Parse(ParseError::Incomplete));
     }
 
@@ -607,7 +604,7 @@ mod tests {
     fn too_many_headers_error() {
         let raw = b"HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\n\r\n";
         let mut headers = [Header::empty(); 1];
-        let result = parse_response_head(raw, &mut headers);
+        let result = ResponseHead::parse(raw, &mut headers);
         assert_eq!(
             result.unwrap_err(),
             Error::Parse(ParseError::TooManyHeaders)
@@ -621,7 +618,7 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
             BodyFraming::ContentLength(42)
         );
     }
@@ -633,7 +630,7 @@ mod tests {
             value: b"chunked",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
             BodyFraming::Chunked
         );
     }
@@ -642,7 +639,7 @@ mod tests {
     fn body_framing_none_for_204() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            determine_body_framing(StatusCode::NO_CONTENT, false, &headers, 0),
+            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers, 0),
             BodyFraming::None
         );
     }
@@ -654,7 +651,7 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, true, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, true, &headers, 1),
             BodyFraming::None
         );
     }
@@ -663,7 +660,7 @@ mod tests {
     fn body_framing_until_close() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 0),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 0),
             BodyFraming::UntilClose
         );
     }
@@ -681,7 +678,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 2),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2),
             BodyFraming::Chunked
         );
     }
@@ -822,14 +819,14 @@ mod tests {
     fn garbage_status_line() {
         let raw = b"\x00\xff\xfe garbage\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        assert!(parse_response_head(raw, &mut headers).is_err());
+        assert!(ResponseHead::parse(raw, &mut headers).is_err());
     }
 
     #[test]
     fn truncated_version() {
         let raw = b"HTTP/1\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
         assert_eq!(err, Error::Parse(ParseError::InvalidVersion));
     }
 
@@ -837,14 +834,14 @@ mod tests {
     fn status_line_no_space_after_version() {
         let raw = b"HTTP/1.1200 OK\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        assert!(parse_response_head(raw, &mut headers).is_err());
+        assert!(ResponseHead::parse(raw, &mut headers).is_err());
     }
 
     #[test]
     fn header_with_nul_byte_in_name() {
         let raw = b"HTTP/1.1 200 OK\r\nBad\x00Name: val\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
         assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
     }
 
@@ -854,7 +851,7 @@ mod tests {
         // fires before MissingColon can be reached.
         let raw = b"HTTP/1.1 200 OK\r\nHeaderNoColon\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
         assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
     }
 
@@ -862,7 +859,7 @@ mod tests {
     fn header_empty_name() {
         let raw = b"HTTP/1.1 200 OK\r\n: value\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
         assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
     }
 
@@ -870,7 +867,7 @@ mod tests {
     fn header_name_with_space() {
         let raw = b"HTTP/1.1 200 OK\r\nBad Name: val\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        let err = parse_response_head(raw, &mut headers).unwrap_err();
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
         assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
     }
 
@@ -886,7 +883,7 @@ mod tests {
     fn only_crlf_no_status_line() {
         let raw = b"\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
-        assert!(parse_response_head(raw, &mut headers).is_err());
+        assert!(ResponseHead::parse(raw, &mut headers).is_err());
     }
 
     #[test]
@@ -907,7 +904,7 @@ mod tests {
             value: b"1000",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::NOT_MODIFIED, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers, 1),
             BodyFraming::None
         );
     }
@@ -916,7 +913,7 @@ mod tests {
     fn body_framing_1xx_no_body() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            determine_body_framing(StatusCode::CONTINUE, false, &headers, 0),
+            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers, 0),
             BodyFraming::None
         );
     }
@@ -928,7 +925,7 @@ mod tests {
             value: b"0",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
             BodyFraming::ContentLength(0)
         );
     }
@@ -940,7 +937,7 @@ mod tests {
             value: b" 42 ",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
             BodyFraming::ContentLength(42)
         );
     }
@@ -952,7 +949,7 @@ mod tests {
             value: b"abc",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 0),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 0),
             BodyFraming::UntilClose
         );
     }
@@ -964,7 +961,7 @@ mod tests {
             value: b"gzip",
         }];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
             BodyFraming::UntilClose
         );
     }
@@ -982,7 +979,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            determine_body_framing(StatusCode::OK, false, &headers, 2),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2),
             BodyFraming::Chunked
         );
     }
@@ -1159,7 +1156,7 @@ mod tests {
                 value: &src[28..32],
             },
         ];
-        let ranges = build_ranges(&headers, src).unwrap();
+        let ranges = HeaderRange::build_ranges(&headers, src).unwrap();
         assert_eq!(
             &src[usize::from(ranges[0].name_start)
                 ..usize::from(ranges[0].name_start) + usize::from(ranges[0].name_len)],

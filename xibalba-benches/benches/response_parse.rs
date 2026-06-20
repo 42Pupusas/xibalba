@@ -1,36 +1,36 @@
 use divan::black_box;
 use xibalba_benches as fx;
 use xibalba_proto::header::Header;
-use xibalba_proto::response::{ChunkedDecoder, DecodeResult, parse_response_head};
+use xibalba_proto::response::{ChunkedDecoder, DecodeResult, ResponseHead};
 
 fn main() {
     divan::main();
 }
 
-// ── parse_response_head internals ──────────────────────────────────────────
+// ── ResponseHead::parse internals ──────────────────────────────────────────
 
 #[divan::bench]
 fn parse_minimal() {
     let mut hdrs = [const { Header::empty() }; 32];
-    parse_response_head(black_box(fx::RESP_MINIMAL), &mut hdrs).unwrap();
+    ResponseHead::parse(black_box(fx::RESP_MINIMAL), &mut hdrs).unwrap();
 }
 
 #[divan::bench]
 fn parse_typical_6_known() {
     let mut hdrs = [const { Header::empty() }; 32];
-    parse_response_head(black_box(fx::RESP_TYPICAL), &mut hdrs).unwrap();
+    ResponseHead::parse(black_box(fx::RESP_TYPICAL), &mut hdrs).unwrap();
 }
 
 #[divan::bench]
 fn parse_heavy_22_mixed() {
     let mut hdrs = [const { Header::empty() }; 32];
-    parse_response_head(black_box(fx::RESP_HEAVY), &mut hdrs).unwrap();
+    ResponseHead::parse(black_box(fx::RESP_HEAVY), &mut hdrs).unwrap();
 }
 
 #[divan::bench]
 fn parse_heavy_20_unknown() {
     let mut hdrs = [const { Header::empty() }; 32];
-    parse_response_head(black_box(fx::RESP_ALL_UNKNOWN), &mut hdrs).unwrap();
+    ResponseHead::parse(black_box(fx::RESP_ALL_UNKNOWN), &mut hdrs).unwrap();
 }
 
 // ── ChunkedDecoder internals ───────────────────────────────────────────────
@@ -105,12 +105,12 @@ mod compare {
     use divan::black_box;
     use xibalba_benches as fx;
     use xibalba_proto::header::Header;
-    use xibalba_proto::response::parse_response_head;
+    use xibalba_proto::response::ResponseHead;
 
     #[divan::bench]
     fn parse_minimal_xibalba() {
         let mut hdrs = [const { Header::empty() }; 32];
-        parse_response_head(black_box(fx::RESP_MINIMAL), &mut hdrs).unwrap();
+        ResponseHead::parse(black_box(fx::RESP_MINIMAL), &mut hdrs).unwrap();
     }
 
     #[divan::bench]
@@ -123,7 +123,7 @@ mod compare {
     #[divan::bench]
     fn parse_typical_xibalba() {
         let mut hdrs = [const { Header::empty() }; 32];
-        parse_response_head(black_box(fx::RESP_TYPICAL), &mut hdrs).unwrap();
+        ResponseHead::parse(black_box(fx::RESP_TYPICAL), &mut hdrs).unwrap();
     }
 
     #[divan::bench]
@@ -136,7 +136,7 @@ mod compare {
     #[divan::bench]
     fn parse_heavy_xibalba() {
         let mut hdrs = [const { Header::empty() }; 32];
-        parse_response_head(black_box(fx::RESP_HEAVY), &mut hdrs).unwrap();
+        ResponseHead::parse(black_box(fx::RESP_HEAVY), &mut hdrs).unwrap();
     }
 
     #[divan::bench]

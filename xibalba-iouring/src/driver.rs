@@ -37,8 +37,7 @@ use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
 use xibalba_proto::response::{
-    BodyFraming, ChunkedDecoder, DecodeResult, build_ranges, determine_body_framing,
-    parse_response_head,
+    BodyFraming, ChunkedDecoder, DecodeResult, HeaderRange, ResponseHead,
 };
 use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
@@ -229,7 +228,105 @@ impl ResponseParser {
         }
 
         self.head_accum.extend_from_slice(data);
-        parse_head_and_maybe_finish(self, request_id).map(|(resp, _)| resp)
+        self.parse_head_and_maybe_finish(request_id)
+            .map(|(resp, _)| resp)
+    }
+
+    /// Look for `\r\n\r\n` in `head_accum`. If found, parse the head, set up
+    /// the partial response (or finish immediately if the body is also
+    /// present), and return the completed response when applicable.
+    fn parse_head_and_maybe_finish(&mut self, request_id: RequestId) -> Option<(Response, usize)> {
+        let head_end = self.head_accum.windows(4).position(|w| w == b"\r\n\r\n")?;
+        let head_bytes_len = head_end + 4;
+
+        let mut hdr_buf = [const { xibalba_proto::header::Header::empty() }; MAX_HEADERS];
+        let (head, consumed) =
+            ResponseHead::parse(&self.head_accum[..head_bytes_len], &mut hdr_buf).ok()?;
+
+        let framing = BodyFraming::from_response(
+            head.status,
+            false,
+            &hdr_buf[..head.header_count],
+            head.header_count,
+        );
+        let ranges = HeaderRange::build_ranges(
+            &hdr_buf[..head.header_count],
+            &self.head_accum[..head_bytes_len],
+        )
+        .ok()?;
+        let (version, status, header_count) = (head.version, head.status, head.header_count);
+
+        // Split head bytes out of head_accum without a fresh allocation: drain the
+        // prefix and collect into a vec (reuses the drained allocation when possible).
+        let head_buf: Vec<u8> = self.head_accum.drain(..head_bytes_len).collect();
+        // `consumed` was an index into the original head_accum; after the drain the
+        // remaining bytes start at what was index `head_bytes_len`, so adjust.
+        let consumed_after_drain = consumed - head_bytes_len;
+
+        let head_data = HeadData {
+            head_buf,
+            ranges,
+            header_count,
+        };
+
+        let (internal_framing, body_done) = match framing {
+            BodyFraming::None => (InternalFraming::Done, true),
+            BodyFraming::ContentLength(n) => {
+                (InternalFraming::ContentLength { remaining: n }, n == 0)
+            }
+            BodyFraming::Chunked => (
+                InternalFraming::Chunked {
+                    decoder: ChunkedDecoder::new(),
+                },
+                false,
+            ),
+            BodyFraming::UntilClose => (InternalFraming::UntilClose, false),
+        };
+
+        // Reuse the parser's body buffer instead of allocating a fresh Vec.
+        let mut body_buf = std::mem::take(&mut self.body_buf);
+        body_buf.clear();
+        #[allow(clippy::cast_possible_truncation)]
+        if let BodyFraming::ContentLength(n) = framing {
+            body_buf.reserve(n as usize);
+        }
+        let mut partial = PartialResponse {
+            version,
+            status,
+            head: head_data,
+            body_buf,
+            body_done,
+            framing: internal_framing,
+        };
+
+        let after_head = &self.head_accum[consumed_after_drain..];
+        let body_consumed = if !after_head.is_empty() && !body_done {
+            pump_partial(&mut partial, after_head)
+        } else {
+            0
+        };
+
+        if partial.body_done {
+            let total_consumed = consumed_after_drain + body_consumed;
+            // Shift leftover bytes to the front of head_accum (no new allocation).
+            self.head_accum.drain(..total_consumed);
+            self.partial = None;
+            Some((
+                Response {
+                    request_id,
+                    version: partial.version,
+                    status: partial.status,
+                    head: partial.head,
+                    body: partial.body_buf,
+                },
+                body_consumed,
+            ))
+        } else {
+            // Trim consumed head bytes from head_accum; body bytes stay in partial.
+            self.head_accum.drain(..consumed_after_drain);
+            self.partial = Some(partial);
+            None
+        }
     }
 }
 
@@ -850,104 +947,6 @@ fn finish_until_close(
 }
 
 // ── CQE data processing ───────────────────────────────────────────────────────
-
-fn parse_head_and_maybe_finish(
-    parser: &mut ResponseParser,
-    request_id: RequestId,
-) -> Option<(Response, usize)> {
-    let head_end = parser
-        .head_accum
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")?;
-    let head_bytes_len = head_end + 4;
-
-    let mut hdr_buf = [const { xibalba_proto::header::Header::empty() }; MAX_HEADERS];
-    let (head, consumed) =
-        parse_response_head(&parser.head_accum[..head_bytes_len], &mut hdr_buf).ok()?;
-
-    let framing = determine_body_framing(
-        head.status,
-        false,
-        &hdr_buf[..head.header_count],
-        head.header_count,
-    );
-    let ranges = build_ranges(
-        &hdr_buf[..head.header_count],
-        &parser.head_accum[..head_bytes_len],
-    )
-    .ok()?;
-    let (version, status, header_count) = (head.version, head.status, head.header_count);
-
-    // Split head bytes out of head_accum without a fresh allocation: drain the
-    // prefix and collect into a vec (reuses the drained allocation when possible).
-    let head_buf: Vec<u8> = parser.head_accum.drain(..head_bytes_len).collect();
-    // `consumed` was an index into the original head_accum; after the drain the
-    // remaining bytes start at what was index `head_bytes_len`, so adjust.
-    let consumed_after_drain = consumed - head_bytes_len;
-
-    let head_data = HeadData {
-        head_buf,
-        ranges,
-        header_count,
-    };
-
-    let (internal_framing, body_done) = match framing {
-        BodyFraming::None => (InternalFraming::Done, true),
-        BodyFraming::ContentLength(n) => (InternalFraming::ContentLength { remaining: n }, n == 0),
-        BodyFraming::Chunked => (
-            InternalFraming::Chunked {
-                decoder: ChunkedDecoder::new(),
-            },
-            false,
-        ),
-        BodyFraming::UntilClose => (InternalFraming::UntilClose, false),
-    };
-
-    // Reuse the parser's body buffer instead of allocating a fresh Vec.
-    let mut body_buf = std::mem::take(&mut parser.body_buf);
-    body_buf.clear();
-    #[allow(clippy::cast_possible_truncation)]
-    if let BodyFraming::ContentLength(n) = framing {
-        body_buf.reserve(n as usize);
-    }
-    let mut partial = PartialResponse {
-        version,
-        status,
-        head: head_data,
-        body_buf,
-        body_done,
-        framing: internal_framing,
-    };
-
-    let after_head = &parser.head_accum[consumed_after_drain..];
-    let body_consumed = if !after_head.is_empty() && !body_done {
-        pump_partial(&mut partial, after_head)
-    } else {
-        0
-    };
-
-    if partial.body_done {
-        let total_consumed = consumed_after_drain + body_consumed;
-        // Shift leftover bytes to the front of head_accum (no new allocation).
-        parser.head_accum.drain(..total_consumed);
-        parser.partial = None;
-        Some((
-            Response {
-                request_id,
-                version: partial.version,
-                status: partial.status,
-                head: partial.head,
-                body: partial.body_buf,
-            },
-            body_consumed,
-        ))
-    } else {
-        // Trim consumed head bytes from head_accum; body bytes stay in partial.
-        parser.head_accum.drain(..consumed_after_drain);
-        parser.partial = Some(partial);
-        None
-    }
-}
 
 /// Feeds `data` into `resp`, returning the number of bytes consumed.
 fn pump_partial(resp: &mut PartialResponse, data: &[u8]) -> usize {

@@ -20,28 +20,27 @@ impl Request<'_> {
     /// Returns `SerializeError::BufferTooSmall` if the buffer cannot hold
     /// the full request head.
     pub fn serialize_to_buf(&self, buf: &mut [u8]) -> Result<usize, Error> {
-        let mut pos = 0;
-
-        pos = write_bytes(buf, pos, self.method.as_bytes())?;
-        pos = write_byte(buf, pos, b' ')?;
-        pos = write_bytes(buf, pos, self.path)?;
+        let mut w = BufWriter::new(buf);
+        w.write_bytes(self.method.as_bytes())?;
+        w.write_byte(b' ')?;
+        w.write_bytes(self.path)?;
         if let Some(query) = self.query {
-            pos = write_byte(buf, pos, b'?')?;
-            pos = write_bytes(buf, pos, query)?;
+            w.write_byte(b'?')?;
+            w.write_bytes(query)?;
         }
-        pos = write_byte(buf, pos, b' ')?;
-        pos = write_bytes(buf, pos, self.version.as_bytes())?;
-        pos = write_bytes(buf, pos, b"\r\n")?;
+        w.write_byte(b' ')?;
+        w.write_bytes(self.version.as_bytes())?;
+        w.write_bytes(b"\r\n")?;
 
         for header in self.headers {
-            pos = write_bytes(buf, pos, header.name.as_bytes())?;
-            pos = write_bytes(buf, pos, b": ")?;
-            pos = write_bytes(buf, pos, header.value)?;
-            pos = write_bytes(buf, pos, b"\r\n")?;
+            w.write_bytes(header.name.as_bytes())?;
+            w.write_bytes(b": ")?;
+            w.write_bytes(header.value)?;
+            w.write_bytes(b"\r\n")?;
         }
 
-        pos = write_bytes(buf, pos, b"\r\n")?;
-        Ok(pos)
+        w.write_bytes(b"\r\n")?;
+        Ok(w.pos())
     }
 
     /// Serialize the request head to an `impl Write`.
@@ -96,21 +95,50 @@ impl Request<'_> {
     }
 }
 
-fn write_bytes(buf: &mut [u8], pos: usize, data: &[u8]) -> Result<usize, Error> {
-    let end = pos + data.len();
-    if end > buf.len() {
-        return Err(SerializeError::BufferTooSmall.into());
-    }
-    buf[pos..end].copy_from_slice(data);
-    Ok(end)
+/// Cursor over a borrowed serialization buffer. Tracks the current write
+/// position and surfaces `BufferTooSmall` errors as the cursor advances.
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
 }
 
-fn write_byte(buf: &mut [u8], pos: usize, byte: u8) -> Result<usize, Error> {
-    if pos >= buf.len() {
-        return Err(SerializeError::BufferTooSmall.into());
+impl<'a> BufWriter<'a> {
+    const fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
     }
-    buf[pos] = byte;
-    Ok(pos + 1)
+
+    const fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Append `data` at the current position. Errors if it would overflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SerializeError::BufferTooSmall` when `pos + data.len() > buf.len()`.
+    fn write_bytes(&mut self, data: &[u8]) -> Result<(), Error> {
+        let end = self.pos + data.len();
+        if end > self.buf.len() {
+            return Err(SerializeError::BufferTooSmall.into());
+        }
+        self.buf[self.pos..end].copy_from_slice(data);
+        self.pos = end;
+        Ok(())
+    }
+
+    /// Append a single byte at the current position.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SerializeError::BufferTooSmall` when `pos >= buf.len()`.
+    fn write_byte(&mut self, byte: u8) -> Result<(), Error> {
+        if self.pos >= self.buf.len() {
+            return Err(SerializeError::BufferTooSmall.into());
+        }
+        self.buf[self.pos] = byte;
+        self.pos += 1;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

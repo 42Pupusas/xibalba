@@ -1,3 +1,4 @@
+use crate::bytes::ByteSliceExt;
 use crate::error::{Error, UrlError};
 use crate::scheme::Scheme;
 
@@ -22,7 +23,9 @@ impl<'a> Url<'a> {
             return Err(UrlError::Empty.into());
         }
 
-        let sep_pos = find_subsequence(input, b"://").ok_or(UrlError::InvalidScheme)?;
+        let sep_pos = input
+            .find_subsequence(b"://")
+            .ok_or(UrlError::InvalidScheme)?;
         let scheme = Scheme::try_from(&input[..sep_pos])?;
         let rest = &input[sep_pos + 3..];
 
@@ -33,12 +36,12 @@ impl<'a> Url<'a> {
         let authority = &rest[..authority_end];
         let after_authority = &rest[authority_end..];
 
-        let (host, port) = parse_authority(authority)?;
+        let (host, port) = Self::parse_authority(authority)?;
         if host.is_empty() {
             return Err(UrlError::MissingHost.into());
         }
 
-        let (path, query, fragment) = parse_path_query_fragment(after_authority);
+        let (path, query, fragment) = Self::parse_path_query_fragment(after_authority);
 
         Ok(Self {
             scheme,
@@ -74,6 +77,82 @@ impl<'a> Url<'a> {
             done: self.query.is_none(),
         }
     }
+
+    fn parse_authority(authority: &[u8]) -> Result<(&[u8], Option<u16>), Error> {
+        if authority.is_empty() {
+            return Ok((b"", None));
+        }
+
+        if authority[0] == b'[' {
+            let bracket_end = authority
+                .iter()
+                .position(|&b| b == b']')
+                .ok_or(UrlError::InvalidByte(0))?;
+            let host = &authority[1..bracket_end];
+            let after_bracket = &authority[bracket_end + 1..];
+            if after_bracket.is_empty() {
+                Ok((host, None))
+            } else if after_bracket[0] == b':' {
+                let port = Self::parse_port(&after_bracket[1..])?;
+                Ok((host, Some(port)))
+            } else {
+                Err(UrlError::InvalidByte(bracket_end + 1).into())
+            }
+        } else {
+            match authority.iter().rposition(|&b| b == b':') {
+                Some(colon_pos) => {
+                    let host = &authority[..colon_pos];
+                    let port = Self::parse_port(&authority[colon_pos + 1..])?;
+                    Ok((host, Some(port)))
+                }
+                None => Ok((authority, None)),
+            }
+        }
+    }
+
+    fn parse_port(bytes: &[u8]) -> Result<u16, Error> {
+        if bytes.is_empty() {
+            return Err(UrlError::InvalidPort.into());
+        }
+        let mut result: u32 = 0;
+        for &b in bytes {
+            let digit = b.wrapping_sub(b'0');
+            if digit > 9 {
+                return Err(UrlError::InvalidPort.into());
+            }
+            result = result * 10 + u32::from(digit);
+            if result > u32::from(u16::MAX) {
+                return Err(UrlError::InvalidPort.into());
+            }
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "result is checked > u16::MAX just above; value is guaranteed in range"
+        )]
+        Ok(result as u16)
+    }
+
+    fn parse_path_query_fragment(input: &[u8]) -> (&[u8], Option<&[u8]>, Option<&[u8]>) {
+        if input.is_empty() {
+            return (b"", None, None);
+        }
+
+        let (before_fragment, fragment) = input
+            .iter()
+            .position(|&b| b == b'#')
+            .map_or((input, None), |pos| {
+                (&input[..pos], Some(&input[pos + 1..]))
+            });
+
+        let (path, query) = before_fragment
+            .iter()
+            .position(|&b| b == b'?')
+            .map_or((before_fragment, None), |pos| {
+                (&before_fragment[..pos], Some(&before_fragment[pos + 1..]))
+            });
+
+        (path, query, fragment)
+    }
 }
 
 /// Zero-copy iterator over query string key-value pairs.
@@ -108,88 +187,6 @@ impl<'a> Iterator for QueryParams<'a> {
                 .map_or((pair, None), |pos| (&pair[..pos], Some(&pair[pos + 1..]))),
         )
     }
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn parse_authority(authority: &[u8]) -> Result<(&[u8], Option<u16>), Error> {
-    if authority.is_empty() {
-        return Ok((b"", None));
-    }
-
-    if authority[0] == b'[' {
-        let bracket_end = authority
-            .iter()
-            .position(|&b| b == b']')
-            .ok_or(UrlError::InvalidByte(0))?;
-        let host = &authority[1..bracket_end];
-        let after_bracket = &authority[bracket_end + 1..];
-        if after_bracket.is_empty() {
-            Ok((host, None))
-        } else if after_bracket[0] == b':' {
-            let port = parse_port(&after_bracket[1..])?;
-            Ok((host, Some(port)))
-        } else {
-            Err(UrlError::InvalidByte(bracket_end + 1).into())
-        }
-    } else {
-        match authority.iter().rposition(|&b| b == b':') {
-            Some(colon_pos) => {
-                let host = &authority[..colon_pos];
-                let port = parse_port(&authority[colon_pos + 1..])?;
-                Ok((host, Some(port)))
-            }
-            None => Ok((authority, None)),
-        }
-    }
-}
-
-fn parse_port(bytes: &[u8]) -> Result<u16, Error> {
-    if bytes.is_empty() {
-        return Err(UrlError::InvalidPort.into());
-    }
-    let mut result: u32 = 0;
-    for &b in bytes {
-        let digit = b.wrapping_sub(b'0');
-        if digit > 9 {
-            return Err(UrlError::InvalidPort.into());
-        }
-        result = result * 10 + u32::from(digit);
-        if result > u32::from(u16::MAX) {
-            return Err(UrlError::InvalidPort.into());
-        }
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "result is checked > u16::MAX just above; value is guaranteed in range"
-    )]
-    Ok(result as u16)
-}
-
-fn parse_path_query_fragment(input: &[u8]) -> (&[u8], Option<&[u8]>, Option<&[u8]>) {
-    if input.is_empty() {
-        return (b"", None, None);
-    }
-
-    let (before_fragment, fragment) = input
-        .iter()
-        .position(|&b| b == b'#')
-        .map_or((input, None), |pos| {
-            (&input[..pos], Some(&input[pos + 1..]))
-        });
-
-    let (path, query) = before_fragment
-        .iter()
-        .position(|&b| b == b'?')
-        .map_or((before_fragment, None), |pos| {
-            (&before_fragment[..pos], Some(&before_fragment[pos + 1..]))
-        });
-
-    (path, query, fragment)
 }
 
 #[cfg(test)]
@@ -267,7 +264,10 @@ mod tests {
 
     #[test]
     fn rejects_empty() {
-        assert_eq!(Url::parse(b"").unwrap_err(), Error::UrlParse(UrlError::Empty));
+        assert_eq!(
+            Url::parse(b"").unwrap_err(),
+            Error::UrlParse(UrlError::Empty)
+        );
     }
 
     #[test]

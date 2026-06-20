@@ -1,8 +1,7 @@
 use divan::black_box;
 use xibalba_benches as fx;
-use xibalba_proto::header::{
-    HeaderName, contains_token_ignore_case, parse_u64_from_bytes, trim_ows,
-};
+use xibalba_proto::bytes::ByteSliceExt;
+use xibalba_proto::header::HeaderName;
 
 fn main() {
     divan::main();
@@ -49,58 +48,49 @@ fn header_name_unknown() {
 
 #[divan::bench]
 fn trim_ows_none() {
-    black_box(trim_ows(black_box(fx::OWS_NONE)));
+    black_box(black_box(fx::OWS_NONE).trim_ows());
 }
 
 #[divan::bench]
 fn trim_ows_both_ends() {
-    black_box(trim_ows(black_box(fx::OWS_BOTH)));
+    black_box(black_box(fx::OWS_BOTH).trim_ows());
 }
 
 #[divan::bench]
 fn trim_ows_tabs() {
-    black_box(trim_ows(black_box(fx::OWS_TAB)));
+    black_box(black_box(fx::OWS_TAB).trim_ows());
 }
 
-// ── parse_u64_from_bytes ───────────────────────────────────────────────────
+// ── parse_u64 ──────────────────────────────────────────────────────────────
 
 #[divan::bench]
 fn parse_u64_short() {
-    black_box(parse_u64_from_bytes(black_box(fx::U64_SHORT)));
+    black_box(black_box(fx::U64_SHORT).parse_u64());
 }
 
 #[divan::bench]
 fn parse_u64_long() {
-    black_box(parse_u64_from_bytes(black_box(fx::U64_LONG)));
+    black_box(black_box(fx::U64_LONG).parse_u64());
 }
 
 #[divan::bench]
 fn parse_u64_with_ows() {
-    black_box(parse_u64_from_bytes(black_box(fx::U64_WITH_OWS)));
+    black_box(black_box(fx::U64_WITH_OWS).parse_u64());
 }
 
 // ── contains_token_ignore_case ─────────────────────────────────────────────
 
 #[divan::bench]
 fn contains_token_present_short() {
-    black_box(contains_token_ignore_case(
-        black_box(fx::TOKEN_LIST_SHORT),
-        b"chunked",
-    ));
+    black_box(black_box(fx::TOKEN_LIST_SHORT).contains_token_ignore_case(b"chunked"));
 }
 
 #[divan::bench]
 fn contains_token_present_long() {
-    black_box(contains_token_ignore_case(
-        black_box(fx::TOKEN_LIST_LONG),
-        b"chunked",
-    ));
+    black_box(black_box(fx::TOKEN_LIST_LONG).contains_token_ignore_case(b"chunked"));
 }
 
 #[divan::bench]
 fn contains_token_absent() {
-    black_box(contains_token_ignore_case(
-        black_box(fx::TOKEN_ABSENT),
-        b"chunked",
-    ));
+    black_box(black_box(fx::TOKEN_ABSENT).contains_token_ignore_case(b"chunked"));
 }

@@ -552,7 +552,9 @@ fn streaming_content_length_body() {
     let (port, server) = one_shot_server(response);
     let mut client = connect(port);
 
-    let mut resp = client.send_streaming(client.build(Method::Get, b"/")).unwrap();
+    let mut resp = client
+        .send_streaming(client.build(Method::Get, b"/"))
+        .unwrap();
     let mut body = String::new();
     resp.body.read_to_string(&mut body).unwrap();
     assert_eq!(body, "hello world");
@@ -683,9 +685,8 @@ fn multiple_requests_same_connection() {
 #[test]
 fn very_large_header_value() {
     let big_value = "X".repeat(4096);
-    let response_str = format!(
-        "HTTP/1.1 200 OK\r\nX-Big: {big_value}\r\nContent-Length: 2\r\n\r\nok"
-    );
+    let response_str =
+        format!("HTTP/1.1 200 OK\r\nX-Big: {big_value}\r\nContent-Length: 2\r\n\r\nok");
     let response_bytes: &'static [u8] = Box::leak(response_str.into_bytes().into_boxed_slice());
     let (port, server) = one_shot_server(response_bytes);
     let mut client = connect(port);

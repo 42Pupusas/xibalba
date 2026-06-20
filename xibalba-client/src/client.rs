@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::time::Duration;
 
+use xibalba_proto::bytes::ByteSliceExt;
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
@@ -542,7 +543,7 @@ impl<C: Connector> Client<C> {
 
             let location = resp
                 .headers()
-                .find(|(name, _)| xibalba_proto::header::ascii_eq_ignore_case(name, b"Location"))
+                .find(|(name, _)| name.ascii_eq_ignore_case(b"Location"))
                 .map(|(_, v)| v);
 
             let location = match location {

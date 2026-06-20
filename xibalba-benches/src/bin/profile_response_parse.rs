@@ -5,7 +5,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use std::hint::black_box;
 use xibalba_benches as fx;
 use xibalba_proto::header::Header;
-use xibalba_proto::response::parse_response_head;
+use xibalba_proto::response::ResponseHead;
 
 const ITERATIONS: usize = 2_000_000;
 
@@ -14,7 +14,7 @@ fn run_minimal() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
     for _ in 0..ITERATIONS {
-        parse_response_head(black_box(fx::RESP_MINIMAL), &mut hdrs).unwrap();
+        ResponseHead::parse(black_box(fx::RESP_MINIMAL), &mut hdrs).unwrap();
     }
 }
 
@@ -23,7 +23,7 @@ fn run_typical() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
     for _ in 0..ITERATIONS {
-        parse_response_head(black_box(fx::RESP_TYPICAL), &mut hdrs).unwrap();
+        ResponseHead::parse(black_box(fx::RESP_TYPICAL), &mut hdrs).unwrap();
     }
 }
 
@@ -32,7 +32,7 @@ fn run_heavy() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
     for _ in 0..ITERATIONS {
-        parse_response_head(black_box(fx::RESP_HEAVY), &mut hdrs).unwrap();
+        ResponseHead::parse(black_box(fx::RESP_HEAVY), &mut hdrs).unwrap();
     }
 }
 
