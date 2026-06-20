@@ -166,10 +166,19 @@ impl<S: Read> Read for StreamingBody<'_, S> {
             StreamState::Done => Ok(0),
             StreamState::Length { remaining } => self.read_content_length(buf, remaining),
             StreamState::UntilClose => self.read_until_close(buf),
-            StreamState::Chunked { .. } => match self.read_chunked(buf)? {
-                ChunkedRead::Progress(n) => Ok(n),
-                ChunkedRead::NeedMore => Ok(0),
-            },
+            StreamState::Chunked { .. } => {
+                // Loop until the decoder either emits data or finishes the
+                // chunked stream. Returning `Ok(0)` here would signal EOF to
+                // callers, which is wrong when the decoder is merely waiting
+                // for the next chunk.
+                loop {
+                    match self.read_chunked(buf)? {
+                        ChunkedRead::Progress(0) if self.is_done() => return Ok(0),
+                        ChunkedRead::Progress(n) => return Ok(n),
+                        ChunkedRead::NeedMore => {}
+                    }
+                }
+            }
         }
     }
 }
