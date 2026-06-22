@@ -20,6 +20,10 @@ http = "1"
 url = "2"
 ureq = "3"
 dhat = { version = "0.3", optional = true }
+# TLS provider benchmarks
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "aws_lc_rs"] }
+rustls-rustcrypto = "0.0.2-alpha"
+rcgen = "0.14"
 
 [[bench]]
 name = "response_parse"
@@ -40,6 +44,19 @@ harness = false
 [[bench]]
 name = "network"
 harness = false
+
+[[bench]]
+name = "tls_providers"
+harness = false
+
+[[test]]
+name = "tls_adversarial"
+path = "src/bin/tls_adversarial.rs"
+
+[[bin]]
+name = "tls_adversarial"
+path = "src/bin/tls_adversarial.rs"
+test = false
 
 [[bin]]
 name = "profile-response-parse"
