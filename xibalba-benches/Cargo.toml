@@ -3,6 +3,7 @@ name = "xibalba-benches"
 version = "0.1.0"
 edition = "2024"
 publish = false
+autobins = false
 
 [lib]
 path = "src/lib.rs"
@@ -52,11 +53,6 @@ harness = false
 [[test]]
 name = "tls_adversarial"
 path = "src/bin/tls_adversarial.rs"
-
-[[bin]]
-name = "tls_adversarial"
-path = "src/bin/tls_adversarial.rs"
-test = false
 
 [[bin]]
 name = "profile-response-parse"

@@ -4,25 +4,25 @@
 //!   - rustcrypto (experimental)
 //!
 //! Bench groups:
-//!   handshake        — fresh TCP + TLS handshake per iter (1 conn, 1 req)
-//!   roundtrip        — persistent conn, small body, one GET per iter
-//!   throughput       — persistent conn, 1 MiB body, measures record-layer perf
-//!   concurrent       — 8 threads hammering the same server simultaneously
-//!   sequential_burst — 500 sequential requests on one persistent connection
+//!   `handshake`        — fresh TCP + TLS handshake per iter (1 conn, 1 req)
+//!   `roundtrip`        — persistent conn, small body, one GET per iter
+//!   `throughput`       — persistent conn, 1 MiB body, measures record-layer perf
+//!   `concurrent`       — 8 threads hammering the same server simultaneously
+//!   `sequential_burst` — 500 sequential requests on one persistent connection
 //!
 //! Adversarial tests (cargo test):
-//!   alert_on_bad_cert        — server presents cert not in client trust store → error
-//!   alert_on_wrong_hostname  — SNI mismatch → error
-//!   abrupt_close_mid_record  — server drops TCP mid-TLS record → IO error
-//!   oversized_record         — server sends a TLS record > 16 KiB limit → error
-//!   garbage_server_hello     — server sends random bytes instead of TLS → error
-//!   replay_client_hello      — replayed ClientHello bytes → server rejects
+//!   `alert_on_bad_cert`        — server presents cert not in client trust store → error
+//!   `alert_on_wrong_hostname`  — SNI mismatch → error
+//!   `abrupt_close_mid_record`  — server drops TCP mid-TLS record → IO error
+//!   `oversized_record`         — server sends a TLS record > 16 KiB limit → error
+//!   `garbage_server_hello`     — server sends random bytes instead of TLS → error
+//!   `replay_client_hello`      — replayed `ClientHello` bytes → server rejects
 //!
 //! Run benches:
-//!   BENCH_NETWORK=1 cargo bench --bench tls_providers -p xibalba-benches
+//!   `BENCH_NETWORK=1` cargo bench --bench `tls_providers` -p xibalba-benches
 //!
 //! Run adversarial tests:
-//!   cargo test --bench tls_providers -p xibalba-benches -- --test-threads=1
+//!   cargo test --bench `tls_providers` -p xibalba-benches -- --test-threads=1
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -185,7 +185,7 @@ impl ProviderCtx {
         server_p: Arc<rustls::crypto::CryptoProvider>,
     ) -> Self {
         let ck = self_signed();
-        let cert = CertificateDer::from(ck.cert.der().to_owned());
+        let cert = ck.cert.der().to_owned();
         let key = PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
 
         let server_cfg_small =
@@ -196,7 +196,7 @@ impl ProviderCtx {
         let port_large = spawn_tls_server(server_cfg_large, vec![b'x'; 1024 * 1024]);
 
         let client_cfg = make_client_cfg(client_p, cert);
-        ProviderCtx {
+        Self {
             port_small,
             port_large,
             client_cfg,
@@ -211,18 +211,22 @@ impl ProviderCtx {
 macro_rules! provider_benches {
     ($mod_name:ident, $ctx_fn:ident) => {
         mod $mod_name {
-            use std::sync::OnceLock;
-            use divan::black_box;
             use super::{ProviderCtx, do_request, tls_connect};
+            use divan::black_box;
+            use std::sync::OnceLock;
 
             static CTX: OnceLock<ProviderCtx> = OnceLock::new();
-            fn ctx() -> &'static ProviderCtx { CTX.get_or_init(super::$ctx_fn) }
+            fn ctx() -> &'static ProviderCtx {
+                CTX.get_or_init(super::$ctx_fn)
+            }
 
             // ── handshake ─────────────────────────────────────────────────────
             // Full TCP connect + TLS handshake + one tiny GET per iter.
             #[divan::bench(skip_ext_time, sample_count = 100)]
             fn handshake(bencher: divan::Bencher) {
-                if !super::network_enabled() { return; }
+                if !super::network_enabled() {
+                    return;
+                }
                 let c = ctx();
                 bencher.bench_local(|| {
                     let mut s = tls_connect(black_box(c.port_small), &c.client_cfg);
@@ -235,7 +239,9 @@ macro_rules! provider_benches {
             // Isolates record-layer + HTTP framing overhead.
             #[divan::bench(skip_ext_time, sample_count = 500)]
             fn roundtrip(bencher: divan::Bencher) {
-                if !super::network_enabled() { return; }
+                if !super::network_enabled() {
+                    return;
+                }
                 let c = ctx();
                 let mut s = tls_connect(c.port_small, &c.client_cfg);
                 bencher.bench_local(|| {
@@ -248,7 +254,9 @@ macro_rules! provider_benches {
             // Exercises AES-GCM / ChaCha20 decryption throughput.
             #[divan::bench(skip_ext_time, sample_count = 50)]
             fn throughput(bencher: divan::Bencher) {
-                if !super::network_enabled() { return; }
+                if !super::network_enabled() {
+                    return;
+                }
                 let c = ctx();
                 let mut s = tls_connect(c.port_large, &c.client_cfg);
                 bencher.bench_local(|| {
@@ -262,7 +270,9 @@ macro_rules! provider_benches {
             // Reflects real keep-alive API usage.
             #[divan::bench(skip_ext_time, sample_count = 20)]
             fn sequential_burst(bencher: divan::Bencher) {
-                if !super::network_enabled() { return; }
+                if !super::network_enabled() {
+                    return;
+                }
                 let c = ctx();
                 let mut s = tls_connect(c.port_small, &c.client_cfg);
                 bencher.bench_local(|| {
@@ -277,20 +287,26 @@ macro_rules! provider_benches {
             // 100 sequential GETs.  Measures provider under thread contention.
             #[divan::bench(skip_ext_time, sample_count = 10)]
             fn concurrent(bencher: divan::Bencher) {
-                if !super::network_enabled() { return; }
+                if !super::network_enabled() {
+                    return;
+                }
                 let c = ctx();
                 bencher.bench_local(|| {
-                    let handles: Vec<_> = (0..8).map(|_| {
-                        let port = c.port_small;
-                        let cfg = std::sync::Arc::clone(&c.client_cfg);
-                        std::thread::spawn(move || {
-                            let mut s = tls_connect(port, &cfg);
-                            for _ in 0..100 {
-                                do_request(&mut s).unwrap();
-                            }
+                    let handles: Vec<_> = (0..8)
+                        .map(|_| {
+                            let port = c.port_small;
+                            let cfg = std::sync::Arc::clone(&c.client_cfg);
+                            std::thread::spawn(move || {
+                                let mut s = tls_connect(port, &cfg);
+                                for _ in 0..100 {
+                                    do_request(&mut s).unwrap();
+                                }
+                            })
                         })
-                    }).collect();
-                    for h in handles { h.join().unwrap(); }
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
                 });
             }
         }
@@ -327,13 +343,13 @@ provider_benches!(rustcrypto, rustcrypto_ctx);
 
 #[cfg(test)]
 #[allow(dead_code)]
-/// Build a (server_cfg, client_cfg) pair that TRUST each other.
+/// Build a (`server_cfg`, `client_cfg`) pair that TRUST each other.
 fn trusted_pair(
     server_p: Arc<rustls::crypto::CryptoProvider>,
     client_p: Arc<rustls::crypto::CryptoProvider>,
 ) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let ck = self_signed();
-    let cert = CertificateDer::from(ck.cert.der().to_owned());
+    let cert = ck.cert.der().to_owned();
     let key = PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
     let scfg = make_server_cfg(server_p, cert.clone(), key);
     let ccfg = make_client_cfg(client_p, cert);
@@ -342,12 +358,10 @@ fn trusted_pair(
 
 #[cfg(test)]
 #[allow(dead_code)]
-/// Build a server_cfg from a cert that the client will NOT trust.
-fn untrusted_server_cfg(
-    server_p: Arc<rustls::crypto::CryptoProvider>,
-) -> Arc<ServerConfig> {
+/// Build a `server_cfg` from a cert that the client will NOT trust.
+fn untrusted_server_cfg(server_p: Arc<rustls::crypto::CryptoProvider>) -> Arc<ServerConfig> {
     let ck = self_signed();
-    let cert = CertificateDer::from(ck.cert.der().to_owned());
+    let cert = ck.cert.der().to_owned();
     let key = PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
     make_server_cfg(server_p, cert, key)
 }
@@ -370,7 +384,7 @@ fn try_connect_sni(
     tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
     tls.flush()?;
     let mut buf = [0u8; 64];
-    tls.read(&mut buf)?;
+    tls.read_exact(&mut buf)?;
     Ok(())
 }
 
@@ -379,17 +393,17 @@ macro_rules! adversarial_tests {
         #[cfg(test)]
         mod $mod_name {
             #![allow(unused_imports)]
+            use super::{
+                make_client_cfg, make_server_cfg, self_signed, spawn_tls_server, tls_connect,
+                trusted_pair, try_connect_sni, untrusted_server_cfg,
+            };
+            use rustls::pki_types::ServerName;
+            use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+            use rustls::{ClientConnection, StreamOwned};
             use std::io::{Read, Write};
             use std::net::{TcpListener, TcpStream};
             use std::sync::Arc;
             use std::time::Duration;
-            use rustls::pki_types::ServerName;
-            use rustls::{ClientConnection, StreamOwned};
-            use super::{
-                make_client_cfg, make_server_cfg, self_signed, spawn_tls_server,
-                tls_connect, try_connect_sni, trusted_pair, untrusted_server_cfg,
-            };
-            use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
             // ── 1. Cert not in trust store → client must reject ───────────────
             #[test]
@@ -460,7 +474,10 @@ macro_rules! adversarial_tests {
                 let result = stream.read_to_end(&mut body);
                 // Either read returns Err, or we read 0 bytes (clean close mid-body)
                 let is_incomplete = result.is_err() || body.len() < 1000;
-                assert!(is_incomplete, "expected error or truncated body on abrupt close");
+                assert!(
+                    is_incomplete,
+                    "expected error or truncated body on abrupt close"
+                );
             }
 
             // ── 4. Garbage bytes from server → TLS alert ─────────────────────
@@ -478,7 +495,7 @@ macro_rules! adversarial_tests {
 
                 let client_p = Arc::new($client_p);
                 let ck = self_signed();
-                let cert = CertificateDer::from(ck.cert.der().to_owned());
+                let cert = ck.cert.der().to_owned();
                 let client_cfg = make_client_cfg(client_p, cert);
 
                 let result = try_connect_sni(port, &client_cfg, "localhost");
@@ -559,7 +576,8 @@ macro_rules! adversarial_tests {
                 // Client connects and sends its ClientHello, then we close it.
                 let capture_result = std::thread::spawn(move || {
                     let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
-                    tcp.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                    tcp.set_read_timeout(Some(Duration::from_millis(200)))
+                        .unwrap();
                     let name = ServerName::try_from("localhost").unwrap();
                     let conn = ClientConnection::new(client_cfg, name).unwrap();
                     let mut tls = StreamOwned::new(conn, tcp);
@@ -572,7 +590,10 @@ macro_rules! adversarial_tests {
                 drop(capture_result);
 
                 let client_hello_bytes = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                assert!(!client_hello_bytes.is_empty(), "captured no ClientHello bytes");
+                assert!(
+                    !client_hello_bytes.is_empty(),
+                    "captured no ClientHello bytes"
+                );
 
                 // ── Second: replay those bytes to a fresh server connection ────
                 let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();

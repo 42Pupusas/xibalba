@@ -10,8 +10,8 @@ use xibalba_proto::version::Version;
 /// This deliberately does *not* limit a response head: [`HeadData`] owns a
 /// dynamically sized copy of the complete parsed head. Modern API gateways
 /// can legitimately add enough tracing and rate-limit metadata to exceed one
-/// read buffer, while [`Config::max_head_size`](crate::client::Config) remains
-/// the explicit memory and abuse limit.
+/// read buffer. The `Client` const generic is the explicit memory and abuse
+/// limit for response heads.
 pub const HEAD_BUF_SIZE: usize = 8192;
 pub use xibalba_proto::response::MAX_HEADERS;
 

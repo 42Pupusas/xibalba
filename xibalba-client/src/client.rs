@@ -17,10 +17,17 @@ use crate::connector::Connector;
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
+/// Default maximum response-head size in bytes.
+///
+/// API gateways commonly attach tracing, rate-limit, and routing metadata.
+/// 64 KiB accepts those normal responses while retaining a bounded default.
+/// Select another compile-time limit with `Client<C, MAX_HEAD_SIZE>` or
+/// `AsyncClient<MAX_HEAD_SIZE>` when an integration has different needs.
+pub const DEFAULT_MAX_HEAD_SIZE: usize = 64 * 1024;
+
 pub struct Config {
     pub read_timeout: Option<Duration>,
     pub max_response_body: usize,
-    pub max_head_size: usize,
     pub max_redirects: u8,
 }
 
@@ -29,11 +36,6 @@ impl Default for Config {
         Self {
             read_timeout: Some(Duration::from_secs(30)),
             max_response_body: 10 * 1024 * 1024,
-            // API gateways commonly attach tracing, rate-limit, and routing
-            // metadata. 16 KiB rejects valid streamed responses from those
-            // gateways; 64 KiB remains bounded and fits HeaderRange's u16
-            // offsets exactly.
-            max_head_size: 64 * 1024,
             max_redirects: 10,
         }
     }
@@ -169,7 +171,10 @@ impl<'a> RequestBuilder<'a> {
     /// # Errors
     ///
     /// Returns `Error` on serialization or connection failure.
-    pub fn send<C: Connector>(self, client: &mut Client<C>) -> Result<Response, Error> {
+    pub fn send<C: Connector, const MAX_HEAD_SIZE: usize>(
+        self,
+        client: &mut Client<C, MAX_HEAD_SIZE>,
+    ) -> Result<Response, Error> {
         client.execute(&self.into_params())
     }
 
@@ -195,7 +200,7 @@ impl<'a> RequestBuilder<'a> {
 
 // ── Client ───────────────────────────────────────────────────────────────────
 
-pub struct Client<C: Connector> {
+pub struct Client<C: Connector, const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SIZE> {
     tls_config: C::TlsConfig,
     pub(crate) stream: C::Stream,
     pub(crate) config: Config,
@@ -210,7 +215,7 @@ pub struct Client<C: Connector> {
     pub(crate) dirty: bool,
 }
 
-impl<C: Connector> Client<C> {
+impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// # Errors
     ///
     /// Returns `Error` on connection failure.
@@ -262,7 +267,7 @@ impl<C: Connector> Client<C> {
     }
 
     /// Execute a fully-buffered request built with [`Client::build`].
-    /// Follows redirects up to `Config::max_redirects`.
+    /// Follows redirects up to the configured `max_redirects` value.
     ///
     /// # Errors
     ///
@@ -482,11 +487,7 @@ impl<C: Connector> Client<C> {
         }
         self.stream.flush()?;
 
-        let head = read_response_head(
-            &mut self.stream,
-            &mut self.head_buf,
-            self.config.max_head_size,
-        );
+        let head = read_response_head(&mut self.stream, &mut self.head_buf, MAX_HEAD_SIZE);
         match head {
             Ok(parts) => Ok(parts),
             Err(error) => {

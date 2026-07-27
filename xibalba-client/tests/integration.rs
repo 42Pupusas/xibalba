@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use xibalba_client::async_client::{AsyncClient, Chunk};
 use xibalba_client::client::{Client, Config};
+
+const SMALL_HEAD_SIZE: usize = 256;
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_client::proto::error::{ConnectionError, Error};
 use xibalba_client::proto::method::Method;
@@ -88,6 +90,14 @@ fn connect(port: u16) -> Client<PlainConnector> {
 fn connect_with_config(port: u16, config: Config) -> Client<PlainConnector> {
     let url = format!("http://127.0.0.1:{port}/");
     Client::<PlainConnector>::connect(url.as_bytes(), (), config).unwrap()
+}
+
+fn connect_with_small_head_limit(
+    port: u16,
+    config: Config,
+) -> Client<PlainConnector, SMALL_HEAD_SIZE> {
+    let url = format!("http://127.0.0.1:{port}/");
+    Client::<PlainConnector, SMALL_HEAD_SIZE>::connect(url.as_bytes(), (), config).unwrap()
 }
 
 fn connect_async(port: u16) -> AsyncClient {
@@ -1350,11 +1360,7 @@ fn head_at_limit_with_body_tail_is_accepted() {
         stream.write_all(b"ok").unwrap();
     });
 
-    let config = Config {
-        max_head_size: 256,
-        ..Config::default()
-    };
-    let mut client = connect_with_config(port, config);
+    let mut client = connect_with_small_head_limit(port, Config::default());
     assert_eq!(client.get(b"/at-limit").unwrap().text().unwrap(), "ok");
 
     server.join().unwrap();
@@ -1386,11 +1392,7 @@ fn oversized_head_forces_reconnect_before_next_request() {
             .unwrap();
     });
 
-    let config = Config {
-        max_head_size: 256,
-        ..Config::default()
-    };
-    let mut client = connect_with_config(port, config);
+    let mut client = connect_with_small_head_limit(port, Config::default());
     assert_eq!(
         client.get(b"/too-large").unwrap_err(),
         Error::Connection(ConnectionError::HeadTooLarge)
@@ -1410,7 +1412,7 @@ fn async_oversized_head_forces_reconnect_before_next_request() {
         let (mut first, _) = listener.accept().unwrap();
         read_request(&mut first);
         first.write_all(b"HTTP/1.1 200 OK\r\nX-Huge: ").unwrap();
-        first.write_all(&vec![b'A'; 70 * 1024]).unwrap();
+        first.write_all(&vec![b'A'; 2_000]).unwrap();
         first
             .write_all(b"\r\nContent-Length: 5\r\n\r\nstale")
             .unwrap();
@@ -1423,7 +1425,15 @@ fn async_oversized_head_forces_reconnect_before_next_request() {
             .unwrap();
     });
 
-    let client = connect_async(port);
+    // The async facade carries the same const generic into its reader-owned
+    // Client, so deployments can pick a tighter bound without runtime state.
+    let url = format!("http://127.0.0.1:{port}/");
+    let client = AsyncClient::<SMALL_HEAD_SIZE>::connect::<PlainConnector>(
+        url.as_bytes(),
+        (),
+        Config::default(),
+    )
+    .unwrap();
     let mut rejected = client
         .submit(Method::Get, b"/too-large".to_vec(), None, None, vec![])
         .unwrap();
@@ -1460,11 +1470,7 @@ fn head_too_large_rejected() {
         stream.write_all(b"\r\nContent-Length: 0\r\n\r\n").unwrap();
     });
 
-    let config = Config {
-        max_head_size: 256,
-        ..Config::default()
-    };
-    let mut client = connect_with_config(port, config);
+    let mut client = connect_with_small_head_limit(port, Config::default());
     let result = client.get(b"/huge-head");
     assert_eq!(
         result.unwrap_err(),

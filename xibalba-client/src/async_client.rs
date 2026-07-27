@@ -55,7 +55,7 @@ use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 
 use crate::body::{HEAD_BUF_SIZE, StreamingBody};
-use crate::client::{Client, Config};
+use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 
 /// Default capacity for the per-request chunk ring: a few SSE
 /// events worth of buffering. The ring parks the caller on full
@@ -189,7 +189,7 @@ impl StreamHandle {
 
 /// The background-reader client. Owns the reader thread directly;
 /// `Drop` closes the control ring and joins the thread.
-pub struct AsyncClient {
+pub struct AsyncClient<const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SIZE> {
     /// Wrapped in `Option` so `Drop` can take it out and close the
     /// control ring *before* joining the reader thread. The
     /// reader parks in `pop_block` on the consumer; with the
@@ -201,7 +201,7 @@ pub struct AsyncClient {
     join: Option<JoinHandle<()>>,
 }
 
-impl AsyncClient {
+impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
     fn control(&self) -> Result<&MpscProducer<Control>, Error> {
         self.control_tx
             .as_ref()
@@ -221,7 +221,7 @@ impl AsyncClient {
         C::Stream: Send + 'static,
         C::TlsConfig: Send + 'static,
     {
-        let client = Client::<C>::connect(url, tls_config, config)?;
+        let client = Client::<C, MAX_HEAD_SIZE>::connect(url, tls_config, config)?;
 
         let (control_tx, control_rx) =
             mpsc::RingBuffer::<Control>::new(Capacity::at_least(CONTROL_RING_CAP)).split();
@@ -229,7 +229,7 @@ impl AsyncClient {
         let join = thread::Builder::new()
             .name("xibalba-reader".to_owned())
             .spawn(move || {
-                run_reader::<C>(client, control_rx);
+                run_reader(client, control_rx);
             })
             .map_err(|e| {
                 Error::Connection(ConnectionError::Other(format!(
@@ -295,7 +295,7 @@ impl AsyncClient {
     }
 }
 
-impl Drop for AsyncClient {
+impl<const MAX_HEAD_SIZE: usize> Drop for AsyncClient<MAX_HEAD_SIZE> {
     fn drop(&mut self) {
         // Close the control ring first. The reader's `pop_block`
         // observes the closed producer and returns `None`,
@@ -313,7 +313,7 @@ impl Drop for AsyncClient {
     }
 }
 
-impl std::fmt::Debug for AsyncClient {
+impl<const MAX_HEAD_SIZE: usize> std::fmt::Debug for AsyncClient<MAX_HEAD_SIZE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncClient").finish_non_exhaustive()
     }
@@ -322,8 +322,10 @@ impl std::fmt::Debug for AsyncClient {
 /// The reader thread's main loop: pop a control message, process
 /// requests, honor cancels. Errors and aborts are delivered as
 /// terminator chunks.
-fn run_reader<C>(mut client: Client<C>, mut control_rx: MpscConsumer<Control>)
-where
+fn run_reader<C, const MAX_HEAD_SIZE: usize>(
+    mut client: Client<C, MAX_HEAD_SIZE>,
+    mut control_rx: MpscConsumer<Control>,
+) where
     C: crate::connector::Connector,
 {
     // Requests popped off the control ring while polling for a cancel
@@ -368,8 +370,8 @@ fn poll_control(
     }
 }
 
-fn process_request<C>(
-    client: &mut Client<C>,
+fn process_request<C, const MAX_HEAD_SIZE: usize>(
+    client: &mut Client<C, MAX_HEAD_SIZE>,
     request: AsyncRequest,
     control_rx: &mut MpscConsumer<Control>,
     pending: &mut VecDeque<AsyncRequest>,

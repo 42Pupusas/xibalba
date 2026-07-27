@@ -4,7 +4,7 @@
 //! failures are attributed per-provider.
 //!
 //! Run:
-//!   cargo test --test tls_adversarial -p xibalba-benches -- --test-threads=4
+//!   cargo test --test `tls_adversarial` -p xibalba-benches -- --test-threads=4
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -63,7 +63,7 @@ fn trusted_pair(
     client_p: Arc<rustls::crypto::CryptoProvider>,
 ) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let ck = self_signed();
-    let cert = CertificateDer::from(ck.cert.der().to_owned());
+    let cert = ck.cert.der().to_owned();
     let key = PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
     let scfg = make_server_cfg(server_p, cert.clone(), key);
     let ccfg = make_client_cfg(client_p, cert);
@@ -115,7 +115,7 @@ fn try_connect_sni(
     tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
     tls.flush()?;
     let mut buf = [0u8; 64];
-    tls.read(&mut buf)?;
+    tls.read_exact(&mut buf)?;
     Ok(())
 }
 
@@ -126,6 +126,7 @@ fn try_connect_sni(
 macro_rules! adversarial_suite {
     ($mod_name:ident, $server_p:expr, $client_p:expr) => {
         mod $mod_name {
+            #[allow(unused_imports)]
             use super::*;
 
             #[test]
@@ -168,13 +169,14 @@ macro_rules! adversarial_suite {
                     let mut tls = StreamOwned::new(conn, tcp);
                     let mut buf = [0u8; 256];
                     let _ = tls.read(&mut buf);
-                    let _ = tls.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\npartial",
-                    );
+                    let _ =
+                        tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\npartial");
                     drop(tls);
                 });
                 let mut stream = tls_connect(port, &client_cfg);
-                stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .unwrap();
                 stream.flush().unwrap();
                 let mut body = Vec::new();
                 let result = stream.read_to_end(&mut body);
@@ -190,12 +192,11 @@ macro_rules! adversarial_suite {
                 let port = listener.local_addr().unwrap().port();
                 std::thread::spawn(move || {
                     let (mut tcp, _) = listener.accept().unwrap();
-                    let _ = tcp
-                        .write_all(b"\xDE\xAD\xBE\xEF this is NOT a TLS server hello !!!");
+                    let _ = tcp.write_all(b"\xDE\xAD\xBE\xEF this is NOT a TLS server hello !!!");
                 });
                 let client_p = Arc::new($client_p);
                 let ck = super::self_signed();
-                let cert = CertificateDer::from(ck.cert.der().to_owned());
+                let cert = ck.cert.der().to_owned();
                 let client_cfg = make_client_cfg(client_p, cert);
                 let result = try_connect_sni(port, &client_cfg, "localhost");
                 assert!(result.is_err(), "client must reject garbage server hello");
@@ -219,7 +220,9 @@ macro_rules! adversarial_suite {
                     let _ = raw.write_all(&[0x17, 0x03, 0x03, 0x80, 0x00]);
                 });
                 let mut stream = tls_connect(port, &client_cfg);
-                stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .unwrap();
                 stream.flush().unwrap();
                 let mut buf = vec![0u8; 4096];
                 let result = stream.read(&mut buf);
@@ -245,7 +248,8 @@ macro_rules! adversarial_suite {
                 });
                 std::thread::spawn(move || {
                     let tcp = TcpStream::connect(("127.0.0.1", port1)).unwrap();
-                    tcp.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+                    tcp.set_read_timeout(Some(Duration::from_millis(150)))
+                        .unwrap();
                     let name = ServerName::try_from("localhost").unwrap();
                     let conn = ClientConnection::new(client_cfg, name).unwrap();
                     let mut tls = StreamOwned::new(conn, tcp);
@@ -279,8 +283,7 @@ macro_rules! adversarial_suite {
                 .join()
                 .unwrap();
 
-                let server_succeeded =
-                    rx2.recv_timeout(Duration::from_secs(3)).unwrap_or(false);
+                let server_succeeded = rx2.recv_timeout(Duration::from_secs(3)).unwrap_or(false);
                 assert!(
                     !server_succeeded,
                     "server must not complete handshake from replayed ClientHello alone"
@@ -306,4 +309,4 @@ adversarial_suite!(
     rustls_rustcrypto::provider()
 );
 
-fn main() {}
+const fn main() {}
