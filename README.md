@@ -13,11 +13,15 @@ A minimal HTTP/1.1 client for Rust with a streaming body reader and zero-copy pa
 ## Usage
 
 ```rust
-use xibalba::client::Client;
+use xibalba_client::client::Client;
+// Supply the connector for the transport/TLS stack your application uses.
+use my_connector::Connector;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::new()?;
-    let mut response = client.get(b"https://example.com/")?;
+fn main() -> Result<(), xibalba_client::proto::error::Error> {
+    let mut client = Client::<Connector>::connect_default(
+        b"https://example.com/", Connector::tls_config()?
+    )?;
+    let response = client.get(b"/")?;
 
     println!("Status: {}", response.status);
     println!("Body: {}", response.text()?);
@@ -49,32 +53,42 @@ loop {
 }
 ```
 
-## TLS crypto backend
+## Transport and TLS
 
-By default xibalba uses [ring](https://github.com/briansmith/ring). To use
-[aws-lc-rs](https://github.com/aws/aws-lc-rs) instead, disable default features
-and enable the `aws-lc-rs` feature:
+`xibalba-client` is transport-agnostic. Implement its `Connector` trait for the
+TCP/TLS stack your application already uses; the included
+[`tcp-rustls` example](examples/tcp-rustls) shows a complete rustls connector.
+Keeping TLS out of the core crate lets applications choose certificate roots,
+crypto providers, proxy behavior, and their runtime without pulling an unused
+TLS stack into every consumer.
 
-```toml
-[dependencies]
-xibalba = { version = "0.1", default-features = false, features = ["aws-lc-rs"] }
+## Response-head limits
+
+`Client` and `AsyncClient` bound a response status line plus headers at 64 KiB
+by default. API gateways often add tracing and rate-limit headers, so the
+limit is intentionally larger than the read buffer. Set an integration-specific
+compile-time bound with the const generic when needed:
+
+```rust
+use xibalba_client::client::Client;
+
+// Reject response heads larger than 128 KiB for this client type.
+type ApiClient<C> = Client<C, { 128 * 1024 }>;
 ```
 
 ## Architecture
 
 | Module | Responsibility |
 |--------|---------------|
-| `client` | `Client` and `Response` — top-level API |
-| `connection` | TCP + TLS connection setup |
-| `stream` | `Read`/`Write`/`SetReadTimeout` abstraction over plain/TLS streams |
-| `body` | Streaming `BodyReader` backed by a lock-free ring buffer |
-| `response` | Response head parser, body framing detection, chunked decoder state machine |
-| `request` | Request serialiser |
-| `url` | Zero-copy URL parser |
-| `header` | Header name enum, parsing utilities |
-| `error` | Typed error hierarchy |
+| `xibalba-proto` | Zero-copy URL/head parsing, request serialization, and body framing |
+| `xibalba-client::client` | Synchronous connection reuse, redirects, and streaming bodies |
+| `xibalba-client::async_client` | Background-reader API for cancellable streaming responses |
+| `xibalba-client::connector` | Application-owned TCP/TLS connector boundary |
+| `xibalba-iouring` | Experimental io_uring-backed HTTP/1.1 connection pool |
 
-The reader runs on a background thread and pushes raw bytes into an SPSC ring
-buffer ([quetzalcoatl](../quetzalcoatl)). The main thread parses the response
-head from that buffer, then hands the consumer side to `BodyReader` for
-incremental body reads.
+The synchronous client reads directly from the caller-supplied connector. The
+async client owns the same synchronous client on one reader thread and delivers
+response head/body chunks over `quetzalcoatl` rings. A streaming response that
+is cancelled or fails while reading is deliberately discarded: the next request
+reconnects rather than parsing unread bytes from the failed response as a new
+one.
