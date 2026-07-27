@@ -1132,7 +1132,10 @@ fn streaming_chunked_need_more_is_not_eof() {
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
 
-    assert!(matches!(handle.next_block(), Some(Chunk::Head { status: 200, .. })));
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
 
     let mut chunks = Vec::new();
     while let Some(chunk) = handle.next_block() {
@@ -1191,7 +1194,10 @@ fn streaming_chunked_many_short_chunks_with_gaps() {
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
 
-    assert!(matches!(handle.next_block(), Some(Chunk::Head { status: 200, .. })));
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
 
     let mut body = String::new();
     while let Some(chunk) = handle.next_block() {
@@ -1245,7 +1251,10 @@ fn streaming_chunked_single_byte_chunks() {
     let mut handle = client
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
-    assert!(matches!(handle.next_block(), Some(Chunk::Head { status: 200, .. })));
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
 
     let mut got = Vec::new();
     while let Some(chunk) = handle.next_block() {
@@ -1286,6 +1295,156 @@ fn body_too_large_rejected() {
         Error::Connection(ConnectionError::BodyTooLarge)
     );
     drop(server);
+}
+
+#[test]
+fn default_limit_accepts_large_api_response_head() {
+    // Gateways can add substantial tracing and rate-limit metadata. The
+    // default must accept a normal 32 KiB response head, and the complete
+    // header must remain available after parsing rather than being truncated
+    // to the socket read buffer.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nX-Gateway-Metadata: ")
+            .unwrap();
+        stream.write_all(&vec![b'M'; 32 * 1024]).unwrap();
+        stream
+            .write_all(b"\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+    });
+
+    let mut client = connect(port);
+    let response = client.get(b"/large-head").unwrap();
+    let metadata = response
+        .headers()
+        .find(|(name, _)| *name == b"X-Gateway-Metadata")
+        .map(|(_, value)| value)
+        .expect("large gateway header must be preserved");
+    assert_eq!(metadata.len(), 32 * 1024);
+    assert!(metadata.iter().all(|&byte| byte == b'M'));
+    assert_eq!(response.text().unwrap(), "ok");
+
+    server.join().unwrap();
+}
+
+#[test]
+fn head_at_limit_with_body_tail_is_accepted() {
+    // The read that finds `\r\n\r\n` often includes body bytes too. Count
+    // only the head toward max_head; rejecting the combined read would make a
+    // correctly sized gateway response fail depending on packet boundaries.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        let prefix = b"HTTP/1.1 200 OK\r\nX-Fill: ";
+        let suffix = b"\r\nContent-Length: 2\r\n\r\n";
+        let fill_len = 256 - prefix.len() - suffix.len();
+        stream.write_all(prefix).unwrap();
+        stream.write_all(&vec![b'F'; fill_len]).unwrap();
+        stream.write_all(suffix).unwrap();
+        stream.write_all(b"ok").unwrap();
+    });
+
+    let config = Config {
+        max_head_size: 256,
+        ..Config::default()
+    };
+    let mut client = connect_with_config(port, config);
+    assert_eq!(client.get(b"/at-limit").unwrap().text().unwrap(), "ok");
+
+    server.join().unwrap();
+}
+
+#[test]
+fn oversized_head_forces_reconnect_before_next_request() {
+    // Reading enough bytes to reject a head leaves an indeterminate suffix on
+    // the socket. The following request must use a new connection, not parse
+    // that suffix as a response head.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        read_request(&mut first);
+        first.write_all(b"HTTP/1.1 200 OK\r\nX-Huge: ").unwrap();
+        first.write_all(&[b'A'; 2_000]).unwrap();
+        first
+            .write_all(b"\r\nContent-Length: 5\r\n\r\nstale")
+            .unwrap();
+        first.flush().unwrap();
+
+        // The client deliberately abandons `first`; a clean retry arrives on
+        // a separate socket and gets an unrelated valid answer.
+        let (mut second, _) = listener.accept().unwrap();
+        read_request(&mut second);
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+    });
+
+    let config = Config {
+        max_head_size: 256,
+        ..Config::default()
+    };
+    let mut client = connect_with_config(port, config);
+    assert_eq!(
+        client.get(b"/too-large").unwrap_err(),
+        Error::Connection(ConnectionError::HeadTooLarge)
+    );
+    assert_eq!(client.get(b"/retry").unwrap().text().unwrap(), "fresh");
+
+    server.join().unwrap();
+}
+
+#[test]
+fn async_oversized_head_forces_reconnect_before_next_request() {
+    // The agent uses AsyncClient. Its reader must carry the dirty marker from
+    // a rejected head into the next queued request just like Client does.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        read_request(&mut first);
+        first.write_all(b"HTTP/1.1 200 OK\r\nX-Huge: ").unwrap();
+        first.write_all(&vec![b'A'; 70 * 1024]).unwrap();
+        first
+            .write_all(b"\r\nContent-Length: 5\r\n\r\nstale")
+            .unwrap();
+        first.flush().unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        read_request(&mut second);
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+    });
+
+    let client = connect_async(port);
+    let mut rejected = client
+        .submit(Method::Get, b"/too-large".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        rejected.next_block(),
+        Some(Chunk::Error(error))
+            if *error == Error::Connection(ConnectionError::HeadTooLarge)
+    ));
+    drop(rejected);
+
+    let mut retry = client
+        .submit(Method::Get, b"/retry".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        retry.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(retry.next_block(), Some(Chunk::Body(b"fresh".to_vec())));
+    assert_eq!(retry.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
 }
 
 #[test]

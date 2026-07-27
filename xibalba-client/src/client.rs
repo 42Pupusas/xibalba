@@ -29,7 +29,11 @@ impl Default for Config {
         Self {
             read_timeout: Some(Duration::from_secs(30)),
             max_response_body: 10 * 1024 * 1024,
-            max_head_size: 16 * 1024,
+            // API gateways commonly attach tracing, rate-limit, and routing
+            // metadata. 16 KiB rejects valid streamed responses from those
+            // gateways; 64 KiB remains bounded and fits HeaderRange's u16
+            // offsets exactly.
+            max_head_size: 64 * 1024,
             max_redirects: 10,
         }
     }
@@ -373,6 +377,13 @@ impl<C: Connector> Client<C> {
         self.reconnect(&url)
     }
 
+    /// Mark the live connection unusable after a response head could not be
+    /// fully read. The next request must reconnect: unread header/body bytes
+    /// would otherwise be interpreted as a new status line.
+    const fn discard_partial_response(&mut self) {
+        self.dirty = true;
+    }
+
     /// Whether `err` is the signature of a server-closed idle keep-alive
     /// connection: a transport-level failure (TLS/TCP EOF, reset, broken
     /// pipe) or our own `ConnectionClosed`. Safe to retry only because
@@ -471,13 +482,22 @@ impl<C: Connector> Client<C> {
         }
         self.stream.flush()?;
 
-        let (head_data, framing, tail_offset) = read_response_head(
+        let head = read_response_head(
             &mut self.stream,
             &mut self.head_buf,
             self.config.max_head_size,
-        )?;
-
-        Ok((head_data, framing, tail_offset))
+        );
+        match head {
+            Ok(parts) => Ok(parts),
+            Err(error) => {
+                // The parser may have consumed a prefix of this response even
+                // though it rejected the head (notably HeadTooLarge). Never
+                // reuse that socket: a later request would see the response
+                // remainder as its own head and corrupt the session.
+                self.discard_partial_response();
+                Err(error)
+            }
+        }
     }
 
     fn send_one(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {

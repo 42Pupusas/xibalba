@@ -5,6 +5,13 @@ use xibalba_proto::response::HeaderRange;
 use xibalba_proto::status::StatusCode;
 use xibalba_proto::version::Version;
 
+/// Size of each socket read and body-decoding scratch buffer.
+///
+/// This deliberately does *not* limit a response head: [`HeadData`] owns a
+/// dynamically sized copy of the complete parsed head. Modern API gateways
+/// can legitimately add enough tracing and rate-limit metadata to exceed one
+/// read buffer, while [`Config::max_head_size`](crate::client::Config) remains
+/// the explicit memory and abuse limit.
 pub const HEAD_BUF_SIZE: usize = 8192;
 pub use xibalba_proto::response::MAX_HEADERS;
 
@@ -12,15 +19,17 @@ pub use xibalba_proto::response::MAX_HEADERS;
 pub struct HeadData {
     pub version: Version,
     pub status: StatusCode,
-    pub head_buf: [u8; HEAD_BUF_SIZE],
-    pub head_len: usize,
+    /// Exactly the status line and headers, excluding any body bytes read in
+    /// the same socket operation. A `Vec` keeps header ranges valid for every
+    /// configured head size instead of silently truncating them at one read.
+    pub head_buf: Vec<u8>,
     pub ranges: [HeaderRange; MAX_HEADERS],
     pub header_count: usize,
 }
 
 impl HeadData {
     pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        let buf = &self.head_buf[..self.head_len];
+        let buf = &self.head_buf;
         self.ranges[..self.header_count]
             .iter()
             .filter_map(move |r| {
@@ -397,28 +406,40 @@ pub(crate) fn read_response_head<S: Read>(
             return Err(ConnectionError::ConnectionClosed.into());
         }
         head_acc.extend_from_slice(&raw[..n]);
+        // A socket read can contain both the final header bytes and the body
+        // prefix. Find the delimiter before applying the limit so a valid
+        // `max_head`-sized head is not rejected merely because its first body
+        // bytes arrived in the same read.
+        if let Some(pos) = head_acc.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head_end = pos + 4;
+            if head_end > max_head {
+                return Err(ConnectionError::HeadTooLarge.into());
+            }
+            break head_end;
+        }
         if head_acc.len() > max_head {
             return Err(ConnectionError::HeadTooLarge.into());
-        }
-        if let Some(pos) = head_acc.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
         }
     };
 
     let mut hdr_buf = [const { Header::empty() }; MAX_HEADERS];
     let (head, consumed) = ResponseHead::parse(&head_acc[..head_end], &mut hdr_buf)?;
 
-    let copy_len = head_end.min(HEAD_BUF_SIZE);
-    let ranges = HeaderRange::build_ranges(&hdr_buf[..head.header_count], &head_acc[..copy_len])?;
-    let mut head_data = HeadData {
+    // Derive ranges while headers still borrow `head_acc`, then preserve the
+    // complete head for the response. This keeps duplicate header names or
+    // values positional rather than re-searching their byte patterns in a
+    // copy. `HeaderRange` offsets are `u16`, so the 64 KiB default is the
+    // largest useful standard limit; a custom larger head fails safely if an
+    // offset cannot be represented.
+    let ranges = HeaderRange::build_ranges(&hdr_buf[..head.header_count], &head_acc[..head_end])?;
+    let head_bytes = head_acc[..head_end].to_vec();
+    let head_data = HeadData {
         version: head.version,
         status: head.status,
-        head_buf: [0u8; HEAD_BUF_SIZE],
-        head_len: head_end,
+        head_buf: head_bytes,
         ranges,
         header_count: head.header_count,
     };
-    head_data.head_buf[..copy_len].copy_from_slice(&head_acc[..copy_len]);
 
     let framing = BodyFraming::from_response(
         head.status,
