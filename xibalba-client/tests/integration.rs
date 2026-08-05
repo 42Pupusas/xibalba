@@ -108,6 +108,153 @@ fn connect_async(port: u16) -> AsyncClient {
 // ── AsyncClient tests ────────────────────────────────────────────────────────
 
 #[test]
+fn async_silently_dead_stream_surfaces_error_and_recovers() {
+    // Regression test for the wedged-reader bug. A server that stops
+    // sending mid-SSE without closing the socket (NAT drop, silent
+    // middlebox reset) used to park the reader thread in an unbounded
+    // WouldBlock retry loop: the caller hung forever in pop_block, and
+    // every later request queued behind the dead read — the client
+    // could never be restarted. With the stall cap, the stream must
+    // yield Chunk::Error within a few read-timeout windows and the next
+    // request must be served on a fresh connection.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        // First connection: send head + one chunk, then go silent
+        // WITHOUT closing the socket. Hold it open until the test ends.
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+
+        // Second connection: serve the recovery request.
+        let (mut stream2, _) = listener.accept().unwrap();
+        read_request(&mut stream2);
+        stream2
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+        stream2.flush().unwrap();
+        // Only now let the first (dead) connection drop.
+        drop(stream);
+    });
+
+    // Short read timeout so the stall cap trips quickly.
+    let url = format!("http://127.0.0.1:{port}/");
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(50)),
+        ..Config::default()
+    };
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config).unwrap();
+
+    let mut handle = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle.next_block(), Some(Chunk::Body(b"first".to_vec())));
+
+    // The silent stall must surface as an error, not hang forever.
+    let start = std::time::Instant::now();
+    let chunk = handle.next_block();
+    assert!(
+        matches!(chunk, Some(Chunk::Error(_))),
+        "expected stall error, got {chunk:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "stall detection took too long: {:?}",
+        start.elapsed()
+    );
+
+    // The client must be restartable: the next request reconnects
+    // (dirty connection) and gets a clean, correct response.
+    let mut handle2 = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle2.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle2.next_block(), Some(Chunk::Body(b"fresh".to_vec())));
+    assert_eq!(handle2.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
+}
+
+#[test]
+fn async_dropped_handle_before_head_does_not_desync_next_request() {
+    // Regression test for the head-push desync bug. If the caller drops
+    // its StreamHandle before the reader delivers Chunk::Head (e.g. an
+    // application-level header timeout), the reader used to bail out
+    // with the response body still unread and the connection NOT marked
+    // dirty. The next request then reused the socket and parsed the
+    // previous response's leftover body as its own head — silently
+    // receiving the wrong response. The reader must mark the connection
+    // dirty the moment an unread body exists so the next request
+    // reconnects.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        // First connection: a complete buffered response the client
+        // will abandon before reading. Its bytes sit unread on the
+        // socket — exactly the stale prefix that used to be parsed as
+        // the next response's head.
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nstale")
+            .unwrap();
+        stream.flush().unwrap();
+
+        // Second connection: the follow-up request must land here.
+        let (mut stream2, _) = listener.accept().unwrap();
+        read_request(&mut stream2);
+        stream2
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+        stream2.flush().unwrap();
+        drop(stream);
+    });
+
+    let client = connect_async(port);
+
+    // Submit and immediately drop the handle — before the reader can
+    // push Chunk::Head. The push then fails and the reader bails with
+    // the body unread.
+    let handle = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    drop(handle);
+
+    // Give the reader time to hit the failed head push.
+    thread::sleep(Duration::from_millis(200));
+
+    // The follow-up must see the fresh response, not the stale body.
+    let mut handle2 = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle2.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(
+        handle2.next_block(),
+        Some(Chunk::Body(b"fresh".to_vec())),
+        "second response was corrupted by the abandoned response's leftovers"
+    );
+    assert_eq!(handle2.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
+}
+
+#[test]
 fn async_cancel_mid_stream_then_next_request_is_clean() {
     // Regression test for the mid-stream cancel corruption bug.
     // Cancelling (dropping) a StreamHandle before the response body is

@@ -63,6 +63,21 @@ use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 /// wakeup latency, not correctness.
 const CHUNK_RING_CAP: usize = 32;
 
+/// How many consecutive read timeouts (`WouldBlock`) the streaming
+/// body path tolerates before declaring the stream stalled.
+///
+/// A blocking socket with `SO_RCVTIMEO` returns `WouldBlock` when no
+/// data arrives within `read_timeout`; each retry re-arms the timer, so
+/// the total silence tolerated is `(MAX_STREAM_STALLED_READS + 1) ×
+/// read_timeout`. Without a cap, a peer that half-dies without sending
+/// FIN/RST (NAT drop, silent middlebox reset — the common failure mode
+/// for long-lived SSE streams) parks the reader thread in this retry
+/// loop forever: the caller hangs in `pop_block`, and every request
+/// submitted afterwards queues behind the wedged read, so the client
+/// can never be restarted. The sync path (`body::read_retry`) already
+/// bounds its retries; this is the streaming path's equivalent.
+const MAX_STREAM_STALLED_READS: u32 = 4;
+
 /// Default capacity for the control ring feeding the reader
 /// thread. One slot per in-flight request; the worker only ever
 /// has one model round in flight, so a handful of slots is plenty.
@@ -438,6 +453,16 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         .map(|(n, v)| (n.to_vec(), v.to_vec()))
         .collect();
 
+    // From this point on the response body sits unread on the socket.
+    // Mark the connection dirty *before* anything can bail out early
+    // (caller dropped the handle, body-read failure, …); each success
+    // path below clears it once the body really is consumed. Leaving
+    // this flag unset on any early return is a session-corruption bug:
+    // the next request would reuse the socket and parse this response's
+    // leftover body bytes as its own head, silently returning response
+    // N's data to request N+1.
+    client.dirty = true;
+
     if chunk_tx
         .push_block(Chunk::Head {
             status,
@@ -445,7 +470,9 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         })
         .is_err()
     {
-        // Caller dropped the handle; nothing to do.
+        // Caller dropped the handle; the unread body stays on the
+        // socket. `dirty` is already set, so the next request
+        // reconnects instead of desyncing.
         return;
     }
 
@@ -460,6 +487,9 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         );
         match body_result {
             Ok(bytes) => {
+                // Body fully consumed — the socket is positioned at the
+                // next response, so keep-alive reuse is safe again.
+                client.dirty = false;
                 if !bytes.is_empty() {
                     let _ = chunk_tx.push_block(Chunk::Body(bytes));
                 }
@@ -479,11 +509,10 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // cancel is observed on the next read attempt (bounded by the
     // client's `read_timeout`).
     //
-    // Mark the *client's* dirty flag so that cancelling/abandoning
-    // the stream leaves the connection in a state the next request
-    // will reconnect from.
+    // `dirty` is already set above; `StreamingBody` clears it when the
+    // body is read to completion, so cancelling/abandoning the stream
+    // leaves the connection in a state the next request reconnects from.
     let tail = client.head_buf[tail_offset..].to_vec();
-    client.dirty = true;
     let mut cancellable = CancellableStream::new(&mut client.stream, control_rx, pending);
     let mut body = StreamingBody::new(&mut cancellable, &mut client.dirty, &framing, tail);
     let mut buf = vec![0u8; HEAD_BUF_SIZE];
@@ -521,6 +550,9 @@ pub struct CancellableStream<'a, S: Read> {
     inner: &'a mut S,
     control_rx: &'a mut MpscConsumer<Control>,
     pending: &'a mut VecDeque<AsyncRequest>,
+    /// Consecutive `WouldBlock` timeouts since the last successful
+    /// read. Reset on progress; capped by [`MAX_STREAM_STALLED_READS`].
+    stalled_reads: u32,
 }
 
 impl<'a, S: Read> CancellableStream<'a, S> {
@@ -533,6 +565,7 @@ impl<'a, S: Read> CancellableStream<'a, S> {
             inner,
             control_rx,
             pending,
+            stalled_reads: 0,
         }
     }
 }
@@ -547,9 +580,23 @@ impl<S: Read> Read for CancellableStream<'_, S> {
                 ));
             }
             match self.inner.read(buf) {
-                Ok(n) => return Ok(n),
+                Ok(n) => {
+                    self.stalled_reads = 0;
+                    return Ok(n);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Read timeout expired — loop to re-check cancel message.
+                    // Read timeout expired. Retry to re-check the cancel
+                    // message — but only a bounded number of times, so a
+                    // silently dead peer surfaces as an error instead of
+                    // wedging the reader thread (and every queued request
+                    // behind it) forever.
+                    self.stalled_reads += 1;
+                    if self.stalled_reads > MAX_STREAM_STALLED_READS {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "stream stalled: no data within the read-timeout budget",
+                        ));
+                    }
                 }
                 Err(e) => return Err(e),
             }
