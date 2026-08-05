@@ -18,7 +18,11 @@ pub trait SetReadTimeout {
 /// strategy (rustls, native-tls, none, etc.) without the client crate knowing
 /// anything about a specific library.
 pub trait Connector {
-    type Stream: Read + Write + SetReadTimeout + Send + 'static;
+    /// The synchronous client owns its stream on the caller's thread, so it
+    /// need not cross a thread boundary. `AsyncClient::connect` imposes
+    /// `Send + 'static` at the only call site that moves it to a reader thread.
+    /// This keeps synchronous use available to single-owner `io_uring` streams.
+    type Stream: Read + Write + SetReadTimeout;
     type TlsConfig;
 
     /// Open a connection to `url`, using `tls_config` for HTTPS.
