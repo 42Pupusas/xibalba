@@ -141,10 +141,11 @@ fn async_silently_dead_stream_surfaces_error_and_recovers() {
         drop(stream);
     });
 
-    // Short read timeout so the stall cap trips quickly.
+    // Short read timeout + short silence budget so the stall trips quickly.
     let url = format!("http://127.0.0.1:{port}/");
     let config = Config {
         read_timeout: Some(Duration::from_millis(50)),
+        stream_silence: Duration::from_millis(300),
         ..Config::default()
     };
     let client: AsyncClient =
@@ -183,6 +184,128 @@ fn async_silently_dead_stream_surfaces_error_and_recovers() {
     ));
     assert_eq!(handle2.next_block(), Some(Chunk::Body(b"fresh".to_vec())));
     assert_eq!(handle2.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
+}
+
+#[test]
+fn async_slow_head_beyond_read_timeout_still_succeeds() {
+    // Regression test for the "os error 11" leak. A server whose first
+    // response byte arrives long after `read_timeout` (inference
+    // providers queue + prompt-process before emitting the SSE head)
+    // used to exhaust the head path's fixed retry *count* and surface
+    // the raw EAGAIN/WouldBlock to the caller. With a wall-clock
+    // `head_silence` budget decoupled from `read_timeout`, a slow but
+    // healthy head must succeed.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        // Stay silent well past several read-timeout ticks (the old
+        // cap was 3 retries × read_timeout = 150ms here).
+        thread::sleep(Duration::from_millis(600));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow")
+            .unwrap();
+    });
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(50)),
+        head_silence: Duration::from_secs(5),
+        ..Config::default()
+    };
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config).unwrap();
+
+    let mut handle = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(
+        matches!(handle.next_block(), Some(Chunk::Head { status: 200, .. })),
+        "slow head must not surface a WouldBlock error"
+    );
+    assert_eq!(handle.next_block(), Some(Chunk::Body(b"slow".to_vec())));
+    assert_eq!(handle.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
+}
+
+#[test]
+fn async_failed_reconnect_surfaces_error_not_desync() {
+    // Regression test for the swallowed-reconnect bug. When the
+    // connection is dirty (abandoned streaming body) and the reconnect
+    // in `process_request` fails, the reader used to ignore the failure
+    // (`let _ = client.ensure_clean()`) and send the next request over
+    // the still-dirty socket — parsing the stale leftover body as the
+    // new response's head and desyncing every response afterwards,
+    // permanently. A failed reconnect must surface as Chunk::Error and
+    // leave the connection dirty so a later request retries cleanly.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        // One connection only: send a response the client abandons
+        // mid-body (chunked, never terminated), leaving it dirty.
+        let (mut stream, _) = listener.accept().unwrap();
+        // Close the listener immediately — otherwise a reconnect attempt
+        // would sit in the kernel accept backlog and "succeed". With it
+        // gone, reconnects get ECONNREFUSED, which is the scenario under
+        // test.
+        drop(listener);
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        // Hold the socket open while the test runs, then drop.
+        thread::sleep(Duration::from_secs(2));
+        drop(stream);
+        // Listener drops here: all reconnect attempts to this port fail.
+    });
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(50)),
+        ..Config::default()
+    };
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config).unwrap();
+
+    let mut handle = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle.next_block(), Some(Chunk::Body(b"first".to_vec())));
+    // Abandon the stream mid-body: cancel and drop the handle. The
+    // connection is now dirty.
+    handle.cancel().unwrap();
+    drop(handle);
+
+    // Give the reader time to observe the cancel.
+    thread::sleep(Duration::from_millis(200));
+
+    // The server's listener is about to be unreachable for reconnects
+    // (single-accept). The next request must fail loudly with a
+    // connection error — NOT silently parse the stale "first" chunk
+    // remnants as its own response.
+    let mut handle2 = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    match handle2.next_block() {
+        Some(Chunk::Error(_)) => {} // reconnect failed loudly — correct
+        Some(Chunk::Head { .. }) => {
+            // A Head here could only come from stale bytes (the server
+            // never serves a second request).
+            panic!("desync: stale bytes parsed as a fresh response head");
+        }
+        other => panic!("expected Chunk::Error, got {other:?}"),
+    }
 
     server.join().unwrap();
 }
@@ -948,8 +1071,11 @@ fn timeout_fires_on_stalled_server() {
         drop(stream);
     });
 
+    // Silence tolerance is the explicit head_silence budget, not a
+    // multiple of read_timeout — configure it short so the test is fast.
     let config = Config {
         read_timeout: Some(Duration::from_millis(100)),
+        head_silence: Duration::from_millis(400),
         ..Config::default()
     };
     let mut client = connect_with_config(port, config);
@@ -959,6 +1085,14 @@ fn timeout_fires_on_stalled_server() {
     assert!(
         start.elapsed() < Duration::from_secs(2),
         "should time out quickly"
+    );
+    // The surfaced error must be a descriptive TimedOut, never the raw
+    // EAGAIN/WouldBlock ("os error 11") from the socket.
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("silence budget"),
+        "expected the silence-budget error, got: {msg}"
     );
     drop(server);
 }

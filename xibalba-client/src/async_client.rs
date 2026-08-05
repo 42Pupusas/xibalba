@@ -63,21 +63,6 @@ use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 /// wakeup latency, not correctness.
 const CHUNK_RING_CAP: usize = 32;
 
-/// How many consecutive read timeouts (`WouldBlock`) the streaming
-/// body path tolerates before declaring the stream stalled.
-///
-/// A blocking socket with `SO_RCVTIMEO` returns `WouldBlock` when no
-/// data arrives within `read_timeout`; each retry re-arms the timer, so
-/// the total silence tolerated is `(MAX_STREAM_STALLED_READS + 1) ×
-/// read_timeout`. Without a cap, a peer that half-dies without sending
-/// FIN/RST (NAT drop, silent middlebox reset — the common failure mode
-/// for long-lived SSE streams) parks the reader thread in this retry
-/// loop forever: the caller hangs in `pop_block`, and every request
-/// submitted afterwards queues behind the wedged read, so the client
-/// can never be restarted. The sync path (`body::read_retry`) already
-/// bounds its retries; this is the streaming path's equivalent.
-const MAX_STREAM_STALLED_READS: u32 = 4;
-
 /// Default capacity for the control ring feeding the reader
 /// thread. One slot per in-flight request; the worker only ever
 /// has one model round in flight, so a handful of slots is plenty.
@@ -385,6 +370,10 @@ fn poll_control(
     }
 }
 
+// One linear pass over a request's lifecycle (clean → send → head → body
+// → terminator); splitting it would scatter the dirty-flag invariants that
+// the whole desync class of bugs hinges on.
+#[allow(clippy::too_many_lines)]
 fn process_request<C, const MAX_HEAD_SIZE: usize>(
     client: &mut Client<C, MAX_HEAD_SIZE>,
     request: AsyncRequest,
@@ -398,8 +387,21 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // not call `ensure_clean()` itself, and the previous response's
     // leftover bytes would otherwise be interpreted as this response's
     // head, corrupting the stream.
-    if client.dirty {
-        let _ = client.ensure_clean();
+    //
+    // A failed reconnect is a HARD error for this request. Swallowing
+    // it (as an earlier version did with `let _ =`) proceeds on the
+    // still-dirty socket: the stale response bytes get parsed as this
+    // request's head, and from then on every request receives the
+    // previous request's response — a permanent, silent desync that
+    // survives until the process restarts. `dirty` stays set, so the
+    // next request simply retries the reconnect.
+    if client.dirty
+        && let Err(e) = client.ensure_clean()
+    {
+        let _ = request
+            .chunk_tx
+            .push_block(Chunk::Error(std::sync::Arc::new(e)));
+        return;
     }
 
     // Drain any stale cancel messages that may have accumulated while
@@ -484,6 +486,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
             &framing,
             &client.head_buf[tail_offset..],
             client.config.max_response_body,
+            client.config.stream_silence,
         );
         match body_result {
             Ok(bytes) => {
@@ -513,8 +516,9 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // body is read to completion, so cancelling/abandoning the stream
     // leaves the connection in a state the next request reconnects from.
     let tail = client.head_buf[tail_offset..].to_vec();
-    let mut cancellable = CancellableStream::new(&mut client.stream, control_rx, pending);
-    let mut body = StreamingBody::new(&mut cancellable, &mut client.dirty, &framing, tail);
+    let silence = client.config.stream_silence;
+    let mut cancellable = CancellableStream::new(&mut client.stream, control_rx, pending, silence);
+    let mut body = StreamingBody::new(&mut cancellable, &mut client.dirty, &framing, tail, silence);
     let mut buf = vec![0u8; HEAD_BUF_SIZE];
     loop {
         match body.read(&mut buf) {
@@ -550,22 +554,32 @@ pub struct CancellableStream<'a, S: Read> {
     inner: &'a mut S,
     control_rx: &'a mut MpscConsumer<Control>,
     pending: &'a mut VecDeque<AsyncRequest>,
-    /// Consecutive `WouldBlock` timeouts since the last successful
-    /// read. Reset on progress; capped by [`MAX_STREAM_STALLED_READS`].
-    stalled_reads: u32,
+    /// Wall-clock silence tolerance between reads (see
+    /// [`Config::stream_silence`](crate::client::Config::stream_silence)).
+    /// Measured in real time rather than retry counts so the tolerance
+    /// does not silently shrink when the per-read `read_timeout` is
+    /// shortened for cancel latency. Without any bound, a peer that
+    /// half-dies without FIN/RST (NAT drop) parks the reader thread in
+    /// the retry loop forever: the caller hangs in `pop_block` and every
+    /// queued request wedges behind the dead read.
+    silence: std::time::Duration,
+    /// When the last successful read completed; the silence clock.
+    last_progress: std::time::Instant,
 }
 
 impl<'a, S: Read> CancellableStream<'a, S> {
-    const fn new(
+    fn new(
         inner: &'a mut S,
         control_rx: &'a mut MpscConsumer<Control>,
         pending: &'a mut VecDeque<AsyncRequest>,
+        silence: std::time::Duration,
     ) -> Self {
         Self {
             inner,
             control_rx,
             pending,
-            stalled_reads: 0,
+            silence,
+            last_progress: std::time::Instant::now(),
         }
     }
 }
@@ -581,20 +595,19 @@ impl<S: Read> Read for CancellableStream<'_, S> {
             }
             match self.inner.read(buf) {
                 Ok(n) => {
-                    self.stalled_reads = 0;
+                    self.last_progress = std::time::Instant::now();
                     return Ok(n);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Read timeout expired. Retry to re-check the cancel
-                    // message — but only a bounded number of times, so a
-                    // silently dead peer surfaces as an error instead of
-                    // wedging the reader thread (and every queued request
-                    // behind it) forever.
-                    self.stalled_reads += 1;
-                    if self.stalled_reads > MAX_STREAM_STALLED_READS {
+                    // message — but never past the silence budget, so a
+                    // silently dead peer surfaces as a descriptive error
+                    // (not raw EAGAIN) instead of wedging the reader
+                    // thread and every queued request behind it.
+                    if self.last_progress.elapsed() >= self.silence {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            "stream stalled: no data within the read-timeout budget",
+                            format!("stream stalled: peer sent no data for {:.0?}", self.silence),
                         ));
                     }
                 }

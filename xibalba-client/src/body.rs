@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::time::{Duration, Instant};
 
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::response::HeaderRange;
@@ -96,6 +97,9 @@ pub struct StreamingBody<'a, S: Read> {
     /// first the head-read overshoot, then refills from `stream`.
     raw: Vec<u8>,
     raw_pos: usize,
+    /// Wall-clock silence tolerance between body bytes; resets on
+    /// every successful socket read. See [`SilenceBudget`].
+    budget: SilenceBudget,
 }
 
 #[derive(Debug)]
@@ -111,11 +115,12 @@ enum StreamState {
 }
 
 impl<'a, S: Read> StreamingBody<'a, S> {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         stream: &'a mut S,
         dirty: &'a mut bool,
         framing: &xibalba_proto::response::BodyFraming,
         tail: Vec<u8>,
+        silence: std::time::Duration,
     ) -> Self {
         use xibalba_proto::response::{BodyFraming, ChunkedDecoder};
         let state = match *framing {
@@ -132,6 +137,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
             state,
             raw: tail,
             raw_pos: 0,
+            budget: SilenceBudget::new(silence),
         };
         if matches!(body.state, StreamState::Done) {
             body.finish();
@@ -157,7 +163,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
     fn input(&mut self) -> std::io::Result<&[u8]> {
         if self.raw_pos >= self.raw.len() {
             self.raw.resize(HEAD_BUF_SIZE, 0);
-            let n = read_retry(&mut self.stream, &mut self.raw)?;
+            let n = self.budget.read(&mut self.stream, &mut self.raw)?;
             self.raw.truncate(n);
             self.raw_pos = 0;
         }
@@ -240,7 +246,7 @@ impl<S: Read> StreamingBody<'_, S> {
 
         if self.raw_pos >= self.raw.len() {
             self.raw.resize(HEAD_BUF_SIZE, 0);
-            let n = read_retry(&mut self.stream, &mut self.raw)?;
+            let n = self.budget.read(&mut self.stream, &mut self.raw)?;
             self.raw.truncate(n);
             self.raw_pos = 0;
             if n == 0 {
@@ -281,6 +287,7 @@ fn read_body_chunked<S: Read>(
     stream: &mut S,
     tail: &[u8],
     max_body: usize,
+    budget: &mut SilenceBudget,
 ) -> Result<Vec<u8>, Error> {
     use xibalba_proto::response::{ChunkedDecoder, DecodeResult};
 
@@ -310,7 +317,7 @@ fn read_body_chunked<S: Read>(
     }
 
     loop {
-        let n = read_retry(stream, &mut raw)?;
+        let n = budget.read(stream, &mut raw)?;
         if n == 0 {
             return Err(ConnectionError::ConnectionClosed.into());
         }
@@ -337,54 +344,83 @@ fn read_body_chunked<S: Read>(
     }
 }
 
-// ── Inline read helpers ──────────────────────────────────────────────────────
+// ── Silence budget ───────────────────────────────────────────────────────────
 
-/// How many consecutive [`std::io::ErrorKind::WouldBlock`] timeouts to
-/// tolerate before giving up. A slow API that takes 8s to send headers
-/// with a 5s per-read ceiling needs one retry; a genuinely stalled
-/// server exhausts these quickly (3 × timeout).
-const MAX_WOULDBLOCK_RETRIES: u32 = 3;
-
-/// Read from `stream`, retrying on [`std::io::ErrorKind::WouldBlock`]
-/// up to [`MAX_WOULDBLOCK_RETRIES`] times.
+/// Wall-clock tolerance for peer silence across read-timeout ticks.
 ///
 /// A blocking socket with `SO_RCVTIMEO` returns `EAGAIN`/`WouldBlock` when
-/// no data arrives within the timeout window. The timeout is a ceiling, not
-/// a failure — retrying resets the timer and waits for the next window.
-/// This is what [`super::CancellableStream`] already does for the streaming
-/// body path; this helper extends the same treatment to the head-read and
-/// synchronous body-read paths, with a cap so a dead server doesn't hang
-/// the caller forever.
-fn read_retry(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut attempts = 0u32;
-    loop {
-        match stream.read(buf) {
-            Ok(n) => return Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                attempts += 1;
-                if attempts > MAX_WOULDBLOCK_RETRIES {
-                    return Err(e);
-                }
-            }
-            Err(e) => return Err(e),
-        }
-    }
+/// no data arrives within `read_timeout`. That per-read ceiling exists for
+/// cancel latency, not as a failure threshold — so silence tolerance must
+/// be measured in wall-clock time, independent of how short the per-read
+/// timeout is. The previous design capped retry *counts*, which silently
+/// changed meaning with the configured `read_timeout` (a 5s timeout gave
+/// only ~20s of head tolerance) and leaked the raw `EAGAIN` ("os error 11")
+/// to callers when it tripped. The budget resets on every successful read:
+/// it bounds *silence*, not total transfer time.
+#[derive(Debug)]
+pub(crate) struct SilenceBudget {
+    limit: Duration,
+    last_progress: Instant,
 }
 
-/// Like [`std::io::Read::read_exact`] but retries on `WouldBlock`.
-fn read_exact_retry(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        let n = read_retry(stream, &mut buf[off..])?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed mid-body",
-            ));
+impl SilenceBudget {
+    pub(crate) fn new(limit: Duration) -> Self {
+        Self {
+            limit,
+            last_progress: Instant::now(),
         }
-        off += n;
     }
-    Ok(())
+
+    /// The error surfaced when the budget is exhausted: a descriptive
+    /// `TimedOut`, never the raw `WouldBlock`/`EAGAIN` the socket produced.
+    fn expired(&self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "peer sent no data for {:.0?} (silence budget exhausted)",
+                self.limit
+            ),
+        )
+    }
+
+    /// Read from `stream`, absorbing `WouldBlock` ticks until data arrives
+    /// or the silence budget is exhausted. Progress resets the budget.
+    pub(crate) fn read(
+        &mut self,
+        stream: &mut impl Read,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        loop {
+            match stream.read(buf) {
+                Ok(n) => {
+                    self.last_progress = Instant::now();
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if self.last_progress.elapsed() >= self.limit {
+                        return Err(self.expired());
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Like [`std::io::Read::read_exact`] but through the silence budget.
+    fn read_exact(&mut self, stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut off = 0;
+        while off < buf.len() {
+            let n = self.read(stream, &mut buf[off..])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-body",
+                ));
+            }
+            off += n;
+        }
+        Ok(())
+    }
 }
 
 /// Returns `(HeadData, framing, tail_offset)`. The tail bytes (body prefix
@@ -393,6 +429,7 @@ pub(crate) fn read_response_head<S: Read>(
     stream: &mut S,
     head_acc: &mut Vec<u8>,
     max_head: usize,
+    silence: Duration,
 ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
     use xibalba_proto::header::Header;
     use xibalba_proto::response::{BodyFraming, HeaderRange, ResponseHead};
@@ -400,8 +437,13 @@ pub(crate) fn read_response_head<S: Read>(
     head_acc.clear();
     let mut raw = [0u8; HEAD_BUF_SIZE];
 
+    // The head budget spans the whole wait for the first response bytes
+    // (server queueing + prompt processing for inference APIs); it is
+    // deliberately decoupled from `read_timeout`, which stays short for
+    // cancel latency.
+    let mut budget = SilenceBudget::new(silence);
     let head_end = loop {
-        let n = read_retry(stream, &mut raw)?;
+        let n = budget.read(stream, &mut raw)?;
         if n == 0 {
             return Err(ConnectionError::ConnectionClosed.into());
         }
@@ -456,8 +498,11 @@ pub(crate) fn read_body<S: Read>(
     framing: &xibalba_proto::response::BodyFraming,
     tail: &[u8],
     max_body: usize,
+    silence: Duration,
 ) -> Result<Vec<u8>, Error> {
     use xibalba_proto::response::BodyFraming as ProtoFraming;
+
+    let mut budget = SilenceBudget::new(silence);
 
     match *framing {
         ProtoFraming::None => Ok(Vec::new()),
@@ -473,18 +518,18 @@ pub(crate) fn read_body<S: Read>(
             body.extend_from_slice(&tail[..from_tail]);
             if body.len() < len {
                 body.resize(len, 0);
-                read_exact_retry(stream, &mut body[from_tail..])?;
+                budget.read_exact(stream, &mut body[from_tail..])?;
             }
             Ok(body)
         }
 
-        ProtoFraming::Chunked => read_body_chunked(stream, tail, max_body),
+        ProtoFraming::Chunked => read_body_chunked(stream, tail, max_body, &mut budget),
 
         ProtoFraming::UntilClose => {
             let mut body = tail.to_vec();
             let mut raw = [0u8; HEAD_BUF_SIZE];
             loop {
-                let n = read_retry(stream, &mut raw)?;
+                let n = budget.read(stream, &mut raw)?;
                 if n == 0 {
                     return Ok(body);
                 }

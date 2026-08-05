@@ -26,9 +26,30 @@ use crate::connector::Connector;
 pub const DEFAULT_MAX_HEAD_SIZE: usize = 64 * 1024;
 
 pub struct Config {
+    /// Per-socket-read ceiling (`SO_RCVTIMEO`). Keep this SHORT: it is
+    /// the granularity at which a cancel signal is observed mid-stream,
+    /// not a failure threshold. Silence tolerance is governed by the
+    /// two budgets below, which retry across read-timeout ticks.
     pub read_timeout: Option<Duration>,
     pub max_response_body: usize,
     pub max_redirects: u8,
+    /// Total wall-clock silence tolerated while waiting for a response
+    /// head (between flushing the request and the first response byte).
+    ///
+    /// Inference providers legitimately spend a long time queueing,
+    /// doing prompt-cache lookup, and initial reasoning before they
+    /// emit the SSE head — a budget tied to `read_timeout` retry
+    /// *counts* silently changed meaning with the configured timeout
+    /// and surfaced raw `EAGAIN` ("os error 11") on healthy-but-slow
+    /// starts. This is an explicit duration instead.
+    pub head_silence: Duration,
+    /// Total wall-clock silence tolerated between body bytes of a
+    /// streaming response. Resets on every successful read. Generous
+    /// by default: reasoning models can go quiet for minutes between
+    /// SSE events; the cap only exists so a peer that half-dies
+    /// without FIN/RST (NAT drop) surfaces as an error instead of
+    /// wedging the reader forever.
+    pub stream_silence: Duration,
 }
 
 impl Default for Config {
@@ -37,6 +58,8 @@ impl Default for Config {
             read_timeout: Some(Duration::from_secs(30)),
             max_response_body: 10 * 1024 * 1024,
             max_redirects: 10,
+            head_silence: Duration::from_mins(2),
+            stream_silence: Duration::from_mins(5),
         }
     }
 }
@@ -487,7 +510,12 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         }
         self.stream.flush()?;
 
-        let head = read_response_head(&mut self.stream, &mut self.head_buf, MAX_HEAD_SIZE);
+        let head = read_response_head(
+            &mut self.stream,
+            &mut self.head_buf,
+            MAX_HEAD_SIZE,
+            self.config.head_silence,
+        );
         match head {
             Ok(parts) => Ok(parts),
             Err(error) => {
@@ -509,6 +537,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             &framing,
             &self.head_buf[tail_offset..],
             self.config.max_response_body,
+            self.config.stream_silence,
         )?;
 
         Ok(Response {
@@ -540,7 +569,8 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
 
         let tail = self.head_buf[tail_offset..].to_vec();
         self.dirty = true;
-        let body = StreamingBody::new(&mut self.stream, &mut self.dirty, &framing, tail);
+        let silence = self.config.stream_silence;
+        let body = StreamingBody::new(&mut self.stream, &mut self.dirty, &framing, tail, silence);
 
         Ok(StreamingResponse {
             version: head_data.version,
