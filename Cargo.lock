@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "xibalba-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "quetzalcoatl 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "xibalba-proto",

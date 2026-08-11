@@ -189,6 +189,156 @@ fn async_silently_dead_stream_surfaces_error_and_recovers() {
 }
 
 #[test]
+fn async_stale_cancel_does_not_abort_the_next_request() {
+    // Regression test for the cancel-cascade bug. Cancels travel on the
+    // control ring shared by every request, and used to carry no
+    // identity: the reader treated the next `Cancel` it saw as applying
+    // to whatever request was in flight *at that moment*. So a caller
+    // that gave up on request A (an application-level head timeout, say)
+    // and cancelled it a moment too late would have that cancel land on
+    // request B, aborting a perfectly healthy response. One flaky
+    // request thereby killed the following turn, and the conversation
+    // could not make progress. Cancels are now addressed to a ticket, so
+    // a cancel for a finished request is discarded.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        // Request A: a complete, clean response.
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+            .unwrap();
+        stream.flush().unwrap();
+
+        // Request B on the same kept-alive connection: send the head and
+        // a first chunk, then hold the stream open. B is *mid-body* —
+        // exactly when the reader polls the control ring between reads,
+        // and so exactly when a stale cancel would be misapplied to it.
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nsecond\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(400));
+        stream.write_all(b"5\r\nthird\r\n0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(200));
+    });
+
+    let client = connect_async(port);
+
+    // Request A: consume it fully, so it is finished and its ticket retired.
+    let mut handle_a = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle_a.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle_a.next_block(), Some(Chunk::Body(b"first".to_vec())));
+    assert_eq!(handle_a.next_block(), Some(Chunk::Eof));
+
+    // Start B and let it get mid-body, so the reader is inside the
+    // streaming loop that polls the control ring between reads.
+    let mut handle_b = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle_b.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle_b.next_block(), Some(Chunk::Body(b"second".to_vec())));
+
+    // Only now cancel A — far too late, and while B is streaming. Before
+    // tickets, the reader applied this to B and aborted it.
+    handle_a.cancel().unwrap();
+
+    // B must run to completion regardless.
+    match handle_b.next_block() {
+        Some(Chunk::Body(b)) => assert_eq!(b, b"third".to_vec()),
+        Some(Chunk::Aborted) => {
+            panic!("stale cancel for a finished request aborted the in-flight request")
+        }
+        other => panic!("expected request B to keep streaming, got {other:?}"),
+    }
+    assert_eq!(handle_b.next_block(), Some(Chunk::Eof));
+
+    server.join().unwrap();
+}
+
+#[test]
+fn async_queued_request_reports_when_it_reaches_the_wire() {
+    // Regression test for the "timed out waiting for response headers"
+    // wedge. Requests serialize through one reader thread, so a request
+    // submitted while another is streaming sits in the control ring,
+    // unsent. A caller enforcing its own head deadline from submit time
+    // therefore timed out against a request that had never been written
+    // — reporting a transport failure for bytes that never left the
+    // machine, and (with an unscoped cancel) taking the healthy
+    // in-flight request down with it. `has_started` lets the caller
+    // start its clock when the request actually reaches the socket.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // Request A: head, one chunk, then a deliberate pause holding
+        // the reader thread busy while B waits in the queue.
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(500));
+        stream.write_all(b"0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(200));
+    });
+
+    let client = connect_async(port);
+
+    let mut handle_a = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle_a.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle_a.next_block(), Some(Chunk::Body(b"first".to_vec())));
+
+    // B is submitted while A still owns the reader: queued, not sent.
+    let mut handle_b = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(
+        !handle_b.has_started(),
+        "a request queued behind a live stream must not count as started"
+    );
+
+    // Once A finishes, B reaches the wire and reports it.
+    assert_eq!(handle_a.next_block(), Some(Chunk::Eof));
+    assert!(matches!(
+        handle_b.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert!(
+        handle_b.has_started(),
+        "a request that produced a head must report as started"
+    );
+    assert_eq!(handle_b.next_block(), Some(Chunk::Body(b"second".to_vec())));
+
+    server.join().unwrap();
+}
+
+#[test]
 fn async_slow_head_beyond_read_timeout_still_succeeds() {
     // Regression test for the "os error 11" leak. A server whose first
     // response byte arrives long after `read_timeout` (inference

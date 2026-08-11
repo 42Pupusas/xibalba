@@ -45,6 +45,8 @@
 
 use std::collections::VecDeque;
 use std::io::Read;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use quetzalcoatl::capacity::Capacity;
@@ -67,6 +69,17 @@ const CHUNK_RING_CAP: usize = 32;
 /// thread. One slot per in-flight request; the worker only ever
 /// has one model round in flight, so a handful of slots is plenty.
 const CONTROL_RING_CAP: usize = 8;
+
+/// Ticket value meaning "cancel whatever request is in flight", used by
+/// [`AsyncClient::cancel`] where the caller has no specific handle.
+///
+/// Every other cancel names the exact request it belongs to. That
+/// distinction is load-bearing: the control ring is shared by every
+/// request, so an unscoped cancel that arrives *after* its intended
+/// request already finished would otherwise be applied to whichever
+/// request happens to be streaming next, aborting a perfectly healthy
+/// response. Tickets make a late cancel a no-op instead.
+const CANCEL_ANY: u64 = u64::MAX;
 
 /// One response chunk delivered from the reader thread to the
 /// caller.
@@ -108,8 +121,11 @@ pub enum Chunk {
 enum Control {
     /// Start a new streaming request.
     Request(AsyncRequest),
-    /// Cancel the currently in-flight request, if any.
-    Cancel,
+    /// Cancel the request with this ticket, or any in-flight request
+    /// when the ticket is [`CANCEL_ANY`]. A cancel naming a request that
+    /// has already finished is discarded rather than applied to its
+    /// successor.
+    Cancel(u64),
 }
 
 /// One streaming request handed to the reader thread. The reader
@@ -122,6 +138,14 @@ pub struct AsyncRequest {
     body: Option<Vec<u8>>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     chunk_tx: spsc::Producer<Chunk>,
+    /// Identifies this request on the shared control ring so a cancel
+    /// can name it precisely.
+    ticket: u64,
+    /// Flipped by the reader when it takes this request off the queue.
+    /// Shared with the caller's [`StreamHandle`] so a response-head
+    /// deadline can measure time on the wire rather than time spent
+    /// queued behind an earlier request.
+    started: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for AsyncRequest {
@@ -132,6 +156,7 @@ impl std::fmt::Debug for AsyncRequest {
             .field("query", &self.query)
             .field("body_len", &self.body.as_ref().map(Vec::len))
             .field("headers_len", &self.headers.len())
+            .field("ticket", &self.ticket)
             .finish_non_exhaustive()
     }
 }
@@ -145,6 +170,12 @@ impl std::fmt::Debug for AsyncRequest {
 pub struct StreamHandle {
     chunk_rx: SpscConsumer<Chunk>,
     control_tx: MpscProducer<Control>,
+    /// This request's ticket, so [`cancel`](Self::cancel) targets only
+    /// this request and never a successor that reused the reader.
+    ticket: u64,
+    /// Set by the reader once this request leaves the queue and reaches
+    /// the socket. See [`has_started`](Self::has_started).
+    started: Arc<AtomicBool>,
 }
 
 impl StreamHandle {
@@ -160,8 +191,22 @@ impl StreamHandle {
     /// exited.
     pub fn cancel(&self) -> Result<(), Error> {
         self.control_tx
-            .push_block(Control::Cancel)
+            .push_block(Control::Cancel(self.ticket))
             .map_err(|_| Error::Connection(ConnectionError::Other("reader is gone".into())))
+    }
+
+    /// Whether the reader has begun processing this request.
+    ///
+    /// Requests serialize through a single reader thread, so a submitted
+    /// request may sit in the control ring for as long as its
+    /// predecessor takes. A caller enforcing its own response-head
+    /// deadline must not start that clock at submit time — the request
+    /// has not been written yet, and timing out here reports a transport
+    /// failure for bytes that were never sent. Gate the deadline on this
+    /// flag and it measures the peer's silence instead of the queue's.
+    #[must_use]
+    pub fn has_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
     }
 
     /// The next chunk, or `None` if the ring is empty. The caller
@@ -199,6 +244,9 @@ pub struct AsyncClient<const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SIZE> {
     /// alive across `join.join()` would deadlock the drop itself.)
     control_tx: Option<MpscProducer<Control>>,
     join: Option<JoinHandle<()>>,
+    /// Source of per-request tickets. Monotonic; the only reserved value
+    /// is [`CANCEL_ANY`], which the counter cannot reach in practice.
+    next_ticket: AtomicU64,
 }
 
 impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
@@ -240,6 +288,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
         Ok(Self {
             control_tx: Some(control_tx),
             join: Some(join),
+            next_ticket: AtomicU64::new(0),
         })
     }
 
@@ -263,6 +312,8 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
     ) -> Result<StreamHandle, Error> {
         let (chunk_tx, chunk_rx) =
             spsc::RingBuffer::<Chunk>::new(Capacity::at_least(CHUNK_RING_CAP)).split();
+        let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        let started = Arc::new(AtomicBool::new(false));
         let request = AsyncRequest {
             method,
             path,
@@ -270,6 +321,8 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             body,
             headers,
             chunk_tx,
+            ticket,
+            started: Arc::clone(&started),
         };
         let control_tx = self.control()?;
         control_tx
@@ -278,6 +331,8 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
         Ok(StreamHandle {
             chunk_rx,
             control_tx: control_tx.clone(),
+            ticket,
+            started,
         })
     }
 
@@ -290,7 +345,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
     /// exited.
     pub fn cancel(&self) -> Result<(), Error> {
         self.control()?
-            .push_block(Control::Cancel)
+            .push_block(Control::Cancel(CANCEL_ANY))
             .map_err(|_| Error::Connection(ConnectionError::ReaderGone))
     }
 }
@@ -341,7 +396,7 @@ fn run_reader<C, const MAX_HEAD_SIZE: usize>(
             Some(Control::Request(request)) => {
                 process_request(&mut client, request, &mut control_rx, &mut pending);
             }
-            Some(Control::Cancel) => {
+            Some(Control::Cancel(_)) => {
                 // No request in flight; cancel is a no-op.
             }
             None => break,
@@ -350,22 +405,38 @@ fn run_reader<C, const MAX_HEAD_SIZE: usize>(
 }
 
 /// Poll the control channel without blocking, returning `true` if a
-/// `Cancel` was observed.
+/// `Cancel` addressed to `current` was observed.
 ///
 /// The control ring multiplexes cancels and new requests, and the
 /// consumer has no non-destructive peek — checking for a cancel must
 /// `pop`. Any `Request` popped while hunting for a cancel is moved into
 /// `pending` (processed later in order) instead of being discarded; that
 /// is what stops a request submitted mid-stream from vanishing.
+///
+/// Cancels are matched against the in-flight request's ticket. A cancel
+/// naming some *other* request is dropped: its target already finished,
+/// and applying it to the current request would abort a healthy response
+/// because an unrelated one timed out. `CANCEL_ANY` (from
+/// [`AsyncClient::cancel`], which names no request) always matches, and
+/// `current == None` means nothing is in flight to cancel.
 fn poll_control(
     control_rx: &mut MpscConsumer<Control>,
     pending: &mut VecDeque<AsyncRequest>,
+    current: Option<u64>,
 ) -> bool {
+    let mut cancelled = false;
     loop {
         match control_rx.pop() {
-            Some(Control::Cancel) => return true,
+            Some(Control::Cancel(ticket)) => {
+                if current.is_some_and(|c| ticket == CANCEL_ANY || ticket == c) {
+                    // Keep draining rather than returning early: a stale
+                    // cancel queued behind this one must not survive to be
+                    // misread as targeting the next request.
+                    cancelled = true;
+                }
+            }
             Some(Control::Request(request)) => pending.push_back(request),
-            None => return false,
+            None => return cancelled,
         }
     }
 }
@@ -406,8 +477,9 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
 
     // Drain any stale cancel messages that may have accumulated while
     // no request was in flight, stashing any queued requests so they
-    // are not dropped.
-    while poll_control(control_rx, pending) {}
+    // are not dropped. `None` means "nothing in flight yet", so every
+    // cancel found here is by definition stale and is discarded.
+    poll_control(control_rx, pending, None);
 
     let AsyncRequest {
         method,
@@ -416,7 +488,15 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         body,
         headers,
         chunk_tx,
+        ticket,
+        started,
     } = request;
+
+    // Publish "this request has left the queue" before the first byte is
+    // written. A caller's response-head deadline keys off this, so it
+    // times the peer rather than the time spent queued behind a slow
+    // predecessor.
+    started.store(true, Ordering::Release);
 
     // Translate the request's owned header buffers into the
     // xibalba `Header<'_>` shape the Client expects (borrowing
@@ -517,7 +597,8 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // leaves the connection in a state the next request reconnects from.
     let tail = client.head_buf[tail_offset..].to_vec();
     let silence = client.config.stream_silence;
-    let mut cancellable = CancellableStream::new(&mut client.stream, control_rx, pending, silence);
+    let mut cancellable =
+        CancellableStream::new(&mut client.stream, control_rx, pending, silence, ticket);
     let mut body = StreamingBody::new(&mut cancellable, &mut client.dirty, &framing, tail, silence);
     let mut buf = vec![0u8; HEAD_BUF_SIZE];
     loop {
@@ -554,6 +635,9 @@ pub struct CancellableStream<'a, S: Read> {
     inner: &'a mut S,
     control_rx: &'a mut MpscConsumer<Control>,
     pending: &'a mut VecDeque<AsyncRequest>,
+    /// The in-flight request's ticket; only a cancel naming it (or
+    /// `CANCEL_ANY`) interrupts this stream.
+    ticket: u64,
     /// Wall-clock silence tolerance between reads (see
     /// [`Config::stream_silence`](crate::client::Config::stream_silence)).
     /// Measured in real time rather than retry counts so the tolerance
@@ -573,11 +657,13 @@ impl<'a, S: Read> CancellableStream<'a, S> {
         control_rx: &'a mut MpscConsumer<Control>,
         pending: &'a mut VecDeque<AsyncRequest>,
         silence: std::time::Duration,
+        ticket: u64,
     ) -> Self {
         Self {
             inner,
             control_rx,
             pending,
+            ticket,
             silence,
             last_progress: std::time::Instant::now(),
         }
@@ -587,7 +673,7 @@ impl<'a, S: Read> CancellableStream<'a, S> {
 impl<S: Read> Read for CancellableStream<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            if poll_control(self.control_rx, self.pending) {
+            if poll_control(self.control_rx, self.pending, Some(self.ticket)) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "request cancelled",
