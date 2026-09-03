@@ -246,6 +246,13 @@ pub struct AsyncClient<const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SIZE> {
     /// Source of per-request tickets. Monotonic; the only reserved value
     /// is [`CANCEL_ANY`], which the counter cannot reach in practice.
     next_ticket: AtomicU64,
+    /// Set by `Drop` before the control ring closes. Closing the ring
+    /// alone cannot interrupt a read already parked on the socket — the
+    /// ring-closed signal only reaches the reader between reads. The
+    /// flag is what turns the next `WouldBlock` retry into an immediate
+    /// shutdown, so `drop` cannot block for `stream_silence` behind a
+    /// stalled in-flight response.
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
@@ -273,10 +280,12 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
         let (control_tx, control_rx) =
             mpsc::RingBuffer::<Control>::new(Capacity::at_least(CONTROL_RING_CAP)).split();
 
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let reader_shutting_down = Arc::clone(&shutting_down);
         let join = thread::Builder::new()
             .name("xibalba-reader".to_owned())
             .spawn(move || {
-                run_reader(client, control_rx);
+                run_reader(client, control_rx, &reader_shutting_down);
             })
             .map_err(|e| {
                 Error::Connection(ConnectionError::Other(format!(
@@ -288,6 +297,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             control_tx: Some(control_tx),
             join: Some(join),
             next_ticket: AtomicU64::new(0),
+            shutting_down,
         })
     }
 
@@ -351,6 +361,13 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
 
 impl<const MAX_HEAD_SIZE: usize> Drop for AsyncClient<MAX_HEAD_SIZE> {
     fn drop(&mut self) {
+        // Flag shutdown before closing the ring: a reader parked in a
+        // socket read never sees the ring close, but its next WouldBlock
+        // retry sees the flag and unwinds immediately. Without this the
+        // join below would wait out the full `stream_silence` budget
+        // behind a stalled in-flight response.
+        self.shutting_down.store(true, Ordering::Release);
+
         // Close the control ring first. The reader's `pop_block`
         // observes the closed producer and returns `None`,
         // unwinding to the outer loop and exiting the thread.
@@ -358,9 +375,10 @@ impl<const MAX_HEAD_SIZE: usize> Drop for AsyncClient<MAX_HEAD_SIZE> {
         // `pop_block` and `join.join()` below would deadlock.
         drop(self.control_tx.take());
 
-        // Best-effort join: if the reader is stuck on a request
-        // that never finishes (e.g. a mid-flight read with a cancel
-        // message not yet observed), we don't block the drop forever.
+        // Best-effort join: the flag above bounds the wait to at most one
+        // read-timeout window; if the reader is wedged below the kernel's
+        // cancel reach (e.g. a stuck TLS handshake), we don't hang the
+        // drop indefinitely.
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -379,6 +397,7 @@ impl<const MAX_HEAD_SIZE: usize> std::fmt::Debug for AsyncClient<MAX_HEAD_SIZE> 
 fn run_reader<C, const MAX_HEAD_SIZE: usize>(
     mut client: Client<C, MAX_HEAD_SIZE>,
     mut control_rx: MpscConsumer<Control>,
+    shutting_down: &AtomicBool,
 ) where
     C: crate::connector::Connector,
 {
@@ -387,13 +406,16 @@ fn run_reader<C, const MAX_HEAD_SIZE: usize>(
     // rather than dropped, then processed in submission order.
     let mut pending: VecDeque<AsyncRequest> = VecDeque::new();
     loop {
+        if shutting_down.load(Ordering::Acquire) {
+            break;
+        }
         if let Some(request) = pending.pop_front() {
-            process_request(&mut client, request, &mut control_rx, &mut pending);
+            process_request(&mut client, request, &mut control_rx, &mut pending, shutting_down);
             continue;
         }
         match control_rx.pop_block() {
             Some(Control::Request(request)) => {
-                process_request(&mut client, request, &mut control_rx, &mut pending);
+                process_request(&mut client, request, &mut control_rx, &mut pending, shutting_down);
             }
             Some(Control::Cancel(_)) => {
                 // No request in flight; cancel is a no-op.
@@ -422,9 +444,13 @@ fn poll_control(
     control_rx: &mut MpscConsumer<Control>,
     pending: &mut VecDeque<AsyncRequest>,
     current: Option<u64>,
+    shutting_down: &AtomicBool,
 ) -> bool {
     let mut cancelled = false;
     loop {
+        if shutting_down.load(Ordering::Acquire) {
+            return true;
+        }
         match control_rx.pop() {
             Some(Control::Cancel(ticket)) => {
                 if current.is_some_and(|c| ticket == CANCEL_ANY || ticket == c) {
@@ -449,6 +475,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     request: AsyncRequest,
     control_rx: &mut MpscConsumer<Control>,
     pending: &mut VecDeque<AsyncRequest>,
+    shutting_down: &AtomicBool,
 ) where
     C: crate::connector::Connector,
 {
@@ -478,7 +505,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // no request was in flight, stashing any queued requests so they
     // are not dropped. `None` means "nothing in flight yet", so every
     // cancel found here is by definition stale and is discarded.
-    poll_control(control_rx, pending, None);
+    poll_control(control_rx, pending, None, shutting_down);
 
     let AsyncRequest {
         method,
@@ -585,8 +612,14 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // leaves the connection in a state the next request reconnects from.
     let tail = client.head_buf[tail_offset..].to_vec();
     let silence = client.config.stream_silence;
-    let mut cancellable =
-        CancellableStream::new(&mut client.stream, control_rx, pending, silence, ticket);
+    let mut cancellable = CancellableStream::new(
+        &mut client.stream,
+        control_rx,
+        pending,
+        silence,
+        ticket,
+        shutting_down,
+    );
     let mut body = StreamingBody::new(&mut cancellable, &mut client.dirty, &framing, tail, silence);
     let mut buf = vec![0u8; HEAD_BUF_SIZE];
     loop {
@@ -637,6 +670,9 @@ pub struct CancellableStream<'a, S: Read> {
     silence: std::time::Duration,
     /// When the last successful read completed; the silence clock.
     last_progress: std::time::Instant,
+    /// Set when the owning [`AsyncClient`] is dropping; the next retry
+    /// unwinds instead of waiting out the silence budget.
+    shutting_down: &'a AtomicBool,
 }
 
 impl<'a, S: Read> CancellableStream<'a, S> {
@@ -646,6 +682,7 @@ impl<'a, S: Read> CancellableStream<'a, S> {
         pending: &'a mut VecDeque<AsyncRequest>,
         silence: std::time::Duration,
         ticket: u64,
+        shutting_down: &'a AtomicBool,
     ) -> Self {
         Self {
             inner,
@@ -654,6 +691,7 @@ impl<'a, S: Read> CancellableStream<'a, S> {
             ticket,
             silence,
             last_progress: std::time::Instant::now(),
+            shutting_down,
         }
     }
 }
@@ -661,7 +699,12 @@ impl<'a, S: Read> CancellableStream<'a, S> {
 impl<S: Read> Read for CancellableStream<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            if poll_control(self.control_rx, self.pending, Some(self.ticket)) {
+            if poll_control(
+                self.control_rx,
+                self.pending,
+                Some(self.ticket),
+                self.shutting_down,
+            ) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "request cancelled",
@@ -674,10 +717,17 @@ impl<S: Read> Read for CancellableStream<'_, S> {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Read timeout expired. Retry to re-check the cancel
-                    // message — but never past the silence budget, so a
-                    // silently dead peer surfaces as a descriptive error
-                    // (not raw EAGAIN) instead of wedging the reader
-                    // thread and every queued request behind it.
+                    // message and the shutdown flag — but never past the
+                    // silence budget, so a silently dead peer surfaces as
+                    // a descriptive error (not raw EAGAIN) instead of
+                    // wedging the reader thread and every queued request
+                    // behind it.
+                    if self.shutting_down.load(Ordering::Acquire) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "client dropped mid-read",
+                        ));
+                    }
                     if self.last_progress.elapsed() >= self.silence {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,

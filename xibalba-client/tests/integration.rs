@@ -1910,7 +1910,7 @@ fn head_too_large_rejected() {
     drop(server);
 }
 
-// ── Audit regression tests ───────────────────────────────────────────────────
+// ── Audit regression tests ──────────────────────────────────────────────────
 
 #[test]
 fn head_request_gets_empty_body_without_waiting_for_one() {
@@ -2123,5 +2123,58 @@ fn switching_protocols_is_surfaced_as_final_response() {
         xibalba_client::proto::status::StatusCode::SWITCHING_PROTOCOLS
     );
     assert_eq!(resp.text().unwrap(), "");
+    server.join().unwrap();
+}
+
+#[test]
+fn async_client_drop_interrupts_in_flight_stream_quickly() {
+    // Dropping the AsyncClient while the reader is parked on a stalled
+    // in-flight response must not wait out the full stream_silence
+    // budget: the shutdown flag turns the next WouldBlock retry into an
+    // unwind, so drop returns within a couple of read-timeout windows.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        // Stall without closing; the reader parks on the socket. The
+        // stream is intentionally never terminated. Held open just long
+        // enough to cover the client-side assertions.
+        thread::sleep(Duration::from_secs(2));
+    });
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(100)),
+        stream_silence: Duration::from_mins(5),
+        ..Config::default()
+    };
+    let client: AsyncClient = AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config)
+        .unwrap();
+
+    let mut handle = client
+        .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 200, .. })
+    ));
+    assert_eq!(handle.next_block(), Some(Chunk::Body(b"first".to_vec())));
+
+    // Drop with a body stream stalled: the reader is inside the retry
+    // loop. Without the shutdown flag, the join inside drop blocks for
+    // stream_silence (300 s here).
+    let started = std::time::Instant::now();
+    drop(client);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "drop took {elapsed:?}; the shutdown flag did not interrupt the stalled read"
+    );
+
     server.join().unwrap();
 }
