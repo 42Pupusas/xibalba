@@ -86,9 +86,8 @@ impl Request<'_> {
     /// `Error::Serialize` (`InvalidPath` / `InvalidHeader`) when the
     /// target or headers contain bytes that cannot be serialized safely.
     pub fn serialize_to_writer(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        self.validate().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
-        })?;
+        self.validate()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         w.write_all(self.method.as_bytes())?;
         w.write_all(b" ")?;
         w.write_all(self.path)?;

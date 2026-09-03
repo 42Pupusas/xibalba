@@ -410,12 +410,24 @@ fn run_reader<C, const MAX_HEAD_SIZE: usize>(
             break;
         }
         if let Some(request) = pending.pop_front() {
-            process_request(&mut client, request, &mut control_rx, &mut pending, shutting_down);
+            process_request(
+                &mut client,
+                request,
+                &mut control_rx,
+                &mut pending,
+                shutting_down,
+            );
             continue;
         }
         match control_rx.pop_block() {
             Some(Control::Request(request)) => {
-                process_request(&mut client, request, &mut control_rx, &mut pending, shutting_down);
+                process_request(
+                    &mut client,
+                    request,
+                    &mut control_rx,
+                    &mut pending,
+                    shutting_down,
+                );
             }
             Some(Control::Cancel(_)) => {
                 // No request in flight; cancel is a no-op.

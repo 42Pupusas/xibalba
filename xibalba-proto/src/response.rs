@@ -204,7 +204,10 @@ impl BodyFraming {
         let mut content_length: Option<u64> = None;
         for h in hdrs {
             if h.name == HeaderName::ContentLength {
-                let len = h.value.parse_u64().ok_or(ParseError::InvalidContentLength)?;
+                let len = h
+                    .value
+                    .parse_u64()
+                    .ok_or(ParseError::InvalidContentLength)?;
                 if content_length.is_some_and(|prev| prev != len) {
                     return Err(ParseError::InvalidContentLength);
                 }
@@ -641,8 +644,7 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
@@ -654,8 +656,7 @@ mod tests {
             value: b"chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -664,8 +665,7 @@ mod tests {
     fn body_framing_none_for_204() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers, 0)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers, 0).unwrap(),
             BodyFraming::None
         );
     }
@@ -677,8 +677,7 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, true, &headers, 1)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::OK, true, &headers, 1).unwrap(),
             BodyFraming::None
         );
     }
@@ -687,8 +686,7 @@ mod tests {
     fn body_framing_until_close() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 0)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 0).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -706,8 +704,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -933,8 +930,7 @@ mod tests {
             value: b"1000",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers, 1)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers, 1).unwrap(),
             BodyFraming::None
         );
     }
@@ -943,8 +939,7 @@ mod tests {
     fn body_framing_1xx_no_body() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers, 0)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers, 0).unwrap(),
             BodyFraming::None
         );
     }
@@ -968,8 +963,7 @@ mod tests {
             value: b" 42 ",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
@@ -1069,8 +1063,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2)
-                .unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
             BodyFraming::Chunked
         );
     }

@@ -1934,7 +1934,9 @@ fn head_request_gets_empty_body_without_waiting_for_one() {
     });
 
     let mut client = connect(port);
-    let resp = client.request(Method::Head, b"/resource", None, None).unwrap();
+    let resp = client
+        .request(Method::Head, b"/resource", None, None)
+        .unwrap();
     assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
     assert_eq!(resp.text().unwrap(), "");
     server.join().unwrap();
@@ -2084,9 +2086,7 @@ fn interim_100_response_is_skipped() {
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
-        stream
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .unwrap();
+        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
         stream.flush().unwrap();
         thread::sleep(Duration::from_millis(100));
         stream
@@ -2153,8 +2153,8 @@ fn async_client_drop_interrupts_in_flight_stream_quickly() {
         stream_silence: Duration::from_mins(5),
         ..Config::default()
     };
-    let client: AsyncClient = AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config)
-        .unwrap();
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config).unwrap();
 
     let mut handle = client
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
