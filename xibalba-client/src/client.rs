@@ -1,253 +1,29 @@
 use std::io::Write;
-use std::time::Duration;
 
-use xibalba_proto::bytes::ByteSliceExt;
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
-use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
 use xibalba_proto::version::Version;
 
-use crate::body::{
-    BodyReader, HEAD_BUF_SIZE, HeadData, StreamingBody, read_body, read_response_head,
-};
-use crate::connector::Connector;
+use crate::body::{BodyCollector, BodyReader, StreamingBody};
+use crate::config::HEAD_BUF_SIZE;
+use crate::connector::{Connector, SetReadTimeout};
+use crate::params::RequestParams;
+use crate::redirect::RedirectState;
+use crate::response::HeadData;
 
-// ── Config ───────────────────────────────────────────────────────────────────
+pub use crate::config::{Config, DEFAULT_MAX_HEAD_SIZE};
+pub use crate::params::RequestBuilder;
+pub use crate::response::{Response, StreamingResponse};
 
-/// Default maximum response-head size in bytes.
+/// A blocking HTTP/1.1 client over one connection.
 ///
-/// API gateways commonly attach tracing, rate-limit, and routing metadata.
-/// 64 KiB accepts those normal responses while retaining a bounded default.
-/// Select another compile-time limit with `Client<C, MAX_HEAD_SIZE>` or
-/// `AsyncClient<MAX_HEAD_SIZE>` when an integration has different needs.
-pub const DEFAULT_MAX_HEAD_SIZE: usize = 64 * 1024;
-
-/// Largest request body written as part of the head buffer instead of a
-/// second `write_all`. One write avoids the delayed-ACK stall a two-write
-/// dispatch can hit against servers without `TCP_NODELAY`; larger bodies
-/// are streamed separately to spare the copy.
-const MAX_INLINE_BODY: usize = 64 * 1024;
-
-pub struct Config {
-    /// Per-socket-read ceiling (`SO_RCVTIMEO`). Keep this SHORT: it is
-    /// the granularity at which a cancel signal is observed mid-stream,
-    /// not a failure threshold. Silence tolerance is governed by the
-    /// two budgets below, which retry across read-timeout ticks. Must
-    /// be finite: with `None` the reader parks in the kernel until data
-    /// arrives and the silence budgets can never trip.
-    pub read_timeout: Option<Duration>,
-    pub max_response_body: usize,
-    pub max_redirects: u8,
-    /// Total wall-clock silence tolerated while waiting for a response
-    /// head (between flushing the request and the first response byte).
-    ///
-    /// Inference providers legitimately spend a long time queueing,
-    /// doing prompt-cache lookup, and initial reasoning before they
-    /// emit the SSE head — a budget tied to `read_timeout` retry
-    /// *counts* silently changed meaning with the configured timeout
-    /// and surfaced raw `EAGAIN` ("os error 11") on healthy-but-slow
-    /// starts. This is an explicit duration instead.
-    pub head_silence: Duration,
-    /// Total wall-clock silence tolerated between body bytes of a
-    /// streaming response. Resets on every successful read. Generous
-    /// by default: reasoning models can go quiet for minutes between
-    /// SSE events; the cap only exists so a peer that half-dies
-    /// without FIN/RST (NAT drop) surfaces as an error instead of
-    /// wedging the reader forever.
-    pub stream_silence: Duration,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            read_timeout: Some(Duration::from_secs(30)),
-            max_response_body: 10 * 1024 * 1024,
-            max_redirects: 10,
-            head_silence: Duration::from_mins(2),
-            stream_silence: Duration::from_mins(5),
-        }
-    }
-}
-
-// ── Redirect state ───────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct RedirectState {
-    method: Method,
-    path: Vec<u8>,
-    query: Option<Vec<u8>>,
-    body: Option<Vec<u8>>,
-    extra_headers: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-impl RedirectState {
-    fn new(params: &RequestParams<'_>) -> Self {
-        Self {
-            method: params.method,
-            path: params.path.to_vec(),
-            query: params.query.map(<[u8]>::to_vec),
-            body: params.body.map(<[u8]>::to_vec),
-            extra_headers: params.extra_headers.clone(),
-        }
-    }
-
-    fn to_params(&self) -> RequestParams<'_> {
-        RequestParams {
-            method: self.method,
-            path: &self.path,
-            query: self.query.as_deref(),
-            body: self.body.as_deref(),
-            extra_headers: self.extra_headers.clone(),
-        }
-    }
-
-    /// Drop credentials-bearing headers when a redirect leaves the origin.
-    /// `Authorization` and the proxy variant are stripped outright; `Cookie`
-    /// is replaced with a `Host`-scoped placeholder so the target origin
-    /// never receives another origin's cookies.
-    fn retarget_headers(&mut self, new_host: Option<&[u8]>) {
-        let Some(new_host) = new_host else {
-            return;
-        };
-        let new_host = new_host.to_vec();
-        self.extra_headers.retain(|(name, _)| {
-            !(name.ascii_eq_ignore_case(b"Authorization")
-                || name.ascii_eq_ignore_case(b"Proxy-Authorization")
-                || name.ascii_eq_ignore_case(b"Cookie")
-                || name.ascii_eq_ignore_case(b"Cookie2"))
-        });
-        self.extra_headers.push((b"Host".to_vec(), new_host));
-    }
-}
-
-// ── Response ─────────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub struct Response {
-    pub version: Version,
-    pub status: StatusCode,
-    pub head: HeadData,
-    pub body: BodyReader,
-}
-
-/// A response whose body is decoded incrementally from the live
-/// connection. Produced by [`Client::send_streaming`].
-///
-/// Borrows the client mutably until dropped. Reading the body to
-/// completion leaves the connection reusable; dropping early marks it
-/// dirty so the next request reconnects.
-#[derive(Debug)]
-pub struct StreamingResponse<'a, S: std::io::Read> {
-    pub version: Version,
-    pub status: StatusCode,
-    pub head: HeadData,
-    pub body: StreamingBody<'a, S>,
-}
-
-impl<S: std::io::Read> StreamingResponse<'_, S> {
-    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.head.headers()
-    }
-}
-
-impl Response {
-    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.head.headers()
-    }
-
-    /// # Errors
-    ///
-    /// Returns `Error::Io` on read failure, or `Error::Connection` if the
-    /// body is not valid UTF-8.
-    pub fn text(mut self) -> Result<String, Error> {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        self.body.read_to_end(&mut buf).map_err(Error::from)?;
-        String::from_utf8(buf).map_err(|_| Error::from(ConnectionError::InvalidUtf8Body))
-    }
-}
-
-// ── Request params ───────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub(crate) struct RequestParams<'a> {
-    pub(crate) method: Method,
-    pub(crate) path: &'a [u8],
-    pub(crate) query: Option<&'a [u8]>,
-    pub(crate) body: Option<&'a [u8]>,
-    /// Owned header bytes: redirects splice in a new `Host` borrowed from
-    /// the `Location` header, so extra headers cannot share one lifetime
-    /// with the original request data.
-    pub(crate) extra_headers: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-// ── RequestBuilder ───────────────────────────────────────────────────────────
-
-/// Collects request parameters for deferred execution.
-///
-/// Created by [`Client::build`]; consumed by [`Client::send`] or
-/// [`Client::send_streaming`].  The builder borrows only the request
-/// data (path, headers, body), never the client.
-pub struct RequestBuilder<'a> {
-    method: Method,
-    path: &'a [u8],
-    query: Option<&'a [u8]>,
-    body: Option<&'a [u8]>,
-    extra_headers: Vec<(&'a [u8], &'a [u8])>,
-}
-
-impl<'a> RequestBuilder<'a> {
-    #[must_use]
-    pub fn header(mut self, name: &'a [u8], value: &'a [u8]) -> Self {
-        self.extra_headers.push((name, value));
-        self
-    }
-
-    #[must_use]
-    pub const fn body(mut self, data: &'a [u8]) -> Self {
-        self.body = Some(data);
-        self
-    }
-
-    #[must_use]
-    pub const fn query(mut self, q: &'a [u8]) -> Self {
-        self.query = Some(q);
-        self
-    }
-
-    /// Execute this request on `client` and return the full response.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error` on serialization or connection failure.
-    pub fn send<C: Connector, const MAX_HEAD_SIZE: usize>(
-        self,
-        client: &mut Client<C, MAX_HEAD_SIZE>,
-    ) -> Result<Response, Error> {
-        client.execute(&self.into_params())
-    }
-
-    /// Materialize the collected parameters into [`RequestParams`].
-    pub(crate) fn into_params(self) -> RequestParams<'a> {
-        RequestParams {
-            method: self.method,
-            path: self.path,
-            query: self.query,
-            body: self.body,
-            extra_headers: self
-                .extra_headers
-                .iter()
-                .map(|(n, v)| (n.to_vec(), v.to_vec()))
-                .collect(),
-        }
-    }
-}
-
-// ── Client ───────────────────────────────────────────────────────────────────
-
+/// Requests go through [`Client::build`] (fluent) or the one-shot
+/// [`Client::request`]/[`Client::get`]/[`Client::post`] helpers. A
+/// keep-alive connection that dies between requests is reconnected and
+/// the request retried once before any response byte is seen.
 pub struct Client<C: Connector, const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SIZE> {
     tls_config: C::TlsConfig,
     pub(crate) stream: C::Stream,
@@ -301,17 +77,11 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     }
 
     /// Start building a request.  Chain `.header()`, `.body()`,
-    /// `.query()`, then call [`Client::send`] or
+    /// `.query()`, then call [`RequestBuilder::send`] or
     /// [`Client::send_streaming`].
     #[must_use]
     pub const fn build<'a>(&self, method: Method, path: &'a [u8]) -> RequestBuilder<'a> {
-        RequestBuilder {
-            method,
-            path,
-            query: None,
-            body: None,
-            extra_headers: Vec::new(),
-        }
+        RequestBuilder::new(method, path)
     }
 
     /// Execute a fully-buffered request built with [`Client::build`].
@@ -378,7 +148,6 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     // ── internals ────────────────────────────────────────────────────────────
 
     fn apply_timeouts(&self) -> Result<(), Error> {
-        use crate::connector::SetReadTimeout;
         self.stream.set_read_timeout(self.config.read_timeout)?;
         Ok(())
     }
@@ -389,21 +158,12 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         if !self.dirty {
             return Ok(());
         }
-        let host = self.host.clone();
-        let url = Url {
-            scheme: self.scheme,
-            host: &host,
-            port: Some(self.port),
-            path: b"/",
-            query: None,
-            fragment: None,
-        };
-        self.reconnect(&url)?;
+        self.reconnect_same_host()?;
         self.dirty = false;
         Ok(())
     }
 
-    fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
+    pub(crate) fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
         self.stream = C::connect(url, &self.tls_config)?;
         self.host = url.host.to_vec();
         self.port = url.effective_port();
@@ -430,7 +190,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// Mark the live connection unusable after a response head could not be
     /// fully read. The next request must reconnect: unread header/body bytes
     /// would otherwise be interpreted as a new status line.
-    const fn discard_partial_response(&mut self) {
+    pub(crate) const fn discard_partial_response(&mut self) {
         self.dirty = true;
     }
 
@@ -451,6 +211,11 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             ),
             _ => false,
         }
+    }
+
+    /// Whether `url` points at the origin this client is connected to.
+    pub(crate) fn is_same_origin(&self, url: &Url<'_>) -> bool {
+        url.host == &self.host[..] && url.effective_port() == self.port && url.scheme == self.scheme
     }
 
     fn host_header_value(&self) -> Vec<u8> {
@@ -495,7 +260,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// Write one request and read the response head, leaving the body
     /// unread on the stream. Returns the head, its framing, and the
     /// offset of the body's first byte within `self.head_buf`.
-    pub(crate) fn send_head_once(
+    fn send_head_once(
         &mut self,
         params: &RequestParams<'_>,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
@@ -531,7 +296,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         req.serialize_to_writer(&mut self.write_buf)?;
 
         match params.body {
-            Some(data) if self.write_buf.len() + data.len() <= MAX_INLINE_BODY => {
+            Some(data) if self.inline_body_fits(data.len()) => {
                 self.write_buf.extend_from_slice(data);
                 self.stream.write_all(&self.write_buf)?;
             }
@@ -543,14 +308,13 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         }
         self.stream.flush()?;
 
-        let head = read_response_head(
+        match HeadData::read_response(
             &mut self.stream,
             &mut self.head_buf,
             MAX_HEAD_SIZE,
             self.config.head_silence,
             params.method == Method::Head,
-        );
-        match head {
+        ) {
             Ok(parts) => Ok(parts),
             Err(error) => {
                 // The parser may have consumed a prefix of this response even
@@ -563,24 +327,38 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         }
     }
 
-    fn send_one(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
-        let (head_data, framing, tail_offset) = self.send_head(params)?;
+    /// Largest request body written as part of the head buffer instead of
+    /// a second `write_all`. One write avoids the delayed-ACK stall a
+    /// two-write dispatch can hit against servers without `TCP_NODELAY`;
+    /// larger bodies are streamed separately to spare the copy.
+    const fn inline_body_fits(&self, body_len: usize) -> bool {
+        self.write_buf.len() + body_len <= MAX_INLINE_BODY
+    }
 
-        let body_data = match read_body(
-            &mut self.stream,
-            &framing,
-            &self.head_buf[tail_offset..],
-            self.config.max_response_body,
-            self.config.stream_silence,
-        ) {
-            Ok(data) => data,
-            Err(error) => {
-                // The body may be partially unread on the socket; never
-                // reuse this connection for the next response.
-                self.discard_partial_response();
-                return Err(error);
-            }
-        };
+    /// Read the response body declared by `framing` into memory,
+    /// marking the connection dirty on failure (the body may be
+    /// partially unread on the socket; never reuse the connection for
+    /// the next response).
+    ///
+    /// `pub(crate)` so the async reader can drain non-2xx bodies with
+    /// the same dirty-flag semantics as the blocking path.
+    pub(crate) fn read_full_body(
+        &mut self,
+        framing: &xibalba_proto::response::BodyFraming,
+        tail_offset: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let mut collector =
+            BodyCollector::new(self.config.max_response_body, self.config.stream_silence);
+        let data = collector.read(&mut self.stream, framing, &self.head_buf[tail_offset..]);
+        if data.is_err() {
+            self.discard_partial_response();
+        }
+        data
+    }
+
+    pub(crate) fn send_one(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
+        let (head_data, framing, tail_offset) = self.send_head(params)?;
+        let body_data = self.read_full_body(&framing, tail_offset)?;
 
         Ok(Response {
             version: head_data.version,
@@ -624,80 +402,9 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
 
     fn execute(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
         self.ensure_clean()?;
-
-        let mut current = RedirectState::new(params);
-
-        for _ in 0..=self.config.max_redirects {
-            let resp = self.send_one(&current.to_params())?;
-
-            if !resp.status.is_redirect() {
-                return Ok(resp);
-            }
-
-            let location = resp
-                .headers()
-                .find(|(name, _)| name.ascii_eq_ignore_case(b"Location"))
-                .map(|(_, v)| v);
-
-            let location = match location {
-                Some(loc) => loc.to_vec(),
-                None => return Ok(resp),
-            };
-
-            if !Self::is_redirect_method_preserving(resp.status) {
-                current.method = Method::Get;
-                current.body = None;
-            }
-
-            self.apply_redirect_location(&location, &mut current)?;
-        }
-
-        Err(ConnectionError::TooManyRedirects.into())
-    }
-
-    const fn is_redirect_method_preserving(status: StatusCode) -> bool {
-        matches!(
-            status,
-            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
-        )
-    }
-
-    fn apply_redirect_location(
-        &mut self,
-        location: &[u8],
-        current: &mut RedirectState,
-    ) -> Result<(), Error> {
-        if location.starts_with(b"http://") || location.starts_with(b"https://") {
-            let url = Url::parse(location)?;
-            let target_port = url.effective_port();
-            let same_origin =
-                url.host == &self.host[..] && target_port == self.port && url.scheme == self.scheme;
-            if same_origin {
-                current.retarget_headers(None);
-            } else {
-                self.reconnect(&url)?;
-                current.retarget_headers(Some(url.host));
-            }
-            current.path = normalize_path(url.path);
-            current.query = url.query.map(<[u8]>::to_vec);
-        } else {
-            let (path_part, query_part) = location
-                .iter()
-                .position(|&b| b == b'?')
-                .map_or((location, None), |pos| {
-                    (&location[..pos], Some(location[pos + 1..].to_vec()))
-                });
-            current.path = normalize_path(path_part);
-            current.query = query_part;
-        }
-        Ok(())
+        RedirectState::follow(self, params)
     }
 }
 
-fn normalize_path(path: &[u8]) -> Vec<u8> {
-    if path.is_empty() {
-        b"/".to_vec()
-    } else {
-        path.to_vec()
-    }
-}
+/// See [`Client::inline_body_fits`].
+const MAX_INLINE_BODY: usize = 64 * 1024;

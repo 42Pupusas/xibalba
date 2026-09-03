@@ -55,8 +55,10 @@ use quetzalcoatl::spsc::{self, Consumer as SpscConsumer};
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::method::Method;
 
-use crate::body::{HEAD_BUF_SIZE, StreamingBody};
+use crate::body::StreamingBody;
 use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
+use crate::config::HEAD_BUF_SIZE;
+use crate::params::RequestParams;
 
 /// Default capacity for the per-request chunk ring: a few SSE
 /// events worth of buffering. The ring parks the caller on full
@@ -539,7 +541,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // Send the head. `send_head` handles the stale-keep-alive
     // reconnect internally (the read failure was before any
     // response byte reached the caller, so retry is safe).
-    let request_params = crate::client::RequestParams {
+    let request_params = RequestParams {
         method,
         path: &path,
         query: query.as_deref(),
@@ -588,13 +590,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // Non-2xx: drain the body as a single chunk for the caller
     // to inspect (e.g. error message from the API).
     if !(200..300).contains(&status) {
-        let body_result = crate::body::read_body(
-            &mut client.stream,
-            &framing,
-            &client.head_buf[tail_offset..],
-            client.config.max_response_body,
-            client.config.stream_silence,
-        );
+        let body_result = client.read_full_body(&framing, tail_offset);
         match body_result {
             Ok(bytes) => {
                 // Body fully consumed — the socket is positioned at the
