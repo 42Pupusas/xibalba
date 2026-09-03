@@ -1,4 +1,4 @@
-use xibalba_proto::error::Error;
+use xibalba_proto::error::{Error, SerializeError};
 use xibalba_proto::method::Method;
 
 use crate::client::Client;
@@ -19,14 +19,47 @@ pub(crate) struct RequestParams<'a> {
 }
 
 impl RequestParams<'_> {
-    /// Header bytes the client itself writes; duplicates would produce a
+    /// Header bytes the client serializes itself; duplicates would produce a
     /// malformed or misleading request. `Cookie` and `Cookie2` are exempt:
     /// multiple cookie headers are legal and common.
-    pub(crate) fn is_client_managed(name: &[u8]) -> bool {
+    pub(crate) fn is_managed(name: &[u8]) -> bool {
         use xibalba_proto::bytes::ByteSliceExt;
         name.ascii_eq_ignore_case(b"Host")
             || name.ascii_eq_ignore_case(b"Content-Length")
             || name.ascii_eq_ignore_case(b"Transfer-Encoding")
+    }
+
+    /// Headers that may legitimately appear several times in one
+    /// request; duplicates of any other name are a caller bug.
+    fn is_repeatable(name: &[u8]) -> bool {
+        use xibalba_proto::bytes::ByteSliceExt;
+        name.ascii_eq_ignore_case(b"Cookie") || name.ascii_eq_ignore_case(b"Cookie2")
+    }
+
+    /// Reject headers the client serializes itself and duplicate names
+    /// before any byte is written. [`RequestBuilder::into_params`] and
+    /// [`AsyncClient::submit`](crate::async_client::AsyncClient::submit)
+    /// both funnel request headers through this check: a builder cannot
+    /// carry the error through its infallible chain, so it surfaces at
+    /// the fallible boundary instead.
+    pub(crate) fn validate_extra_headers(
+        extra_headers: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), SerializeError> {
+        for (name, _) in extra_headers {
+            if Self::is_managed(name) {
+                return Err(SerializeError::DuplicateHeader);
+            }
+            if extra_headers
+                .iter()
+                .filter(|(other, _)| names_match(other, name))
+                .count()
+                > 1
+                && !Self::is_repeatable(name)
+            {
+                return Err(SerializeError::DuplicateHeader);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -55,29 +88,16 @@ impl<'a> RequestBuilder<'a> {
         }
     }
 
-    /// Attach a header to the request.
+    /// Attach a header to the request. Multiple `Cookie` headers are
+    /// allowed.
     ///
-    /// # Panics
-    ///
-    /// Panics if `name` duplicates a header the client writes itself
-    /// (`Host`, `Content-Length`, `Transfer-Encoding`) or duplicates an
-    /// earlier call. Multiple `Cookie` headers are allowed.
+    /// The builder cannot fail per call — a rejected header is reported
+    /// when the builder is sent, as [`Error::Serialize`] with
+    /// [`SerializeError::DuplicateHeader`] (headers the client serializes
+    /// itself: `Host`, `Content-Length`, `Transfer-Encoding`, or a
+    /// duplicate name).
     #[must_use]
-    #[track_caller]
     pub fn header(mut self, name: &'a [u8], value: &'a [u8]) -> Self {
-        assert!(
-            !RequestParams::is_client_managed(name),
-            "duplicate managed header: {}",
-            String::from_utf8_lossy(name),
-        );
-        assert!(
-            !self
-                .extra_headers
-                .iter()
-                .any(|(existing, _)| names_match(existing, name)),
-            "duplicate header: {}",
-            String::from_utf8_lossy(name),
-        );
         self.extra_headers.push((name, value));
         self
     }
@@ -98,7 +118,8 @@ impl<'a> RequestBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `Error` on serialization or connection failure.
+    /// Returns `Error` on serialization, duplicate-header, or connection
+    /// failure.
     pub fn send<C: Connector, const MAX_HEAD_SIZE: usize>(
         self,
         client: &mut Client<C, MAX_HEAD_SIZE>,
@@ -107,8 +128,15 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Materialize the collected parameters into [`RequestParams`].
-    pub(crate) fn into_params(self) -> RequestParams<'a> {
-        RequestParams {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SerializeError::DuplicateHeader`] when the builder
+    /// carries a header the client serializes itself (`Host`,
+    /// `Content-Length`, `Transfer-Encoding`) or the same header name
+    /// twice.
+    pub(crate) fn into_params(self) -> Result<RequestParams<'a>, Error> {
+        let params = RequestParams {
             method: self.method,
             path: self.path,
             query: self.query,
@@ -118,7 +146,9 @@ impl<'a> RequestBuilder<'a> {
                 .iter()
                 .map(|(n, v)| (n.to_vec(), v.to_vec()))
                 .collect(),
-        }
+        };
+        RequestParams::validate_extra_headers(&params.extra_headers)?;
+        Ok(params)
     }
 }
 

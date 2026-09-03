@@ -311,8 +311,10 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
     /// producer half travels with the request to the reader.
     ///
     /// # Errors
-    /// Returns `Error::Connection` if the reader thread has
-    /// already exited.
+    /// Returns `Error::Serialize(DuplicateHeader)` when `headers`
+    /// contains a header the client serializes itself (`Host`,
+    /// `Content-Length`, `Transfer-Encoding`) or the same name twice;
+    /// `Error::Connection` if the reader thread has already exited.
     pub fn submit(
         &self,
         method: Method,
@@ -321,6 +323,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
         body: Option<Vec<u8>>,
         headers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<StreamHandle, Error> {
+        RequestParams::validate_extra_headers(&headers)?;
         let (chunk_tx, chunk_rx) =
             spsc::RingBuffer::<Chunk>::new(Capacity::at_least(CHUNK_RING_CAP)).split();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);

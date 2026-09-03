@@ -87,6 +87,10 @@ pub enum SerializeError {
     /// outside the field-value set (CTLs other than HTAB) — including
     /// CRLF injection.
     InvalidHeader,
+    /// The request declares a header the client serializes itself
+    /// (`Host`, `Content-Length`, `Transfer-Encoding`) or the same
+    /// header name twice.
+    DuplicateHeader,
 }
 
 impl fmt::Display for IoError {
@@ -168,6 +172,7 @@ impl fmt::Display for SerializeError {
             Self::BufferTooSmall => f.write_str("output buffer too small"),
             Self::InvalidPath => f.write_str("invalid request target"),
             Self::InvalidHeader => f.write_str("invalid request header"),
+            Self::DuplicateHeader => f.write_str("duplicate request header"),
         }
     }
 }
@@ -366,6 +371,10 @@ mod tests {
         assert_eq!(
             display(SerializeError::InvalidHeader),
             "invalid request header"
+        );
+        assert_eq!(
+            display(SerializeError::DuplicateHeader),
+            "duplicate request header"
         );
     }
 

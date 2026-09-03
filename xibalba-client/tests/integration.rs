@@ -1520,6 +1520,102 @@ fn builder_with_body_and_headers() {
 }
 
 #[test]
+fn builder_rejects_managed_header_as_an_error() {
+    // Validation fires before any byte is written, so a bare listener
+    // is enough for the client to connect to.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = connect(listener.local_addr().unwrap().port());
+
+    let err = client
+        .send(
+            client
+                .build(Method::Get, b"/")
+                .header(b"Host", b"attacker.example"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        xibalba_client::proto::error::Error::Serialize(
+            xibalba_client::proto::error::SerializeError::DuplicateHeader
+        )
+    );
+}
+
+#[test]
+fn builder_rejects_duplicate_header_name_as_an_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = connect(listener.local_addr().unwrap().port());
+
+    let err = client
+        .send(
+            client
+                .build(Method::Get, b"/")
+                .header(b"X-Trace", b"a")
+                .header(b"x-trace", b"b"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        xibalba_client::proto::error::Error::Serialize(
+            xibalba_client::proto::error::SerializeError::DuplicateHeader
+        )
+    );
+}
+
+#[test]
+fn builder_multiple_cookie_headers_are_allowed() {
+    let (port, server) = echo_request_server();
+    let mut client = connect(port);
+
+    client
+        .send(
+            client
+                .build(Method::Get, b"/")
+                .header(b"Cookie", b"a=1")
+                .header(b"Cookie", b"b=2"),
+        )
+        .unwrap();
+
+    let req_bytes = server.join().unwrap();
+    let req = String::from_utf8_lossy(&req_bytes);
+    assert!(req.contains("Cookie: a=1"), "missing first cookie:\n{req}");
+    assert!(req.contains("Cookie: b=2"), "missing second cookie:\n{req}");
+}
+
+#[test]
+fn async_submit_rejects_duplicate_header_name_as_an_error() {
+    // connect() must succeed, so something has to listen; validation
+    // then rejects the headers before the reader thread is involved.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), Config::default()).unwrap();
+
+    let err = client
+        .submit(
+            Method::Get,
+            b"/".to_vec(),
+            None,
+            None,
+            vec![
+                (b"X-Trace".to_vec(), b"a".to_vec()),
+                (b"x-trace".to_vec(), b"b".to_vec()),
+            ],
+        )
+        .err()
+        .expect("submit must reject duplicate header names");
+    assert_eq!(
+        err,
+        xibalba_client::proto::error::Error::Serialize(
+            xibalba_client::proto::error::SerializeError::DuplicateHeader
+        )
+    );
+}
+
+#[test]
 fn builder_no_hardcoded_user_agent() {
     let (port, server) = echo_request_server();
     let mut client = connect(port);

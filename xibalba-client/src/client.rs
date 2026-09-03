@@ -92,7 +92,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// Returns `Error` on connection failure, serialization error,
     /// or too many redirects.
     pub fn send(&mut self, builder: RequestBuilder<'_>) -> Result<Response, Error> {
-        self.execute(&builder.into_params())
+        self.execute(&builder.into_params()?)
     }
 
     /// Execute a streaming request built with [`Client::build`].
@@ -109,7 +109,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         &mut self,
         builder: RequestBuilder<'_>,
     ) -> Result<StreamingResponse<'_, C::Stream>, Error> {
-        self.execute_streaming(&builder.into_params())
+        self.execute_streaming(&builder.into_params()?)
     }
 
     /// # Errors
