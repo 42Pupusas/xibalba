@@ -41,10 +41,10 @@ impl<'a> ResponseHead<'a> {
 
         let status = StatusCode::try_from(&status_line[9..12])?;
 
-        let reason = if status_line.len() > 13 && status_line[12] == b' ' {
-            &status_line[13..]
-        } else {
-            b""
+        let reason = match status_line.get(12) {
+            None => b"".as_slice(),
+            Some(b' ') => &status_line[13..],
+            Some(_) => return Err(ParseError::InvalidStatusCode.into()),
         };
 
         let mut pos = status_line_end + 2;
@@ -167,10 +167,12 @@ pub enum BodyFraming {
 impl BodyFraming {
     /// Determine body framing from the response status and headers.
     ///
-    /// `Transfer-Encoding: chunked` wins over `Content-Length` (RFC 9112
-    /// §6.1). Multiple `Content-Length` headers are accepted only when
-    /// every value parses to the same number — a conflicting or
-    /// unparseable value is a smuggling vector and is rejected.
+    /// Any `Transfer-Encoding` overrides `Content-Length` (RFC 9112
+    /// §6.3): when `chunked` is the final coding the body is chunked;
+    /// when it is absent or not final the body runs until close, since
+    /// a `Content-Length` next to a transfer coding is a smuggling
+    /// vector. Multiple `Content-Length` headers are accepted only when
+    /// every value parses to the same number.
     ///
     /// # Errors
     ///
@@ -193,12 +195,8 @@ impl BodyFraming {
 
         let hdrs = &headers[..header_count];
 
-        for h in hdrs {
-            if h.name == HeaderName::TransferEncoding
-                && h.value.contains_token_ignore_case(b"chunked")
-            {
-                return Ok(Self::Chunked);
-            }
+        if let Some(framing) = Self::from_transfer_encoding(hdrs) {
+            return Ok(framing);
         }
 
         let mut content_length: Option<u64> = None;
@@ -221,6 +219,35 @@ impl BodyFraming {
 
         Ok(Self::UntilClose)
     }
+
+    /// Framing dictated by `Transfer-Encoding`, or `None` when the
+    /// header is absent. The codings of every `Transfer-Encoding`
+    /// header form one list in order; only a trailing `chunked` frames
+    /// the body.
+    fn from_transfer_encoding(headers: &[Header<'_>]) -> Option<Self> {
+        let mut last_coding: Option<&[u8]> = None;
+        for h in headers {
+            if h.name != HeaderName::TransferEncoding {
+                continue;
+            }
+            for coding in h.value.split(|&b| b == b',') {
+                let coding = coding.trim_ows();
+                if !coding.is_empty() {
+                    last_coding = Some(coding);
+                }
+            }
+            if last_coding.is_none() {
+                last_coding = Some(b"");
+            }
+        }
+        last_coding.map(|coding| {
+            if coding.ascii_eq_ignore_case(b"chunked") {
+                Self::Chunked
+            } else {
+                Self::UntilClose
+            }
+        })
+    }
 }
 
 // --- Chunked transfer decoder state machine ---
@@ -230,6 +257,7 @@ impl BodyFraming {
 pub struct ChunkedDecoder {
     state: ChunkedState,
     chunk_size: u64,
+    size_digits: u8,
     remaining: u64,
     trailer_line_empty: bool,
 }
@@ -272,6 +300,7 @@ impl ChunkedDecoder {
         Self {
             state: ChunkedState::ReadingSize,
             chunk_size: 0,
+            size_digits: 0,
             remaining: 0,
             trailer_line_empty: true,
         }
@@ -346,6 +375,7 @@ impl ChunkedDecoder {
             match self.state {
                 ChunkedState::ReadingSize => {
                     if let Some(digit) = HexDigit::decode(b) {
+                        self.size_digits += 1;
                         self.chunk_size = match self
                             .chunk_size
                             .checked_mul(16)
@@ -359,11 +389,13 @@ impl ChunkedDecoder {
                                 ));
                             }
                         };
-                    } else if b == b'\r' {
-                        self.remaining = self.chunk_size;
-                        self.state = ChunkedState::ReadingSizeLf;
-                    } else if b == b';' {
-                        self.state = ChunkedState::ReadingExtension;
+                    } else if (b == b'\r' || b == b';') && self.size_digits > 0 {
+                        if b == b'\r' {
+                            self.remaining = self.chunk_size;
+                            self.state = ChunkedState::ReadingSizeLf;
+                        } else {
+                            self.state = ChunkedState::ReadingExtension;
+                        }
                     } else {
                         return Step::Yield((DecodeResult::Error(ParseError::InvalidChunkSize), i));
                     }
@@ -440,6 +472,7 @@ impl ChunkedDecoder {
                         ));
                     }
                     self.chunk_size = 0;
+                    self.size_digits = 0;
                     self.state = ChunkedState::ReadingSize;
                     return Step::Advance(i + 1);
                 }
@@ -525,10 +558,14 @@ impl HeaderRange {
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectionError::HeaderNotInBuffer`] if a header name cannot be
-    /// located in `src`, or [`ConnectionError::HeaderRangeOverflow`] if any offset
-    /// or length overflows `u16`.
+    /// Returns [`ParseError::TooManyHeaders`] if `headers` exceeds
+    /// [`MAX_HEADERS`], [`ConnectionError::HeaderNotInBuffer`] if a header name
+    /// cannot be located in `src`, or [`ConnectionError::HeaderRangeOverflow`]
+    /// if any offset or length overflows `u16`.
     pub fn build_ranges(headers: &[Header<'_>], src: &[u8]) -> Result<[Self; MAX_HEADERS], Error> {
+        if headers.len() > MAX_HEADERS {
+            return Err(ParseError::TooManyHeaders.into());
+        }
         let src_base = src.as_ptr().addr();
         let src_end = src_base + src.len();
         let mut ranges = [Self::default(); MAX_HEADERS];
@@ -857,6 +894,22 @@ mod tests {
     }
 
     #[test]
+    fn status_code_followed_by_non_space_rejected() {
+        let raw = b"HTTP/1.1 200X\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidStatusCode));
+    }
+
+    #[test]
+    fn status_line_trailing_space_empty_reason() {
+        let raw = b"HTTP/1.1 200 \r\n\r\n";
+        let (head, _, _) = make_response(raw);
+        assert_eq!(head.status, StatusCode::OK);
+        assert_eq!(head.reason, b"");
+    }
+
+    #[test]
     fn status_line_no_space_after_version() {
         let raw = b"HTTP/1.1200 OK\r\n\r\n";
         let mut headers = [const { Header::empty() }; 4];
@@ -1051,6 +1104,72 @@ mod tests {
     }
 
     #[test]
+    fn transfer_encoding_overrides_content_length() {
+        let headers = [
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"gzip",
+            },
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"42",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::UntilClose
+        );
+    }
+
+    #[test]
+    fn chunked_not_final_coding_is_until_close() {
+        let headers = [Header {
+            name: HeaderName::TransferEncoding,
+            value: b"chunked, gzip",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
+            BodyFraming::UntilClose
+        );
+    }
+
+    #[test]
+    fn chunked_final_across_multiple_transfer_encoding_headers() {
+        let headers = [
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"gzip",
+            },
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"Chunked",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::Chunked
+        );
+    }
+
+    #[test]
+    fn empty_transfer_encoding_is_until_close() {
+        let headers = [
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"",
+            },
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"5",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::UntilClose
+        );
+    }
+
+    #[test]
     fn duplicate_transfer_encoding_both_chunked() {
         let headers = [
             Header {
@@ -1203,6 +1322,59 @@ mod tests {
 
         assert_eq!(total, b"0123456789abcdef");
         assert!(decoder.is_done());
+    }
+
+    #[test]
+    fn chunk_empty_size_line_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, _) = decoder.decode(b"\r\n", &mut output);
+        assert!(matches!(
+            result,
+            DecodeResult::Error(ParseError::InvalidChunkSize)
+        ));
+    }
+
+    #[test]
+    fn chunk_extension_without_size_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, _) = decoder.decode(b";ext\r\n", &mut output);
+        assert!(matches!(
+            result,
+            DecodeResult::Error(ParseError::InvalidChunkSize)
+        ));
+    }
+
+    #[test]
+    fn chunk_empty_size_line_after_data_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let wire = b"5\r\nhello\r\n";
+        let (result, consumed) = decoder.decode(wire, &mut output);
+        assert_eq!(result, DecodeResult::Data(5));
+        assert_eq!(consumed, wire.len());
+        let (result, _) = decoder.decode(b"\r\n\r\n", &mut output);
+        assert!(matches!(
+            result,
+            DecodeResult::Error(ParseError::InvalidChunkSize)
+        ));
+    }
+
+    #[test]
+    fn build_ranges_too_many_headers_is_an_error() {
+        let src = b"A: 1\r\n";
+        let headers = vec![
+            Header {
+                name: HeaderName::from_bytes(b"A"),
+                value: &src[3..4],
+            };
+            MAX_HEADERS + 1
+        ];
+        assert_eq!(
+            HeaderRange::build_ranges(&headers, src).unwrap_err(),
+            Error::Parse(ParseError::TooManyHeaders)
+        );
     }
 
     #[test]

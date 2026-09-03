@@ -1,7 +1,6 @@
 use core::fmt;
 
 use crate::bytes::ByteSliceExt;
-use crate::error::ParseError;
 
 /// RFC 7230 token character validation.
 ///
@@ -53,8 +52,8 @@ impl Tchar {
 /// A parsed or constructed HTTP header name.
 ///
 /// Internally either a well-known header (looked up case-insensitively) or
-/// an arbitrary byte slice. The public API preserves the original enum-like
-/// usage through associated constants.
+/// an arbitrary byte slice. Comparison is always case-insensitive, as HTTP
+/// field names are; the original bytes are preserved for rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HeaderName<'a> {
     inner: HeaderNameInner<'a>,
@@ -63,8 +62,7 @@ pub struct HeaderName<'a> {
 #[derive(Debug, Clone, Copy)]
 enum HeaderNameInner<'a> {
     Known(KnownHeader),
-    Unknown(&'a [u8]),
-    Raw(&'a [u8]),
+    Other(&'a [u8]),
 }
 
 impl HeaderName<'_> {
@@ -210,19 +208,14 @@ impl<'a> HeaderName<'a> {
     pub const fn as_bytes(&self) -> &[u8] {
         match self.inner {
             HeaderNameInner::Known(k) => k.canonical(),
-            HeaderNameInner::Unknown(raw) | HeaderNameInner::Raw(raw) => raw,
+            HeaderNameInner::Other(raw) => raw,
         }
     }
 
     /// Canonical wire-format name as str.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        match self.inner {
-            HeaderNameInner::Known(k) => core::str::from_utf8(k.canonical()).unwrap_or("<invalid>"),
-            HeaderNameInner::Unknown(raw) | HeaderNameInner::Raw(raw) => {
-                core::str::from_utf8(raw).unwrap_or("<invalid>")
-            }
-        }
+        core::str::from_utf8(self.as_bytes()).unwrap_or("<invalid>")
     }
 
     /// Parse a header name from raw bytes, case-insensitively.
@@ -233,7 +226,7 @@ impl<'a> HeaderName<'a> {
             .find(|(_, lower)| bytes.ascii_eq_ignore_case(lower))
             .map_or_else(
                 || Self {
-                    inner: HeaderNameInner::Unknown(bytes),
+                    inner: HeaderNameInner::Other(bytes),
                 },
                 |(known, _)| Self {
                     inner: HeaderNameInner::Known(*known),
@@ -241,11 +234,12 @@ impl<'a> HeaderName<'a> {
             )
     }
 
-    /// Wrap raw bytes from the wire; comparison is case-insensitive.
+    /// Wrap raw bytes from the wire without the known-header lookup;
+    /// comparison is case-insensitive.
     #[must_use]
     pub const fn raw(bytes: &'a [u8]) -> Self {
         Self {
-            inner: HeaderNameInner::Raw(bytes),
+            inner: HeaderNameInner::Other(bytes),
         }
     }
 }
@@ -271,17 +265,11 @@ impl fmt::Display for HeaderName<'_> {
 impl PartialEq for HeaderNameInner<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            // Known variants are equal iff they are the same variant.
             (Self::Known(a), Self::Known(b)) => a == b,
-            // Raw participates in case-insensitive comparison against canonical bytes.
-            (Self::Raw(a), Self::Raw(b)) => a.ascii_eq_ignore_case(b),
-            (Self::Raw(raw), Self::Known(k)) | (Self::Known(k), Self::Raw(raw)) => {
+            (Self::Other(a), Self::Other(b)) => a.ascii_eq_ignore_case(b),
+            (Self::Other(raw), Self::Known(k)) | (Self::Known(k), Self::Other(raw)) => {
                 raw.ascii_eq_ignore_case(k.canonical())
             }
-            // Unknown is exact-bytes equality (caller controls casing).
-            (Self::Unknown(a), Self::Unknown(b)) => a == b,
-            (Self::Unknown(_), Self::Known(_) | Self::Raw(_))
-            | (Self::Known(_) | Self::Raw(_), Self::Unknown(_)) => false,
         }
     }
 }
@@ -290,10 +278,9 @@ impl Eq for HeaderNameInner<'_> {}
 
 impl core::hash::Hash for HeaderNameInner<'_> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        // Hash the lowercased canonical bytes so Raw and known variants hash the same.
         let bytes = match self {
             Self::Known(k) => k.canonical(),
-            Self::Unknown(b) | Self::Raw(b) => b,
+            Self::Other(b) => b,
         };
         for byte in bytes {
             state.write_u8(byte.to_ascii_lowercase());
@@ -315,62 +302,6 @@ impl Header<'_> {
             name: HeaderName::Host,
             value: b"",
         }
-    }
-}
-
-/// A view over a caller-provided buffer of parsed headers.
-#[derive(Debug)]
-pub struct Headers<'buf, 'data> {
-    headers: &'buf [Header<'data>],
-    len: usize,
-}
-
-impl<'buf, 'data> Headers<'buf, 'data> {
-    #[must_use]
-    pub const fn new(headers: &'buf [Header<'data>], len: usize) -> Self {
-        Self { headers, len }
-    }
-
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &Header<'data>> {
-        self.headers[..self.len].iter()
-    }
-
-    /// Find the first header with the given name.
-    #[must_use]
-    pub fn get(&self, name: &HeaderName<'_>) -> Option<&'data [u8]> {
-        self.headers[..self.len]
-            .iter()
-            .find(|h| &h.name == name)
-            .map(|h| h.value)
-    }
-
-    /// Parse the `Content-Length` value as `u64`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ParseError::InvalidContentLength` if the value is present
-    /// but not valid ASCII digits.
-    #[must_use]
-    pub fn content_length(&self) -> Option<Result<u64, ParseError>> {
-        self.get(&HeaderName::ContentLength)
-            .map(|val| val.parse_u64().ok_or(ParseError::InvalidContentLength))
-    }
-
-    /// Check if `Transfer-Encoding` includes "chunked" (case-insensitive).
-    #[must_use]
-    pub fn is_chunked(&self) -> bool {
-        self.get(&HeaderName::TransferEncoding)
-            .is_some_and(|val| val.contains_token_ignore_case(b"chunked"))
     }
 }
 
@@ -559,14 +490,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_vs_unknown_exact_match() {
+    fn other_names_compare_case_insensitively() {
         assert_eq!(
             HeaderName::from_bytes(b"X-Custom"),
             HeaderName::from_bytes(b"X-Custom")
         );
-        assert_ne!(
+        assert_eq!(
             HeaderName::from_bytes(b"X-Custom"),
             HeaderName::from_bytes(b"x-custom")
+        );
+        assert_eq!(
+            HeaderName::from_bytes(b"X-Request-Id"),
+            HeaderName::raw(b"x-request-id")
+        );
+        assert_ne!(
+            HeaderName::from_bytes(b"X-Custom"),
+            HeaderName::from_bytes(b"X-Other")
         );
     }
 

@@ -27,7 +27,8 @@ impl Request<'_> {
             return Err(SerializeError::InvalidPath.into());
         }
         for header in self.headers {
-            if !header.name.as_bytes().iter().all(|&b| Tchar::is_valid(b)) {
+            let name = header.name.as_bytes();
+            if name.is_empty() || !name.iter().all(|&b| Tchar::is_valid(b)) {
                 return Err(SerializeError::InvalidHeader.into());
             }
             if header
@@ -524,6 +525,26 @@ mod tests {
     fn header_name_with_invalid_byte_rejected() {
         let headers = [Header {
             name: HeaderName::from_bytes(b"Bad Name"),
+            value: b"ok",
+        }];
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &headers,
+        };
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn empty_header_name_rejected() {
+        let headers = [Header {
+            name: HeaderName::from_bytes(b""),
             value: b"ok",
         }];
         let req = Request {

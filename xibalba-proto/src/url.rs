@@ -40,6 +40,9 @@ impl<'a> Url<'a> {
         if host.is_empty() {
             return Err(UrlError::MissingHost.into());
         }
+        if let Some(bad) = host.iter().position(|&b| !Self::is_host_byte(b)) {
+            return Err(UrlError::InvalidByte(bad).into());
+        }
 
         let (path, query, fragment) = Self::parse_path_query_fragment(after_authority);
 
@@ -112,6 +115,34 @@ impl<'a> Url<'a> {
                 None => Ok((authority, None)),
             }
         }
+    }
+
+    /// Bytes allowed in a host: `reg-name` / `IPv4address` / bracketed
+    /// `IP-literal` (RFC 3986 §3.2.2). Excludes space, CTLs, DEL and the
+    /// authority/path delimiters that would already have been split off.
+    const fn is_host_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'%'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'['
+                    | b']'
+                    | b':'
+            )
     }
 
     fn parse_port(bytes: &[u8]) -> Result<u16, Error> {
@@ -458,6 +489,25 @@ mod tests {
         let url = Url::parse(b"http://x.com/?key=a=b=c").unwrap();
         let params: Vec<_> = url.query_params().collect();
         assert_eq!(params[0], (b"key" as &[u8], Some(b"a=b=c" as &[u8])));
+    }
+
+    #[test]
+    fn host_with_space_rejected() {
+        assert!(matches!(
+            Url::parse(b"http://exa mple.com/").unwrap_err(),
+            Error::UrlParse(UrlError::InvalidByte(3))
+        ));
+    }
+
+    #[test]
+    fn host_with_ctl_rejected() {
+        assert!(Url::parse(b"http://example.com\r\nX: y/").is_err());
+        assert!(Url::parse(b"http://exam\x00ple.com/").is_err());
+    }
+
+    #[test]
+    fn host_with_non_ascii_rejected() {
+        assert!(Url::parse("http://bücher.example/".as_bytes()).is_err());
     }
 
     #[test]
