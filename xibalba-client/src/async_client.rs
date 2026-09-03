@@ -53,7 +53,6 @@ use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc::{self, Consumer as MpscConsumer, Producer as MpscProducer};
 use quetzalcoatl::spsc::{self, Consumer as SpscConsumer};
 use xibalba_proto::error::{ConnectionError, Error};
-use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 
 use crate::body::{HEAD_BUF_SIZE, StreamingBody};
@@ -498,17 +497,6 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // predecessor.
     started.store(true, Ordering::Release);
 
-    // Translate the request's owned header buffers into the
-    // xibalba `Header<'_>` shape the Client expects (borrowing
-    // from the local `headers` Vec).
-    let header_refs: Vec<Header<'_>> = headers
-        .iter()
-        .map(|(n, v)| Header {
-            name: HeaderName::from_bytes(n),
-            value: v,
-        })
-        .collect();
-
     // Send the head. `send_head` handles the stale-keep-alive
     // reconnect internally (the read failure was before any
     // response byte reached the caller, so retry is safe).
@@ -517,7 +505,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         path: &path,
         query: query.as_deref(),
         body: body.as_deref(),
-        extra_headers: header_refs,
+        extra_headers: headers,
     };
     let send_result = client.send_head(&request_params);
 

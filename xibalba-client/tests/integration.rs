@@ -1909,3 +1909,219 @@ fn head_too_large_rejected() {
     );
     drop(server);
 }
+
+// ── Audit regression tests ───────────────────────────────────────────────────
+
+#[test]
+fn head_request_gets_empty_body_without_waiting_for_one() {
+    // The server answers a HEAD with Content-Length: 5 and NO body (per
+    // RFC 9110 the content-length describes the GET body). The framing
+    // must be None; before the fix the client waited for five body bytes
+    // that never come and hit the silence budget.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let req = read_request(&mut stream);
+        assert!(req.starts_with(b"HEAD "));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+            .unwrap();
+        // Deliberately hold the connection open instead of closing: a
+        // client that tries to read a body blocks until the silence
+        // budget expires.
+        thread::sleep(Duration::from_millis(300));
+    });
+
+    let mut client = connect(port);
+    let resp = client.request(Method::Head, b"/resource", None, None).unwrap();
+    assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
+    assert_eq!(resp.text().unwrap(), "");
+    server.join().unwrap();
+}
+
+#[test]
+fn body_read_failure_marks_connection_dirty_and_next_request_reconnects() {
+    // A body error (BodyTooLarge) leaves unread bytes on the socket. The
+    // connection must be marked dirty so the next request reconnects;
+    // reusing it would parse the stale body as the next response head.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        // Connection 1: head says 100 bytes, client's limit is 50.
+        let (mut first, _) = listener.accept().unwrap();
+        read_request(&mut first);
+        first
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+            .unwrap();
+        first.write_all(&[b'X'; 100]).unwrap();
+
+        // Connection 2: the follow-up request must land HERE, not parse
+        // leftover X bytes as a response head.
+        let (mut second, _) = listener.accept().unwrap();
+        read_request(&mut second);
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+    });
+
+    let config = Config {
+        max_response_body: 50,
+        ..Config::default()
+    };
+    let mut client = connect_with_config(port, config);
+    assert_eq!(
+        client.get(b"/big").unwrap_err(),
+        Error::Connection(ConnectionError::BodyTooLarge)
+    );
+    assert_eq!(client.get(b"/retry").unwrap().text().unwrap(), "fresh");
+
+    server.join().unwrap();
+}
+
+#[test]
+fn cross_origin_absolute_redirect_strips_credentials() {
+    // A 302 to another origin must not carry Authorization or Cookie:
+    // the redirect target would otherwise harvest the caller's bearer
+    // token. The new Host must name the redirect origin.
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_a = listener_a.local_addr().unwrap().port();
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port_b = listener_b.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut a, _) = listener_a.accept().unwrap();
+        read_request(&mut a);
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:{port_b}/final\r\n\r\n"
+        );
+        a.write_all(redirect.as_bytes()).unwrap();
+
+        let (mut b, _) = listener_b.accept().unwrap();
+        let req2 = read_request(&mut b);
+        b.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+        req2
+    });
+
+    let mut client = connect(port_a);
+    let resp = client
+        .send(
+            client
+                .build(Method::Get, b"/start")
+                .header(b"Authorization", b"Bearer sekrit")
+                .header(b"Cookie", b"session=abc"),
+        )
+        .unwrap();
+    assert_eq!(resp.text().unwrap(), "ok");
+
+    let req2 = server.join().unwrap();
+    let req2_str = String::from_utf8_lossy(&req2);
+    assert!(
+        !req2_str.contains("Authorization"),
+        "credentials leaked on cross-origin redirect:\n{req2_str}"
+    );
+    assert!(
+        !req2_str.contains("session=abc"),
+        "cookies leaked on cross-origin redirect:\n{req2_str}"
+    );
+    assert!(
+        req2_str.contains(&format!("Host: 127.0.0.1:{port_b}")),
+        "Host must name the redirect origin:\n{req2_str}"
+    );
+}
+
+#[test]
+fn same_origin_absolute_redirect_keeps_credentials() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // First request: absolute redirect to the SAME origin.
+        read_request(&mut stream);
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: http://127.0.0.1:{port}/final\r\n\r\n"
+        );
+        stream.write_all(redirect.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        // Second request: echo it back for inspection.
+        let req2 = read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+        req2
+    });
+
+    let mut client = connect(port);
+    let resp = client
+        .send(
+            client
+                .build(Method::Get, b"/start")
+                .header(b"Authorization", b"Bearer kept"),
+        )
+        .unwrap();
+    assert_eq!(resp.text().unwrap(), "ok");
+
+    let req2 = server.join().unwrap();
+    let req2_str = String::from_utf8_lossy(&req2);
+    assert!(
+        req2_str.contains("Authorization: Bearer kept"),
+        "same-origin redirect must keep credentials:\n{req2_str}"
+    );
+    assert!(
+        req2_str.contains(&format!("Host: 127.0.0.1:{port}")),
+        "same-origin redirect must keep the Host header:\n{req2_str}"
+    );
+}
+
+#[test]
+fn interim_100_response_is_skipped() {
+    // A 100 Continue interim head precedes the real response on the same
+    // connection. Treating it as the final response desyncs every later
+    // request; it must be skipped and the real head parsed.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal")
+            .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let mut client = connect(port);
+    let resp = client.get(b"/expected-100").unwrap();
+    assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
+    assert_eq!(resp.text().unwrap(), "real");
+    server.join().unwrap();
+}
+
+#[test]
+fn switching_protocols_is_surfaced_as_final_response() {
+    // 101 hands the connection to another protocol; it must be surfaced
+    // (not skipped like other 1xx) so the caller can take over.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+            .unwrap();
+    });
+
+    let mut client = connect(port);
+    let resp = client.get(b"/upgrade").unwrap();
+    assert_eq!(
+        resp.status,
+        xibalba_client::proto::status::StatusCode::SWITCHING_PROTOCOLS
+    );
+    assert_eq!(resp.text().unwrap(), "");
+    server.join().unwrap();
+}

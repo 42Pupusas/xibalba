@@ -2,6 +2,7 @@
 name = "xibalba-proto"
 version = "0.2.1"
 edition = "2024"
+rust-version = "1.91"
 license = "MIT"
 description = "HTTP/1.1 protocol primitives: zero-copy parser, chunked decoder, request serializer"
 repository = "https://github.com/42pupusas/xibalba"

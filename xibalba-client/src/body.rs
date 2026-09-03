@@ -430,6 +430,7 @@ pub(crate) fn read_response_head<S: Read>(
     head_acc: &mut Vec<u8>,
     max_head: usize,
     silence: Duration,
+    request_method_is_head: bool,
 ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
     use xibalba_proto::header::Header;
     use xibalba_proto::response::{BodyFraming, HeaderRange, ResponseHead};
@@ -442,38 +443,60 @@ pub(crate) fn read_response_head<S: Read>(
     // deliberately decoupled from `read_timeout`, which stays short for
     // cancel latency.
     let mut budget = SilenceBudget::new(silence);
-    let head_end = loop {
-        let n = budget.read(stream, &mut raw)?;
-        if n == 0 {
-            return Err(ConnectionError::ConnectionClosed.into());
-        }
-        head_acc.extend_from_slice(&raw[..n]);
-        // A socket read can contain both the final header bytes and the body
-        // prefix. Find the delimiter before applying the limit so a valid
-        // `max_head`-sized head is not rejected merely because its first body
-        // bytes arrived in the same read.
-        if let Some(pos) = head_acc.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head_end = pos + 4;
-            if head_end > max_head {
+
+    let (head, ranges, head_end, framing) = loop {
+        let head_end = loop {
+            let n = budget.read(stream, &mut raw)?;
+            if n == 0 {
+                return Err(ConnectionError::ConnectionClosed.into());
+            }
+            head_acc.extend_from_slice(&raw[..n]);
+            // A socket read can contain both the final header bytes and the body
+            // prefix. Find the delimiter before applying the limit so a valid
+            // `max_head`-sized head is not rejected merely because its first body
+            // bytes arrived in the same read.
+            if let Some(pos) = head_acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head_end = pos + 4;
+                if head_end > max_head {
+                    return Err(ConnectionError::HeadTooLarge.into());
+                }
+                break head_end;
+            }
+            if head_acc.len() > max_head {
                 return Err(ConnectionError::HeadTooLarge.into());
             }
-            break head_end;
+        };
+
+        let mut hdr_buf = [const { Header::empty() }; MAX_HEADERS];
+        let (head, consumed) = ResponseHead::parse(&head_acc[..head_end], &mut hdr_buf)?;
+
+        // 1xx interim responses precede the real response on the same
+        // connection; drop the interim head and keep reading. 101 is the
+        // exception — it hands the connection over to another protocol, so
+        // it is surfaced as a final response.
+        if head.status.is_informational() && head.status != StatusCode::SWITCHING_PROTOCOLS {
+            head_acc.drain(..head_end);
+            continue;
         }
-        if head_acc.len() > max_head {
-            return Err(ConnectionError::HeadTooLarge.into());
-        }
+
+        // Derive ranges while headers still borrow `head_acc`, then preserve the
+        // complete head for the response. This keeps duplicate header names or
+        // values positional rather than re-searching their byte patterns in a
+        // copy. `HeaderRange` offsets are `u16`, so the 64 KiB default is the
+        // largest useful standard limit; a custom larger head fails safely if an
+        // offset cannot be represented.
+        let ranges =
+            HeaderRange::build_ranges(&hdr_buf[..head.header_count], &head_acc[..head_end])?;
+        let framing = BodyFraming::from_response(
+            head.status,
+            request_method_is_head,
+            &hdr_buf[..head.header_count],
+            head.header_count,
+        )?;
+        debug_assert_eq!(consumed, head_end);
+        break (head, ranges, head_end, framing);
     };
 
-    let mut hdr_buf = [const { Header::empty() }; MAX_HEADERS];
-    let (head, consumed) = ResponseHead::parse(&head_acc[..head_end], &mut hdr_buf)?;
-
-    // Derive ranges while headers still borrow `head_acc`, then preserve the
-    // complete head for the response. This keeps duplicate header names or
-    // values positional rather than re-searching their byte patterns in a
-    // copy. `HeaderRange` offsets are `u16`, so the 64 KiB default is the
-    // largest useful standard limit; a custom larger head fails safely if an
-    // offset cannot be represented.
-    let ranges = HeaderRange::build_ranges(&hdr_buf[..head.header_count], &head_acc[..head_end])?;
     let head_bytes = head_acc[..head_end].to_vec();
     let head_data = HeadData {
         version: head.version,
@@ -483,14 +506,7 @@ pub(crate) fn read_response_head<S: Read>(
         header_count: head.header_count,
     };
 
-    let framing = BodyFraming::from_response(
-        head.status,
-        false,
-        &hdr_buf[..head.header_count],
-        head.header_count,
-    )?;
-
-    Ok((head_data, framing, consumed))
+    Ok((head_data, framing, head_end))
 }
 
 pub(crate) fn read_body<S: Read>(
