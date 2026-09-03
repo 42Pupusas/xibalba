@@ -249,6 +249,9 @@ impl ResponseParser {
             &hdr_buf[..head.header_count],
             head.header_count,
         );
+        let Ok(framing) = framing else {
+            return None;
+        };
         let ranges = HeaderRange::build_ranges(
             &hdr_buf[..head.header_count],
             &self.head_accum[..head_bytes_len],

@@ -1,5 +1,5 @@
 use crate::error::{Error, SerializeError};
-use crate::header::Header;
+use crate::header::{Header, Tchar};
 use crate::method::{Method, Token};
 use crate::version::Version;
 
@@ -13,13 +13,48 @@ pub struct Request<'a> {
 }
 
 impl Request<'_> {
+    /// Reject targets and headers that could corrupt the request line or
+    /// smuggle a second request: an empty target, CTLs/space/DEL in the
+    /// target, non-token header names, and CTLs (other than HTAB) in
+    /// header values.
+    fn validate(&self) -> Result<(), Error> {
+        if self.path.is_empty() || self.path.iter().any(|&b| !Self::is_target_byte(b)) {
+            return Err(SerializeError::InvalidPath.into());
+        }
+        if let Some(query) = self.query
+            && query.iter().any(|&b| !Self::is_target_byte(b))
+        {
+            return Err(SerializeError::InvalidPath.into());
+        }
+        for header in self.headers {
+            if !header.name.as_bytes().iter().all(|&b| Tchar::is_valid(b)) {
+                return Err(SerializeError::InvalidHeader.into());
+            }
+            if header
+                .value
+                .iter()
+                .any(|&b| b != b'\t' && (b < 0x20 || b == 0x7f))
+            {
+                return Err(SerializeError::InvalidHeader.into());
+            }
+        }
+        Ok(())
+    }
+
+    const fn is_target_byte(b: u8) -> bool {
+        b > 0x20 && b != 0x7f
+    }
+
     /// Serialize the request head into the provided buffer.
     ///
     /// # Errors
     ///
     /// Returns `SerializeError::BufferTooSmall` if the buffer cannot hold
-    /// the full request head.
+    /// the full request head, or `SerializeError::InvalidPath` /
+    /// `SerializeError::InvalidHeader` if the target or headers contain
+    /// bytes that cannot be serialized safely.
     pub fn serialize_to_buf(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.validate()?;
         let mut w = BufWriter::new(buf);
         w.write_bytes(self.method.as_bytes())?;
         w.write_byte(b' ')?;
@@ -47,8 +82,13 @@ impl Request<'_> {
     ///
     /// # Errors
     ///
-    /// Returns `std::io::Error` on write failure.
+    /// Returns `std::io::Error` on write failure, and
+    /// `Error::Serialize` (`InvalidPath` / `InvalidHeader`) when the
+    /// target or headers contain bytes that cannot be serialized safely.
     pub fn serialize_to_writer(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        self.validate().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+        })?;
         w.write_all(self.method.as_bytes())?;
         w.write_all(b" ")?;
         w.write_all(self.path)?;
@@ -398,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_path_serializes() {
+    fn empty_path_rejected() {
         let req = Request {
             method: Method::Get,
             path: b"",
@@ -407,8 +447,115 @@ mod tests {
             headers: &[],
         };
         let mut buf = [0u8; 64];
-        let len = req.serialize_to_buf(&mut buf).unwrap();
-        // "GET  HTTP/1.1\r\n\r\n" — empty path produces double space
-        assert!(buf[..len].starts_with(b"GET  HTTP/1.1"));
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn path_with_crlf_rejected() {
+        let req = Request {
+            method: Method::Get,
+            path: b"/a\r\nX-Injected: yes",
+            query: None,
+            version: Version::Http11,
+            headers: &[],
+        };
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn space_in_path_rejected() {
+        let req = Request {
+            method: Method::Get,
+            path: b"/a b",
+            query: None,
+            version: Version::Http11,
+            headers: &[],
+        };
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn query_with_crlf_rejected() {
+        let req = Request {
+            method: Method::Get,
+            path: b"/search",
+            query: Some(b"q=1\r\nX-Injected: yes"),
+            version: Version::Http11,
+            headers: &[],
+        };
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn header_value_with_crlf_rejected() {
+        let headers = [Header {
+            name: HeaderName::Accept,
+            value: b"*/*\r\nX-Injected: yes",
+        }];
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &headers,
+        };
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn header_name_with_invalid_byte_rejected() {
+        let headers = [Header {
+            name: HeaderName::from_bytes(b"Bad Name"),
+            value: b"ok",
+        }];
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &headers,
+        };
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            req.serialize_to_buf(&mut buf).unwrap_err(),
+            Error::Serialize(SerializeError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn header_value_crlf_rejected_via_writer() {
+        let headers = [Header {
+            name: HeaderName::Accept,
+            value: b"*/*\nX-Injected: yes",
+        }];
+        let req = Request {
+            method: Method::Get,
+            path: b"/",
+            query: None,
+            version: Version::Http11,
+            headers: &headers,
+        };
+        let mut out = Vec::new();
+        let err = req.serialize_to_writer(&mut out).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

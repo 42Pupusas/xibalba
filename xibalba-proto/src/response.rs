@@ -136,6 +136,12 @@ impl<'a> ResponseHead<'a> {
 
         // Trim trailing OWS in one backward pass — only paid when OWS is present
         let raw_value = &line[value_start..crlf];
+        if raw_value
+            .iter()
+            .any(|&b| b != b'\t' && (b < 0x20 || b == 0x7f))
+        {
+            return Err(ParseError::InvalidHeaderValue.into());
+        }
         let value_end = raw_value
             .iter()
             .rposition(|&b| b != b' ' && b != b'\t')
@@ -160,19 +166,29 @@ pub enum BodyFraming {
 
 impl BodyFraming {
     /// Determine body framing from the response status and headers.
-    #[must_use]
+    ///
+    /// `Transfer-Encoding: chunked` wins over `Content-Length` (RFC 9112
+    /// §6.1). Multiple `Content-Length` headers are accepted only when
+    /// every value parses to the same number — a conflicting or
+    /// unparseable value is a smuggling vector and is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::InvalidContentLength`] when any
+    /// `Content-Length` value is not valid digits or two of them
+    /// disagree.
     pub fn from_response(
         status: StatusCode,
         request_method_is_head: bool,
         headers: &[Header<'_>],
         header_count: usize,
-    ) -> Self {
+    ) -> Result<Self, ParseError> {
         if status.is_informational()
             || status == StatusCode::NO_CONTENT
             || status == StatusCode::NOT_MODIFIED
             || request_method_is_head
         {
-            return Self::None;
+            return Ok(Self::None);
         }
 
         let hdrs = &headers[..header_count];
@@ -181,19 +197,26 @@ impl BodyFraming {
             if h.name == HeaderName::TransferEncoding
                 && h.value.contains_token_ignore_case(b"chunked")
             {
-                return Self::Chunked;
+                return Ok(Self::Chunked);
             }
         }
 
+        let mut content_length: Option<u64> = None;
         for h in hdrs {
-            if h.name == HeaderName::ContentLength
-                && let Some(len) = h.value.parse_u64()
-            {
-                return Self::ContentLength(len);
+            if h.name == HeaderName::ContentLength {
+                let len = h.value.parse_u64().ok_or(ParseError::InvalidContentLength)?;
+                if content_length.is_some_and(|prev| prev != len) {
+                    return Err(ParseError::InvalidContentLength);
+                }
+                content_length = Some(len);
             }
         }
 
-        Self::UntilClose
+        if let Some(len) = content_length {
+            return Ok(Self::ContentLength(len));
+        }
+
+        Ok(Self::UntilClose)
     }
 }
 
@@ -618,7 +641,8 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1)
+                .unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
@@ -630,7 +654,8 @@ mod tests {
             value: b"chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1)
+                .unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -639,7 +664,8 @@ mod tests {
     fn body_framing_none_for_204() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers, 0),
+            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers, 0)
+                .unwrap(),
             BodyFraming::None
         );
     }
@@ -651,7 +677,8 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, true, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, true, &headers, 1)
+                .unwrap(),
             BodyFraming::None
         );
     }
@@ -660,7 +687,8 @@ mod tests {
     fn body_framing_until_close() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 0),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 0)
+                .unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -678,7 +706,8 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2)
+                .unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -904,7 +933,8 @@ mod tests {
             value: b"1000",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers, 1)
+                .unwrap(),
             BodyFraming::None
         );
     }
@@ -913,7 +943,8 @@ mod tests {
     fn body_framing_1xx_no_body() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers, 0),
+            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers, 0)
+                .unwrap(),
             BodyFraming::None
         );
     }
@@ -925,7 +956,7 @@ mod tests {
             value: b"0",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
             BodyFraming::ContentLength(0)
         );
     }
@@ -937,21 +968,80 @@ mod tests {
             value: b" 42 ",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1)
+                .unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
 
     #[test]
-    fn content_length_non_numeric_falls_through() {
+    fn content_length_non_numeric_rejected() {
         let headers = [Header {
             name: HeaderName::ContentLength,
             value: b"abc",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 0),
-            BodyFraming::UntilClose
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            ParseError::InvalidContentLength
         );
+    }
+
+    #[test]
+    fn conflicting_content_length_rejected() {
+        let headers = [
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"5",
+            },
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"6",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            ParseError::InvalidContentLength
+        );
+    }
+
+    #[test]
+    fn duplicate_identical_content_length_accepted() {
+        let headers = [
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"5",
+            },
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"5",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::ContentLength(5)
+        );
+    }
+
+    #[test]
+    fn header_value_with_ctl_byte_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Bad: a\x00b\r\nContent-Length: 0\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderValue));
+    }
+
+    #[test]
+    fn header_value_with_obs_text_accepted() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Name: caf\xc3\xa9\r\nContent-Length: 0\r\n\r\n";
+        let (_, _, headers) = make_response(raw);
+        assert_eq!(headers[0].value, b"caf\xc3\xa9");
+    }
+
+    #[test]
+    fn header_value_with_tab_accepted() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Name: a\tb\r\nContent-Length: 0\r\n\r\n";
+        let (_, _, headers) = make_response(raw);
+        assert_eq!(headers[0].value, b"a\tb");
     }
 
     #[test]
@@ -961,7 +1051,7 @@ mod tests {
             value: b"gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -979,7 +1069,8 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2),
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2)
+                .unwrap(),
             BodyFraming::Chunked
         );
     }

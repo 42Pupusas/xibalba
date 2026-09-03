@@ -83,12 +83,16 @@ impl<'a> Url<'a> {
             return Ok((b"", None));
         }
 
+        if let Some(at) = authority.iter().position(|&b| b == b'@') {
+            return Err(UrlError::InvalidByte(at).into());
+        }
+
         if authority[0] == b'[' {
             let bracket_end = authority
                 .iter()
                 .position(|&b| b == b']')
                 .ok_or(UrlError::InvalidByte(0))?;
-            let host = &authority[1..bracket_end];
+            let host = &authority[..=bracket_end];
             let after_bracket = &authority[bracket_end + 1..];
             if after_bracket.is_empty() {
                 Ok((host, None))
@@ -250,7 +254,7 @@ mod tests {
     #[test]
     fn parse_ipv6() {
         let url = Url::parse(b"http://[::1]:8080/test").unwrap();
-        assert_eq!(url.host, b"::1");
+        assert_eq!(url.host, b"[::1]");
         assert_eq!(url.port, Some(8080));
         assert_eq!(url.path, b"/test");
     }
@@ -258,8 +262,25 @@ mod tests {
     #[test]
     fn parse_ipv6_no_port() {
         let url = Url::parse(b"http://[::1]/test").unwrap();
-        assert_eq!(url.host, b"::1");
+        assert_eq!(url.host, b"[::1]");
         assert_eq!(url.port, None);
+    }
+
+    #[test]
+    fn userinfo_rejected() {
+        assert!(matches!(
+            Url::parse(b"http://user:pass@example.com/path").unwrap_err(),
+            Error::UrlParse(UrlError::InvalidByte(_))
+        ));
+        assert!(Url::parse(b"http://a@b/").is_err());
+        assert!(Url::parse(b"http://user@example.com").is_err());
+    }
+
+    #[test]
+    fn at_sign_in_path_is_not_userinfo() {
+        let url = Url::parse(b"http://example.com/u@ser").unwrap();
+        assert_eq!(url.host, b"example.com");
+        assert_eq!(url.path, b"/u@ser");
     }
 
     #[test]

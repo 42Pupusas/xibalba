@@ -80,6 +80,13 @@ pub enum ParseError {
 pub enum SerializeError {
     /// The output buffer is too small to hold the serialized request.
     BufferTooSmall,
+    /// The request target is empty or contains bytes that cannot appear
+    /// in a request line (CTLs, space, DEL) — including CRLF injection.
+    InvalidPath,
+    /// A header name is not a valid token, or a value contains bytes
+    /// outside the field-value set (CTLs other than HTAB) — including
+    /// CRLF injection.
+    InvalidHeader,
 }
 
 impl fmt::Display for IoError {
@@ -159,6 +166,8 @@ impl fmt::Display for SerializeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BufferTooSmall => f.write_str("output buffer too small"),
+            Self::InvalidPath => f.write_str("invalid request target"),
+            Self::InvalidHeader => f.write_str("invalid request header"),
         }
     }
 }
@@ -349,6 +358,14 @@ mod tests {
         assert_eq!(
             display(SerializeError::BufferTooSmall),
             "output buffer too small"
+        );
+        assert_eq!(
+            display(SerializeError::InvalidPath),
+            "invalid request target"
+        );
+        assert_eq!(
+            display(SerializeError::InvalidHeader),
+            "invalid request header"
         );
     }
 

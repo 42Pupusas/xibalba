@@ -488,7 +488,7 @@ pub(crate) fn read_response_head<S: Read>(
         false,
         &hdr_buf[..head.header_count],
         head.header_count,
-    );
+    )?;
 
     Ok((head_data, framing, consumed))
 }
