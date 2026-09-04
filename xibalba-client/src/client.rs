@@ -215,7 +215,14 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
 
     /// Whether `url` points at the origin this client is connected to.
     pub(crate) fn is_same_origin(&self, url: &Url<'_>) -> bool {
-        url.host == &self.host[..] && url.effective_port() == self.port && url.scheme == self.scheme
+        use xibalba_proto::bytes::ByteSliceExt;
+        url.host.ascii_eq_ignore_case(&self.host)
+            && url.effective_port() == self.port
+            && url.scheme == self.scheme
+    }
+
+    pub(crate) const fn scheme_bytes(&self) -> &'static [u8] {
+        self.scheme.as_bytes()
     }
 
     fn host_header_value(&self) -> Vec<u8> {

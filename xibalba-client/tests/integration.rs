@@ -1346,6 +1346,99 @@ fn redirect_301_followed() {
 }
 
 #[test]
+fn relative_redirect_resolves_against_current_directory_and_strips_fragment() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: next?q=1#ignored\r\n\r\n",
+            )
+            .unwrap();
+        stream.flush().unwrap();
+        let request = read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+        request
+    });
+
+    let mut client = connect(port);
+    assert_eq!(client.get(b"/dir/start").unwrap().text().unwrap(), "ok");
+    let redirected = server.join().unwrap();
+    assert!(
+        redirected.starts_with(b"GET /dir/next?q=1 HTTP/1.1\r\n"),
+        "unexpected redirect target: {}",
+        String::from_utf8_lossy(&redirected)
+    );
+}
+
+#[test]
+fn query_only_redirect_preserves_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: ?page=2\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        let request = read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        request
+    });
+
+    let mut client = connect(port);
+    client.get(b"/items").unwrap();
+    let redirected = server.join().unwrap();
+    assert!(redirected.starts_with(b"GET /items?page=2 HTTP/1.1\r\n"));
+}
+
+#[test]
+fn head_redirect_stays_head() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /final\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        let request = read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n")
+            .unwrap();
+        request
+    });
+
+    let mut client = connect(port);
+    let response = client.request(Method::Head, b"/start", None, None).unwrap();
+    assert_eq!(response.text().unwrap(), "");
+    let redirected = server.join().unwrap();
+    assert!(redirected.starts_with(b"HEAD /final HTTP/1.1\r\n"));
+}
+
+#[test]
+fn status_304_with_location_is_not_followed() {
+    let (port, server) = one_shot_server(
+        b"HTTP/1.1 304 Not Modified\r\nLocation: /must-not-follow\r\nContent-Length: 0\r\n\r\n",
+    );
+    let mut client = connect(port);
+    let response = client.get(b"/cached").unwrap();
+    assert_eq!(
+        response.status,
+        xibalba_client::proto::status::StatusCode::NOT_MODIFIED
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn redirect_chain() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -2123,9 +2216,15 @@ fn cross_origin_absolute_redirect_strips_credentials() {
         !req2_str.contains("session=abc"),
         "cookies leaked on cross-origin redirect:\n{req2_str}"
     );
+    let expected_host = format!("Host: 127.0.0.1:{port_b}\r\n");
     assert!(
-        req2_str.contains(&format!("Host: 127.0.0.1:{port_b}")),
+        req2_str.contains(&expected_host),
         "Host must name the redirect origin:\n{req2_str}"
+    );
+    assert_eq!(
+        req2_str.matches("Host:").count(),
+        1,
+        "redirect request must contain exactly one Host header:\n{req2_str}"
     );
 }
 

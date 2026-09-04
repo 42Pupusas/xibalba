@@ -41,21 +41,15 @@ impl RedirectState {
     }
 
     /// Drop credentials-bearing headers when a redirect leaves the origin.
-    /// `Authorization` and the proxy variant are stripped outright; `Cookie`
-    /// is replaced with a `Host`-scoped placeholder so the target origin
-    /// never receives another origin's cookies.
-    fn retarget_headers(&mut self, new_host: Option<&[u8]>) {
-        let Some(new_host) = new_host else {
-            return;
-        };
-        let new_host = new_host.to_vec();
+    /// The client writes `Host` from its current connection state on every
+    /// request; adding it here would serialize two Host fields.
+    fn strip_cross_origin_headers(&mut self) {
         self.extra_headers.retain(|(name, _)| {
             !(name.ascii_eq_ignore_case(b"Authorization")
                 || name.ascii_eq_ignore_case(b"Proxy-Authorization")
                 || name.ascii_eq_ignore_case(b"Cookie")
                 || name.ascii_eq_ignore_case(b"Cookie2"))
         });
-        self.extra_headers.push((b"Host".to_vec(), new_host));
     }
 
     /// Execute a fully-buffered request, following redirects up to the
@@ -69,7 +63,7 @@ impl RedirectState {
         for _ in 0..=client.config.max_redirects {
             let resp = client.send_one(&current.to_params())?;
 
-            if !resp.status.is_redirect() {
+            if !Self::is_followed_status(resp.status) {
                 return Ok(resp);
             }
 
@@ -83,22 +77,34 @@ impl RedirectState {
                 None => return Ok(resp),
             };
 
-            if !Self::is_method_preserving(resp.status) {
-                current.method = Method::Get;
-                current.body = None;
-            }
-
+            current.apply_method_redirect(resp.status);
             current.apply_location(client, &location)?;
         }
 
         Err(ConnectionError::TooManyRedirects.into())
     }
 
-    const fn is_method_preserving(status: StatusCode) -> bool {
+    const fn is_followed_status(status: StatusCode) -> bool {
         matches!(
             status,
-            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
         )
+    }
+
+    fn apply_method_redirect(&mut self, status: StatusCode) {
+        let becomes_get = match status {
+            StatusCode::SEE_OTHER => self.method != Method::Head,
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => self.method == Method::Post,
+            _ => false,
+        };
+        if becomes_get {
+            self.method = Method::Get;
+            self.body = None;
+        }
     }
 
     fn apply_location<C: Connector, const MAX_HEAD_SIZE: usize>(
@@ -106,35 +112,78 @@ impl RedirectState {
         client: &mut Client<C, MAX_HEAD_SIZE>,
         location: &[u8],
     ) -> Result<(), Error> {
-        if location.starts_with(b"http://") || location.starts_with(b"https://") {
-            let url = Url::parse(location)?;
-            if client.is_same_origin(&url) {
-                self.retarget_headers(None);
-            } else {
-                client.reconnect(&url)?;
-                self.retarget_headers(Some(url.host));
-            }
-            self.path = normalize_path(url.path);
-            self.query = url.query.map(<[u8]>::to_vec);
-        } else {
-            let (path_part, query_part) = location
-                .iter()
-                .position(|&b| b == b'?')
-                .map_or((location, None), |pos| {
-                    (&location[..pos], Some(location[pos + 1..].to_vec()))
-                });
-            self.path = normalize_path(path_part);
-            self.query = query_part;
+        let without_fragment = location
+            .iter()
+            .position(|&b| b == b'#')
+            .map_or(location, |pos| &location[..pos]);
+
+        if without_fragment.starts_with(b"http://") || without_fragment.starts_with(b"https://") {
+            return self.apply_absolute_location(client, without_fragment);
         }
+        if without_fragment.starts_with(b"//") {
+            let mut absolute = client.scheme_bytes().to_vec();
+            absolute.push(b':');
+            absolute.extend_from_slice(without_fragment);
+            return self.apply_absolute_location(client, &absolute);
+        }
+
+        let (path_part, query) = without_fragment.iter().position(|&b| b == b'?').map_or(
+            (without_fragment, None),
+            |pos| {
+                (
+                    &without_fragment[..pos],
+                    Some(without_fragment[pos + 1..].to_vec()),
+                )
+            },
+        );
+
+        if path_part.is_empty() {
+            if query.is_some() {
+                self.query = query;
+            }
+            return Ok(());
+        }
+
+        self.path = if path_part.starts_with(b"/") {
+            path_part.to_vec()
+        } else {
+            self.resolve_relative_path(path_part)
+        };
+        self.query = query;
         Ok(())
     }
-}
 
-fn normalize_path(path: &[u8]) -> Vec<u8> {
-    if path.is_empty() {
-        b"/".to_vec()
-    } else {
-        path.to_vec()
+    fn apply_absolute_location<C: Connector, const MAX_HEAD_SIZE: usize>(
+        &mut self,
+        client: &mut Client<C, MAX_HEAD_SIZE>,
+        location: &[u8],
+    ) -> Result<(), Error> {
+        let url = Url::parse(location)?;
+        if !client.is_same_origin(&url) {
+            client.reconnect(&url)?;
+            self.strip_cross_origin_headers();
+        }
+        self.path = if url.path.is_empty() {
+            b"/".to_vec()
+        } else {
+            url.path.to_vec()
+        };
+        self.query = url.query.map(<[u8]>::to_vec);
+        Ok(())
+    }
+
+    fn resolve_relative_path(&self, relative: &[u8]) -> Vec<u8> {
+        let base_end = self
+            .path
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map_or(0, |pos| pos + 1);
+        let mut resolved = self.path[..base_end].to_vec();
+        if resolved.is_empty() {
+            resolved.push(b'/');
+        }
+        resolved.extend_from_slice(relative);
+        resolved
     }
 }
 
@@ -171,23 +220,22 @@ mod tests {
             ("Cookie", "session=abc"),
             ("X-Custom", "kept"),
         ]));
-        state.retarget_headers(Some(b"other.example"));
+        state.strip_cross_origin_headers();
         let p = state.to_params();
         assert_eq!(header(&p, "Authorization"), None);
         assert_eq!(header(&p, "Proxy-Authorization"), None);
         assert_eq!(header(&p, "Cookie"), None);
         assert_eq!(header(&p, "Cookie2"), None);
         assert_eq!(header(&p, "X-Custom"), Some(&b"kept"[..]));
-        assert_eq!(header(&p, "Host"), Some(&b"other.example"[..]));
+        assert_eq!(header(&p, "Host"), None);
     }
 
     #[test]
     fn same_origin_redirect_keeps_credentials() {
-        let mut state = RedirectState::new(&params_with(&[
+        let state = RedirectState::new(&params_with(&[
             ("Authorization", "Bearer s3cret"),
             ("Cookie", "session=abc"),
         ]));
-        state.retarget_headers(None);
         let p = state.to_params();
         assert_eq!(header(&p, "Authorization"), Some(&b"Bearer s3cret"[..]));
         assert_eq!(header(&p, "Cookie"), Some(&b"session=abc"[..]));
@@ -202,21 +250,7 @@ mod tests {
             body: Some(b"payload"),
             extra_headers: Vec::new(),
         });
-        assert!(RedirectState::is_method_preserving(
-            StatusCode::TEMPORARY_REDIRECT
-        ));
-        assert!(RedirectState::is_method_preserving(
-            StatusCode::PERMANENT_REDIRECT
-        ));
-        assert!(!RedirectState::is_method_preserving(
-            StatusCode::MOVED_PERMANENTLY
-        ));
-        assert!(!RedirectState::is_method_preserving(StatusCode::FOUND));
-
-        if !RedirectState::is_method_preserving(StatusCode::MOVED_PERMANENTLY) {
-            state.method = Method::Get;
-            state.body = None;
-        }
+        state.apply_method_redirect(StatusCode::MOVED_PERMANENTLY);
         let p = state.to_params();
         assert_eq!(p.method, Method::Get);
         assert_eq!(p.body, None);
