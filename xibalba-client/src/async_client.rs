@@ -55,7 +55,7 @@ use quetzalcoatl::spsc::{self, Consumer as SpscConsumer};
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::method::Method;
 
-use crate::body::StreamingBody;
+use crate::body::{BodyCollector, StreamingBody};
 use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 use crate::config::HEAD_BUF_SIZE;
 use crate::params::RequestParams;
@@ -599,21 +599,36 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         return;
     }
 
-    // Non-2xx: drain the body as a single chunk for the caller
-    // to inspect (e.g. error message from the API).
+    // Non-2xx: drain the body as a single chunk for the caller to inspect.
+    // It still runs through CancellableStream: an error response can stall
+    // exactly like a success response, and client drop/cancel must interrupt
+    // both paths.
     if !(200..300).contains(&status) {
-        let body_result = client.read_full_body(&framing, tail_offset);
-        match body_result {
+        let tail = client.head_buf[tail_offset..].to_vec();
+        let mut cancellable = CancellableStream::new(
+            &mut client.stream,
+            control_rx,
+            pending,
+            ticket,
+            shutting_down,
+        );
+        let mut collector = BodyCollector::new(
+            client.config.max_response_body,
+            client.config.stream_silence,
+        );
+        match collector.read(&mut cancellable, &framing, &tail) {
             Ok(bytes) => {
-                // Body fully consumed — the socket is positioned at the
-                // next response, so keep-alive reuse is safe again.
-                client.dirty = false;
-                if !bytes.is_empty() {
-                    let _ = chunk_tx.push_block(Chunk::Body(bytes));
+                client.dirty = !collector.is_reusable();
+                if !bytes.is_empty() && chunk_tx.push_block(Chunk::Body(bytes)).is_err() {
+                    return;
                 }
             }
-            Err(e) => {
-                let _ = chunk_tx.push_block(Chunk::Error(std::sync::Arc::new(e)));
+            Err(Error::Io(error)) if error.kind == std::io::ErrorKind::Interrupted => {
+                let _ = chunk_tx.push_block(Chunk::Aborted);
+                return;
+            }
+            Err(error) => {
+                let _ = chunk_tx.push_block(Chunk::Error(std::sync::Arc::new(error)));
                 return;
             }
         }
@@ -636,7 +651,6 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         &mut client.stream,
         control_rx,
         pending,
-        silence,
         ticket,
         shutting_down,
     );
@@ -679,28 +693,16 @@ pub struct CancellableStream<'a, S: Read> {
     /// The in-flight request's ticket; only a cancel naming it (or
     /// `CANCEL_ANY`) interrupts this stream.
     ticket: u64,
-    /// Wall-clock silence tolerance between reads (see
-    /// [`Config::stream_silence`](crate::client::Config::stream_silence)).
-    /// Measured in real time rather than retry counts so the tolerance
-    /// does not silently shrink when the per-read `read_timeout` is
-    /// shortened for cancel latency. Without any bound, a peer that
-    /// half-dies without FIN/RST (NAT drop) parks the reader thread in
-    /// the retry loop forever: the caller hangs in `pop_block` and every
-    /// queued request wedges behind the dead read.
-    silence: std::time::Duration,
-    /// When the last successful read completed; the silence clock.
-    last_progress: std::time::Instant,
-    /// Set when the owning [`AsyncClient`] is dropping; the next retry
+    /// Set when the owning [`AsyncClient`] is dropping; the next read
     /// unwinds instead of waiting out the silence budget.
     shutting_down: &'a AtomicBool,
 }
 
 impl<'a, S: Read> CancellableStream<'a, S> {
-    fn new(
+    const fn new(
         inner: &'a mut S,
         control_rx: &'a mut MpscConsumer<Control>,
         pending: &'a mut VecDeque<AsyncRequest>,
-        silence: std::time::Duration,
         ticket: u64,
         shutting_down: &'a AtomicBool,
     ) -> Self {
@@ -709,8 +711,6 @@ impl<'a, S: Read> CancellableStream<'a, S> {
             control_rx,
             pending,
             ticket,
-            silence,
-            last_progress: std::time::Instant::now(),
             shutting_down,
         }
     }
@@ -718,45 +718,17 @@ impl<'a, S: Read> CancellableStream<'a, S> {
 
 impl<S: Read> Read for CancellableStream<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            if poll_control(
-                self.control_rx,
-                self.pending,
-                Some(self.ticket),
-                self.shutting_down,
-            ) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "request cancelled",
-                ));
-            }
-            match self.inner.read(buf) {
-                Ok(n) => {
-                    self.last_progress = std::time::Instant::now();
-                    return Ok(n);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Read timeout expired. Retry to re-check the cancel
-                    // message and the shutdown flag — but never past the
-                    // silence budget, so a silently dead peer surfaces as
-                    // a descriptive error (not raw EAGAIN) instead of
-                    // wedging the reader thread and every queued request
-                    // behind it.
-                    if self.shutting_down.load(Ordering::Acquire) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "client dropped mid-read",
-                        ));
-                    }
-                    if self.last_progress.elapsed() >= self.silence {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!("stream stalled: peer sent no data for {:.0?}", self.silence),
-                        ));
-                    }
-                }
-                Err(e) => return Err(e),
-            }
+        if poll_control(
+            self.control_rx,
+            self.pending,
+            Some(self.ticket),
+            self.shutting_down,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "request cancelled",
+            ));
         }
+        self.inner.read(buf)
     }
 }

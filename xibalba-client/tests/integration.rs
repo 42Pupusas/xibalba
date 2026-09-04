@@ -108,6 +108,44 @@ fn connect_async(port: u16) -> AsyncClient {
 // ── AsyncClient tests ────────────────────────────────────────────────────────
 
 #[test]
+fn async_cancel_interrupts_stalled_error_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 100\r\n\r\npartial")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_secs(2));
+    });
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(50)),
+        stream_silence: Duration::from_mins(5),
+        ..Config::default()
+    };
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config).unwrap();
+    let mut handle = client
+        .submit(Method::Get, b"/rate-limit".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(
+        handle.next_block(),
+        Some(Chunk::Head { status: 429, .. })
+    ));
+
+    handle.cancel().unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(handle.next_block(), Some(Chunk::Aborted));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    drop(client);
+    server.join().unwrap();
+}
+
+#[test]
 fn async_silently_dead_stream_surfaces_error_and_recovers() {
     // Regression test for the wedged-reader bug. A server that stops
     // sending mid-SSE without closing the socket (NAT drop, silent
