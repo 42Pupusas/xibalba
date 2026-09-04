@@ -217,12 +217,15 @@ impl ResponseParser {
     /// response when one arrives, None when more data is needed.
     fn feed(&mut self, data: &[u8], request_id: RequestId) -> Result<Option<Response>, Error> {
         if let Some(ref mut partial) = self.partial {
-            if !data.is_empty() {
-                PartialResponse::pump(partial, data)?;
-            }
+            let consumed = if data.is_empty() {
+                0
+            } else {
+                PartialResponse::pump(partial, data)?
+            };
             if partial.body_done {
                 let p = self.partial.take().unwrap();
                 self.head_accum.clear();
+                self.head_accum.extend_from_slice(&data[consumed..]);
                 return Ok(Some(Response {
                     request_id,
                     version: p.version,
@@ -1332,6 +1335,38 @@ mod tests {
                 .unwrap_err(),
             Error::Parse(xibalba_proto::error::ParseError::InvalidChunkSize)
         );
+    }
+
+    #[test]
+    fn pipelined_head_after_body_completed_in_later_feed_is_preserved() {
+        let mut parser = ResponseParser::new();
+        let first_head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe";
+        assert!(parser.feed(first_head, 11).unwrap().is_none());
+
+        let second_head = b"lloHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let first = parser.feed(second_head, 11).unwrap().unwrap();
+        assert_eq!(first.request_id, 11);
+        assert_eq!(first.body, b"hello");
+
+        let second = parser.feed(b"", 12).unwrap().unwrap();
+        assert_eq!(second.request_id, 12);
+        assert_eq!(second.body, b"two");
+    }
+
+    #[test]
+    fn pipelined_head_after_chunked_body_completed_in_later_feed_is_preserved() {
+        let mut parser = ResponseParser::new();
+        let first_head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe";
+        assert!(parser.feed(first_head, 13).unwrap().is_none());
+
+        let second_head = b"llo\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        let first = parser.feed(second_head, 13).unwrap().unwrap();
+        assert_eq!(first.request_id, 13);
+        assert_eq!(first.body, b"hello");
+
+        let second = parser.feed(b"", 14).unwrap().unwrap();
+        assert_eq!(second.request_id, 14);
+        assert_eq!(second.body, b"two");
     }
 
     #[test]

@@ -27,6 +27,11 @@ pub trait Connector {
 
     /// Open a connection to `url`, using `tls_config` for HTTPS.
     ///
+    /// Implementations backed by TCP should enable `TCP_NODELAY` before
+    /// returning. The client coalesces small request bodies, but larger
+    /// bodies require separate head/body writes and otherwise remain
+    /// exposed to delayed-ACK latency.
+    ///
     /// # Errors
     /// Returns `Error` on DNS failure, TCP connect failure, or TLS handshake
     /// failure.

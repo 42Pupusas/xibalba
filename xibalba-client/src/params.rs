@@ -51,7 +51,7 @@ impl RequestParams<'_> {
             }
             if extra_headers
                 .iter()
-                .filter(|(other, _)| names_match(other, name))
+                .filter(|(other, _)| Self::names_match(other, name))
                 .count()
                 > 1
                 && !Self::is_repeatable(name)
@@ -60,6 +60,11 @@ impl RequestParams<'_> {
             }
         }
         Ok(())
+    }
+
+    fn names_match(a: &[u8], b: &[u8]) -> bool {
+        use xibalba_proto::bytes::ByteSliceExt;
+        a.ascii_eq_ignore_case(b)
     }
 }
 
@@ -150,10 +155,4 @@ impl<'a> RequestBuilder<'a> {
         RequestParams::validate_extra_headers(&params.extra_headers)?;
         Ok(params)
     }
-}
-
-/// Case-insensitive header-name comparison on raw bytes.
-fn names_match(a: &[u8], b: &[u8]) -> bool {
-    use xibalba_proto::bytes::ByteSliceExt;
-    a.ascii_eq_ignore_case(b)
 }
