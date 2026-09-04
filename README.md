@@ -53,6 +53,22 @@ loop {
 }
 ```
 
+## Benchmarks
+
+Against `ureq` over real loopback sockets, reusing one keep-alive connection,
+xibalba is about 1.4-1.5x faster on small responses, 64 KiB responses, and
+sequential throughput. URL parsing and request serialization are several times
+faster than the `url` and `http` crates, though those crates do strictly more
+work. Response-head parsing is faster than `httparse` with no headers and
+**1.6-1.8x slower** once six or more headers are present, since `httparse` is
+SIMD-accelerated and `ResponseHead::parse` is scalar.
+
+The experimental io_uring pool is currently slower than the blocking client on
+every sequential scenario measured.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the numbers, the caveats, and how to
+reproduce them.
+
 ## Transport and TLS
 
 `xibalba-client` is transport-agnostic, and deliberately so: its only
