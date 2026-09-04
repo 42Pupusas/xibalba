@@ -55,29 +55,11 @@ impl HeadData {
         head_acc.clear();
         let mut raw = [0u8; HEAD_BUF_SIZE];
         let mut budget = SilenceBudget::new(silence);
+        let mut interim_seen = 0usize;
 
         let (head, ranges, head_end, framing) = loop {
-            let head_end = loop {
-                let n = budget.read(stream, &mut raw)?;
-                if n == 0 {
-                    return Err(ConnectionError::ConnectionClosed.into());
-                }
-                head_acc.extend_from_slice(&raw[..n]);
-                // A socket read can contain both the final header bytes and the body
-                // prefix. Find the delimiter before applying the limit so a valid
-                // `max_head`-sized head is not rejected merely because its first body
-                // bytes arrived in the same read.
-                if let Some(pos) = head_acc.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let head_end = pos + 4;
-                    if head_end > max_head {
-                        return Err(ConnectionError::HeadTooLarge.into());
-                    }
-                    break head_end;
-                }
-                if head_acc.len() > max_head {
-                    return Err(ConnectionError::HeadTooLarge.into());
-                }
-            };
+            let head_end =
+                Self::read_until_head_end(stream, head_acc, &mut raw, &mut budget, max_head)?;
 
             let mut hdr_buf = [const { Header::empty() }; MAX_HEADERS];
             let (head, consumed) = ResponseHead::parse(&head_acc[..head_end], &mut hdr_buf)?;
@@ -87,6 +69,10 @@ impl HeadData {
             // exception — it hands the connection over to another protocol, so
             // it is surfaced as a final response.
             if head.status.is_informational() && head.status != StatusCode::SWITCHING_PROTOCOLS {
+                interim_seen += 1;
+                if interim_seen > MAX_INTERIM_RESPONSES {
+                    return Err(ConnectionError::TooManyInterimResponses.into());
+                }
                 head_acc.drain(..head_end);
                 continue;
             }
@@ -120,7 +106,55 @@ impl HeadData {
 
         Ok((head_data, framing, head_end))
     }
+
+    /// Grow `head_acc` from `stream` until it holds a complete head, and
+    /// return the offset just past the terminating CRLFCRLF. Bytes already
+    /// in `head_acc` (a second head that arrived in the same read as a
+    /// skipped 1xx) are scanned before the socket is touched, so a head
+    /// that is already buffered never waits on another read.
+    ///
+    /// A socket read can contain both the final header bytes and the body
+    /// prefix. The delimiter is found before applying the limit so a valid
+    /// `max_head`-sized head is not rejected merely because its first body
+    /// bytes arrived in the same read.
+    fn read_until_head_end<S: Read>(
+        stream: &mut S,
+        head_acc: &mut Vec<u8>,
+        raw: &mut [u8; HEAD_BUF_SIZE],
+        budget: &mut SilenceBudget,
+        max_head: usize,
+    ) -> Result<usize, Error> {
+        let mut scanned = 0usize;
+        loop {
+            let scan_from = scanned.saturating_sub(3);
+            if let Some(pos) = head_acc[scan_from..]
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+            {
+                let head_end = scan_from + pos + 4;
+                if head_end > max_head {
+                    return Err(ConnectionError::HeadTooLarge.into());
+                }
+                return Ok(head_end);
+            }
+            if head_acc.len() > max_head {
+                return Err(ConnectionError::HeadTooLarge.into());
+            }
+            scanned = head_acc.len();
+
+            let n = budget.read(stream, raw)?;
+            if n == 0 {
+                return Err(ConnectionError::ConnectionClosed.into());
+            }
+            head_acc.extend_from_slice(&raw[..n]);
+        }
+    }
 }
+
+/// Upper bound on 1xx heads skipped before one final response. Servers
+/// send at most a handful (100, 102, 103); an unbounded run is a peer
+/// keeping the client reading forever without ever answering.
+const MAX_INTERIM_RESPONSES: usize = 8;
 
 /// A fully-buffered response: body already read off the wire.
 #[derive(Debug)]

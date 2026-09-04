@@ -31,6 +31,9 @@ pub enum ConnectionError {
     BodyTooLarge,
     HeadTooLarge,
     TooManyRedirects,
+    /// More 1xx interim heads arrived than the client will skip before a
+    /// final response.
+    TooManyInterimResponses,
     /// The async client's background reader thread has exited.
     ReaderGone,
     Other(String),
@@ -116,6 +119,7 @@ impl fmt::Display for ConnectionError {
             Self::BodyTooLarge => f.write_str("response body exceeds size limit"),
             Self::HeadTooLarge => f.write_str("response head exceeds size limit"),
             Self::TooManyRedirects => f.write_str("too many redirects"),
+            Self::TooManyInterimResponses => f.write_str("too many 1xx interim responses"),
             Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::Other(msg) => f.write_str(msg),
         }
@@ -301,6 +305,10 @@ mod tests {
                 "response head exceeds size limit",
             ),
             (ConnectionError::TooManyRedirects, "too many redirects"),
+            (
+                ConnectionError::TooManyInterimResponses,
+                "too many 1xx interim responses",
+            ),
             (
                 ConnectionError::ReaderGone,
                 "background reader thread has exited",

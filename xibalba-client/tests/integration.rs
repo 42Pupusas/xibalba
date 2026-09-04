@@ -2199,6 +2199,44 @@ fn interim_100_response_is_skipped() {
 }
 
 #[test]
+fn interim_and_final_response_in_one_read_are_both_processed() {
+    let (port, server) = one_shot_server(
+        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal",
+    );
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(100)),
+        head_silence: Duration::from_millis(300),
+        ..Config::default()
+    };
+    let mut client = connect_with_config(port, config);
+
+    let started = std::time::Instant::now();
+    let resp = client.get(b"/coalesced-100").unwrap();
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
+    assert_eq!(resp.text().unwrap(), "real");
+    server.join().unwrap();
+}
+
+#[test]
+fn excessive_interim_responses_are_rejected() {
+    let mut response = Vec::new();
+    for _ in 0..9 {
+        response.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+    let (port, server) = one_shot_server(response);
+    let mut client = connect(port);
+
+    assert_eq!(
+        client.get(b"/too-many-interims").unwrap_err(),
+        Error::Connection(ConnectionError::TooManyInterimResponses)
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn switching_protocols_is_surfaced_as_final_response() {
     // 101 hands the connection to another protocol; it must be surfaced
     // (not skipped like other 1xx) so the caller can take over.
