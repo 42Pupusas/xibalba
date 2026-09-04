@@ -1,3 +1,10 @@
+//! `ResponseHead::parse` and `ChunkedDecoder` benches for xibalba's own
+//! parser.
+//!
+//! A comparison against `httparse` lives under `examples/` — see
+//! `examples/compare_response_parse.rs` — so a competing crate never shows
+//! up in this package's normal dependency graph.
+
 use divan::black_box;
 use xibalba_benches as fx;
 use xibalba_proto::header::Header;
@@ -96,53 +103,5 @@ fn chunked_byte_at_a_time() {
         if dec.is_done() {
             break;
         }
-    }
-}
-
-// ── Comparisons: xibalba vs httparse ──────────────────────────────────────
-
-mod compare {
-    use divan::black_box;
-    use xibalba_benches as fx;
-    use xibalba_proto::header::Header;
-    use xibalba_proto::response::ResponseHead;
-
-    #[divan::bench]
-    fn parse_minimal_xibalba() {
-        let mut hdrs = [const { Header::empty() }; 32];
-        ResponseHead::parse(black_box(fx::RESP_MINIMAL), &mut hdrs).unwrap();
-    }
-
-    #[divan::bench]
-    fn parse_minimal_httparse() {
-        let mut hdrs = [httparse::EMPTY_HEADER; 32];
-        let mut resp = httparse::Response::new(&mut hdrs);
-        resp.parse(black_box(fx::RESP_MINIMAL)).unwrap();
-    }
-
-    #[divan::bench]
-    fn parse_typical_xibalba() {
-        let mut hdrs = [const { Header::empty() }; 32];
-        ResponseHead::parse(black_box(fx::RESP_TYPICAL), &mut hdrs).unwrap();
-    }
-
-    #[divan::bench]
-    fn parse_typical_httparse() {
-        let mut hdrs = [httparse::EMPTY_HEADER; 32];
-        let mut resp = httparse::Response::new(&mut hdrs);
-        resp.parse(black_box(fx::RESP_TYPICAL)).unwrap();
-    }
-
-    #[divan::bench]
-    fn parse_heavy_xibalba() {
-        let mut hdrs = [const { Header::empty() }; 32];
-        ResponseHead::parse(black_box(fx::RESP_HEAVY), &mut hdrs).unwrap();
-    }
-
-    #[divan::bench]
-    fn parse_heavy_httparse() {
-        let mut hdrs = [httparse::EMPTY_HEADER; 32];
-        let mut resp = httparse::Response::new(&mut hdrs);
-        resp.parse(black_box(fx::RESP_HEAVY)).unwrap();
     }
 }

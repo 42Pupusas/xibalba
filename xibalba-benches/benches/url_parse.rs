@@ -1,3 +1,9 @@
+//! `Url::parse` and `query_params` benches for xibalba's own parser.
+//!
+//! A comparison against the `url` crate lives under `examples/` — see
+//! `examples/compare_url_parse.rs` — so a competing crate never shows up
+//! in this package's normal dependency graph.
+
 use divan::black_box;
 use xibalba_benches as fx;
 use xibalba_proto::url::Url;
@@ -52,34 +58,4 @@ fn query_params_fifty(bencher: divan::Bencher) {
     bencher.bench(|| {
         black_box(url.query_params().count());
     });
-}
-
-// ── Comparisons: Url::parse vs url crate ──────────────────────────────────
-
-mod compare {
-    use divan::black_box;
-    use xibalba_benches as fx;
-    use xibalba_proto::url::Url;
-
-    #[divan::bench]
-    fn url_simple_xibalba() {
-        Url::parse(black_box(fx::URL_SIMPLE)).unwrap();
-    }
-
-    #[divan::bench]
-    fn url_simple_url_crate() {
-        let s = std::str::from_utf8(fx::URL_SIMPLE).unwrap();
-        url::Url::parse(black_box(s)).unwrap();
-    }
-
-    #[divan::bench]
-    fn url_full_xibalba() {
-        Url::parse(black_box(fx::URL_FULL)).unwrap();
-    }
-
-    #[divan::bench]
-    fn url_full_url_crate() {
-        let s = std::str::from_utf8(fx::URL_FULL).unwrap();
-        url::Url::parse(black_box(s)).unwrap();
-    }
 }

@@ -5,9 +5,9 @@ edition = "2024"
 description = "io_uring-backed HTTP/1.1 connection pool for xibalba"
 
 [dependencies]
-xibalba-proto = { path = "../xibalba-proto" }
-ququmatz = { path = "../../ququmatz" }
-quetzalcoatl = { path = "../../quetzalcoatl" }
+xibalba-proto = { workspace = true }
+ququmatz = { workspace = true }
+quetzalcoatl = { workspace = true }
 
 [[bin]]
 name = "demo"

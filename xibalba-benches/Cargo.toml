@@ -12,19 +12,20 @@ path = "src/lib.rs"
 dhat-heap = ["dep:dhat"]
 
 [dependencies]
-xibalba-proto = { path = "../xibalba-proto" }
-xibalba-client = { path = "../xibalba-client" }
-xibalba-iouring = { path = "../xibalba-iouring" }
+xibalba-proto = { workspace = true }
+xibalba-client = { workspace = true }
+xibalba-iouring = { workspace = true }
 divan = "0.1"
+dhat = { version = "0.3", optional = true }
+
+# Comparison-only dependencies for examples/*.rs. Kept as dev-dependencies
+# so a normal build of this package (and anything depending on it) never
+# pulls in a competing crate — only `cargo run --example ...` does.
+[dev-dependencies]
 httparse = "1"
 http = "1"
 url = "2"
 ureq = "3"
-dhat = { version = "0.3", optional = true }
-# TLS provider benchmarks
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "aws_lc_rs"] }
-rustls-rustcrypto = "0.0.2-alpha"
-rcgen = "0.14"
 
 [[bench]]
 name = "response_parse"
@@ -45,14 +46,6 @@ harness = false
 [[bench]]
 name = "network"
 harness = false
-
-[[bench]]
-name = "tls_providers"
-harness = false
-
-[[test]]
-name = "tls_adversarial"
-path = "src/bin/tls_adversarial.rs"
 
 [[bin]]
 name = "profile-response-parse"

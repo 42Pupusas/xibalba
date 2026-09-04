@@ -4,7 +4,7 @@
 //! failures are attributed per-provider.
 //!
 //! Run:
-//!   cargo test --test `tls_adversarial` -p xibalba-benches -- --test-threads=4
+//!   cargo test --test `tls_adversarial` -p tls-providers-bench -- --test-threads=4
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

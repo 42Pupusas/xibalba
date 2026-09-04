@@ -1,0 +1,24 @@
+[package]
+name = "tls-providers-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Benchmarks + adversarial tests comparing rustls crypto providers (ring, aws-lc-rs, rustcrypto)"
+autobins = false
+
+[dependencies]
+divan = "0.1"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "aws_lc_rs"] }
+rustls-rustcrypto = "0.0.2-alpha"
+
+[[bench]]
+name = "tls_providers"
+harness = false
+
+[[test]]
+name = "tls_adversarial"
+path = "src/bin/tls_adversarial.rs"
+
+[lints]
+workspace = true

@@ -3,16 +3,12 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use std::hint::black_box;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::io::Read;
 
+use xibalba_benches::{EchoServer, PlainConnector};
 use xibalba_client::client::Client;
-use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_iouring::driver::Pool;
-use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::method::Method;
-use xibalba_proto::url::Url;
 
 const ITERATIONS: usize = 10_000;
 
@@ -35,99 +31,10 @@ fn large_resp() -> Vec<u8> {
     r
 }
 
-// ── Plain TCP connector ───────────────────────────────────────────────────────
-
-struct PlainConnector;
-struct PlainStream(TcpStream);
-
-impl Read for PlainStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-impl Write for PlainStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-impl SetReadTimeout for PlainStream {
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.0.set_read_timeout(dur)
-    }
-}
-impl Connector for PlainConnector {
-    type Stream = PlainStream;
-    type TlsConfig = ();
-
-    fn connect(url: &Url<'_>, _tls_config: &()) -> Result<Self::Stream, Error> {
-        let host = std::str::from_utf8(url.host).map_err(|_| {
-            Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
-        })?;
-        let stream = TcpStream::connect(format!("{}:{}", host, url.effective_port()))?;
-        Ok(PlainStream(stream))
-    }
-}
-
-// ── Echo server ───────────────────────────────────────────────────────────────
-
-fn spawn_server(response: Vec<u8>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut s) = stream else { continue };
-            let resp = response.clone();
-            std::thread::spawn(move || {
-                let mut hdr_buf = Vec::with_capacity(512);
-                let mut raw = [0u8; 4096];
-                'conn: loop {
-                    let header_end = loop {
-                        let n = s.read(&mut raw).unwrap_or(0);
-                        if n == 0 {
-                            break 'conn;
-                        }
-                        hdr_buf.extend_from_slice(&raw[..n]);
-                        if let Some(pos) = hdr_buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break pos + 4;
-                        }
-                    };
-                    let body_len: usize = std::str::from_utf8(&hdr_buf[..header_end])
-                        .ok()
-                        .and_then(|s| {
-                            s.lines()
-                                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-                                .and_then(|l| l.split_once(':'))
-                                .and_then(|(_, v)| v.trim().parse().ok())
-                        })
-                        .unwrap_or(0);
-                    let already_read = hdr_buf.len() - header_end;
-                    let mut remaining = body_len.saturating_sub(already_read);
-                    let mut discard = [0u8; 4096];
-                    while remaining > 0 {
-                        let n = s.read(&mut discard[..remaining.min(4096)]).unwrap_or(0);
-                        if n == 0 {
-                            break 'conn;
-                        }
-                        remaining -= n;
-                    }
-                    if s.write_all(&resp).is_err() {
-                        break 'conn;
-                    }
-                    hdr_buf.clear();
-                }
-            });
-        }
-    });
-    port
-}
-
 // ── Run helpers ───────────────────────────────────────────────────────────────
 
 fn run_blocking(response: Vec<u8>) {
-    let port = spawn_server(response);
+    let port = EchoServer::spawn_owned(response);
     let url = format!("http://127.0.0.1:{port}/");
     let mut client = Client::<PlainConnector>::connect_default(url.as_bytes(), ()).unwrap();
 
@@ -156,7 +63,7 @@ fn run_blocking(response: Vec<u8>) {
 }
 
 fn run_io_uring(response: Vec<u8>) {
-    let port = spawn_server(response);
+    let port = EchoServer::spawn_owned(response);
 
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();

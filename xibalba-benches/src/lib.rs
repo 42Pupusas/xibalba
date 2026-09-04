@@ -1,3 +1,8 @@
+pub mod plain_connector;
+pub mod server;
+pub use plain_connector::{PlainConnector, PlainStream};
+pub use server::EchoServer;
+
 // ── Response head fixtures ─────────────────────────────────────────────────
 
 pub const RESP_MINIMAL: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
