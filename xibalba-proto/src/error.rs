@@ -12,6 +12,7 @@ pub struct TlsError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     UrlParse(UrlError),
     Parse(ParseError),
@@ -22,6 +23,7 @@ pub enum Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionError {
     ConnectionClosed,
     ContentLengthOverflow,
@@ -43,6 +45,7 @@ pub enum ConnectionError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UrlError {
     /// Input is empty.
     Empty,
@@ -57,6 +60,7 @@ pub enum UrlError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParseError {
     /// Response is incomplete; need more data.
     Incomplete,
@@ -83,6 +87,7 @@ pub enum ParseError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SerializeError {
     /// The output buffer is too small to hold the serialized request.
     BufferTooSmall,

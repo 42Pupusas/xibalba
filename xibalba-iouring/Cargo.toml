@@ -3,6 +3,7 @@ name = "xibalba-iouring"
 version = "0.1.0"
 edition = "2024"
 description = "io_uring-backed HTTP/1.1 connection pool for xibalba"
+publish = false
 
 [dependencies]
 xibalba-proto = { workspace = true }

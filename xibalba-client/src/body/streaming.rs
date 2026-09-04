@@ -7,10 +7,10 @@ use crate::silence::SilenceBudget;
 
 /// Incremental body reader over a live connection stream.
 ///
-/// Unlike the fully-buffered [`BodyCollector`](crate::body::BodyCollector),
-/// this decodes framing (chunked / content-length / until-close) on the fly
-/// as the caller reads — required for server-sent events, where the
-/// response only ends after the server is done generating.
+/// Unlike a fully-buffered body, this decodes framing (chunked /
+/// content-length / until-close) on the fly as the caller reads —
+/// required for server-sent events, where the response only ends after
+/// the server is done generating.
 ///
 /// Holds `&mut` borrows of the client's stream and its dirty flag for
 /// the duration of the response. The flag is cleared when the body is
