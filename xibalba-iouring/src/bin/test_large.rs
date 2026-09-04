@@ -48,6 +48,9 @@ fn main() {
             xibalba_iouring::driver::ConnResult::Error {
                 request_id, errno, ..
             } => panic!("iter {i}: request {request_id} failed: errno {errno}"),
+            xibalba_iouring::driver::ConnResult::ProtocolError {
+                request_id, error, ..
+            } => panic!("iter {i}: request {request_id} failed: {error}"),
             xibalba_iouring::driver::ConnResult::Timeout => panic!("iter {i}: timed out"),
         };
         assert_eq!(resp.request_id, id);

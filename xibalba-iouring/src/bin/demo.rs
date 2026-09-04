@@ -54,6 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ConnResult::Error {
                 request_id, errno, ..
             } => panic!("request {request_id} failed: errno {errno}"),
+            ConnResult::ProtocolError {
+                request_id, error, ..
+            } => panic!("request {request_id} failed: {error}"),
             ConnResult::Timeout => panic!("request timed out"),
         };
         eprintln!(

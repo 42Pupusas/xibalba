@@ -48,6 +48,7 @@ use xibalba_proto::version::Version;
 const MAX_HEADERS: usize = 64;
 const PBUF_BGID: u16 = 0;
 const BLOCK_SIZE: usize = 8192;
+const MAX_RESPONSE_HEAD: usize = 64 * 1024;
 const SHUTDOWN_UD: u64 = u64::MAX;
 // Second-highest value — cannot collide with recv (bit63=0), send (bit63=1 and not MAX), or SHUTDOWN.
 const TIMEOUT_UD: u64 = u64::MAX - 1;
@@ -110,6 +111,12 @@ pub enum ConnResult {
         /// The connection handle.  The caller should call `disconnect` on it.
         conn: ConnHandle,
         errno: i32,
+    },
+    /// The peer sent a response that could not be parsed or decoded.
+    ProtocolError {
+        request_id: RequestId,
+        conn: ConnHandle,
+        error: std::sync::Arc<Error>,
     },
     /// A `recv_timeout` deadline elapsed before any response arrived.
     Timeout,
@@ -208,55 +215,59 @@ impl ResponseParser {
 
     /// Feed data and attempt to complete a response. Returns the complete
     /// response when one arrives, None when more data is needed.
-    fn feed(&mut self, data: &[u8], request_id: RequestId) -> Option<Response> {
+    fn feed(&mut self, data: &[u8], request_id: RequestId) -> Result<Option<Response>, Error> {
         if let Some(ref mut partial) = self.partial {
             if !data.is_empty() {
-                pump_partial(partial, data);
+                PartialResponse::pump(partial, data)?;
             }
             if partial.body_done {
                 let p = self.partial.take().unwrap();
                 self.head_accum.clear();
-                return Some(Response {
+                return Ok(Some(Response {
                     request_id,
                     version: p.version,
                     status: p.status,
                     head: p.head,
                     body: p.body_buf,
-                });
+                }));
             }
-            return None;
+            return Ok(None);
         }
 
         self.head_accum.extend_from_slice(data);
         self.parse_head_and_maybe_finish(request_id)
-            .map(|(resp, _)| resp)
+            .map(|response| response.map(|(resp, _)| resp))
     }
 
     /// Look for `\r\n\r\n` in `head_accum`. If found, parse the head, set up
     /// the partial response (or finish immediately if the body is also
     /// present), and return the completed response when applicable.
-    fn parse_head_and_maybe_finish(&mut self, request_id: RequestId) -> Option<(Response, usize)> {
-        let head_end = self.head_accum.windows(4).position(|w| w == b"\r\n\r\n")?;
+    fn parse_head_and_maybe_finish(
+        &mut self,
+        request_id: RequestId,
+    ) -> Result<Option<(Response, usize)>, Error> {
+        let Some(head_end) = self.head_accum.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if self.head_accum.len() > MAX_RESPONSE_HEAD {
+                return Err(ConnectionError::HeadTooLarge.into());
+            }
+            return Ok(None);
+        };
         let head_bytes_len = head_end + 4;
 
         let mut hdr_buf = [const { xibalba_proto::header::Header::empty() }; MAX_HEADERS];
         let (head, consumed) =
-            ResponseHead::parse(&self.head_accum[..head_bytes_len], &mut hdr_buf).ok()?;
+            ResponseHead::parse(&self.head_accum[..head_bytes_len], &mut hdr_buf)?;
 
         let framing = BodyFraming::from_response(
             head.status,
             false,
             &hdr_buf[..head.header_count],
             head.header_count,
-        );
-        let Ok(framing) = framing else {
-            return None;
-        };
+        )?;
         let ranges = HeaderRange::build_ranges(
             &hdr_buf[..head.header_count],
             &self.head_accum[..head_bytes_len],
-        )
-        .ok()?;
+        )?;
         let (version, status, header_count) = (head.version, head.status, head.header_count);
 
         // Split head bytes out of head_accum without a fresh allocation: drain the
@@ -304,7 +315,7 @@ impl ResponseParser {
 
         let after_head = &self.head_accum[consumed_after_drain..];
         let body_consumed = if !after_head.is_empty() && !body_done {
-            pump_partial(&mut partial, after_head)
+            PartialResponse::pump(&mut partial, after_head)?
         } else {
             0
         };
@@ -314,7 +325,7 @@ impl ResponseParser {
             // Shift leftover bytes to the front of head_accum (no new allocation).
             self.head_accum.drain(..total_consumed);
             self.partial = None;
-            Some((
+            Ok(Some((
                 Response {
                     request_id,
                     version: partial.version,
@@ -323,17 +334,19 @@ impl ResponseParser {
                     body: partial.body_buf,
                 },
                 body_consumed,
-            ))
+            )))
         } else {
             // Trim consumed head bytes from head_accum; body bytes stay in partial.
             self.head_accum.drain(..consumed_after_drain);
             self.partial = Some(partial);
-            None
+            Ok(None)
         }
     }
 }
 
 struct ConnData {
+    conn_id: u32,
+    fd: usize,
     /// Queue of `request_ids` in submission order, populated by send CQEs.
     pending_ids: VecDeque<RequestId>,
     parser: ResponseParser,
@@ -343,8 +356,10 @@ struct ConnData {
 }
 
 impl ConnData {
-    const fn new() -> Self {
+    const fn new(conn_id: u32) -> Self {
         Self {
+            conn_id,
+            fd: usize::MAX,
             pending_ids: VecDeque::new(),
             parser: ResponseParser::new(),
             recv_buf: Vec::new(),
@@ -628,6 +643,11 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                     conn,
                     errno,
                 } => self.handle_error(request_id, conn, errno),
+                ConnResult::ProtocolError {
+                    request_id,
+                    conn,
+                    error,
+                } => self.handle_protocol_error(request_id, conn, error),
                 other => other,
             };
             let rid = result_id(&r);
@@ -659,6 +679,11 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                     conn,
                     errno,
                 } => self.handle_error(request_id, conn, errno),
+                ConnResult::ProtocolError {
+                    request_id,
+                    conn,
+                    error,
+                } => self.handle_protocol_error(request_id, conn, error),
                 other => other,
             };
             let rid = result_id(&r);
@@ -717,6 +742,20 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                     }
                     self.stash.insert(rid, r);
                 }
+                ConnResult::ProtocolError {
+                    request_id,
+                    conn,
+                    error,
+                } => {
+                    let result = self.handle_protocol_error(request_id, conn, error);
+                    if request_id == id {
+                        let cancel = Sqe::timeout_remove(TIMEOUT_UD);
+                        let _ = self.sub.push(cancel);
+                        let _ = self.sub.submit();
+                        return Ok(Some(result));
+                    }
+                    self.stash.insert(request_id, result);
+                }
                 ConnResult::Response(ref resp) if resp.request_id == id => {
                     let cancel = Sqe::timeout_remove(TIMEOUT_UD);
                     let _ = self.sub.push(cancel);
@@ -735,17 +774,37 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     /// Closes the dead fd and marks the connection for lazy reconnect on the
     /// next `request()` call. The caller still receives the error so it knows
     /// the in-flight request was lost and must be retried.
-    fn handle_error(&mut self, request_id: RequestId, conn: ConnHandle, errno: i32) -> ConnResult {
-        if let Some(c) = self.conns.get_mut(&conn.conn_id) {
-            libc_close(c.fd);
-            c.fd = usize::MAX; // sentinel: fd is closed
-            c.recv_armed = false;
-            c.needs_reconnect = true;
+    fn handle_protocol_error(
+        &mut self,
+        request_id: RequestId,
+        conn: ConnHandle,
+        error: std::sync::Arc<Error>,
+    ) -> ConnResult {
+        self.mark_connection_for_reconnect(conn);
+        ConnResult::ProtocolError {
+            request_id,
+            conn,
+            error,
         }
+    }
+
+    fn handle_error(&mut self, request_id: RequestId, conn: ConnHandle, errno: i32) -> ConnResult {
+        self.mark_connection_for_reconnect(conn);
         ConnResult::Error {
             request_id,
             conn,
             errno,
+        }
+    }
+
+    fn mark_connection_for_reconnect(&mut self, conn: ConnHandle) {
+        if let Some(c) = self.conns.get_mut(&conn.conn_id)
+            && !c.needs_reconnect
+        {
+            libc_close(c.fd);
+            c.fd = usize::MAX;
+            c.recv_armed = false;
+            c.needs_reconnect = true;
         }
     }
 
@@ -819,7 +878,9 @@ fn complete_loop(
                     let ud = UserData::from(cqe.user_data);
                     let conn_id = ud.send_conn_id();
                     let seq = ud.send_seq();
-                    let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
+                    let conn = conns
+                        .entry(conn_id)
+                        .or_insert_with(|| ConnData::new(conn_id));
                     conn.pending_ids.push_back(RequestId::from(seq));
                     // Drain any bytes that arrived before this send CQE.
                     // fd is not available in the send CQE branch (different ud encoding);
@@ -839,7 +900,9 @@ fn complete_loop(
 
             // Negative result → I/O error; zero with no buffer → EOF (UntilClose).
             if cqe.result < 0 {
-                let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
+                let conn = conns
+                    .entry(conn_id)
+                    .or_insert_with(|| ConnData::new(conn_id));
                 let request_id = conn.pop_pending_id().unwrap_or(0);
                 conn.parser.clear();
                 conn.recv_buf.clear();
@@ -856,7 +919,9 @@ fn complete_loop(
 
             // result == 0 with no buffer_id means EOF on the socket.
             if n == 0 && cqe.buffer_id().is_none() {
-                let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
+                let conn = conns
+                    .entry(conn_id)
+                    .or_insert_with(|| ConnData::new(conn_id));
                 finish_until_close(ConnHandle { conn_id, fd }, conn, response_tx);
                 continue;
             }
@@ -870,7 +935,10 @@ fn complete_loop(
                 None => continue,
             };
 
-            let conn = conns.entry(conn_id).or_insert_with(ConnData::new);
+            let conn = conns
+                .entry(conn_id)
+                .or_insert_with(|| ConnData::new(conn_id));
+            conn.fd = fd;
 
             let more = cqe.flags.contains(ququmatz::types::CqeFlags::MORE);
 
@@ -905,11 +973,25 @@ fn drain_recv_buf(conn: &mut ConnData, data: &[u8], response_tx: &SpmcProducer<C
         let feed = if first { data } else { &[] };
         first = false;
         match conn.parser.feed(feed, request_id) {
-            Some(resp) => {
+            Ok(Some(resp)) => {
                 conn.pending_ids.pop_front();
                 let _ = response_tx.push_block(ConnResult::Response(Box::new(resp)));
             }
-            None => break,
+            Ok(None) => break,
+            Err(error) => {
+                conn.pending_ids.pop_front();
+                conn.parser.clear();
+                conn.recv_buf.clear();
+                let _ = response_tx.push_block(ConnResult::ProtocolError {
+                    request_id,
+                    conn: ConnHandle {
+                        conn_id: conn.conn_id,
+                        fd: conn.fd,
+                    },
+                    error: std::sync::Arc::new(error),
+                });
+                break;
+            }
         }
     }
 }
@@ -951,53 +1033,58 @@ fn finish_until_close(
 
 // ── CQE data processing ───────────────────────────────────────────────────────
 
-/// Feeds `data` into `resp`, returning the number of bytes consumed.
-fn pump_partial(resp: &mut PartialResponse, data: &[u8]) -> usize {
-    let mut out = [0u8; BLOCK_SIZE];
-    match &mut resp.framing {
-        InternalFraming::Done => {
-            resp.body_done = true;
-            0
-        }
-        InternalFraming::ContentLength { remaining } => {
-            #[allow(clippy::cast_possible_truncation)]
-            let to_take = data.len().min(*remaining as usize);
-            resp.body_buf.extend_from_slice(&data[..to_take]);
-            *remaining -= to_take as u64;
-            if *remaining == 0 {
-                resp.body_done = true;
+impl PartialResponse {
+    /// # Errors
+    ///
+    /// Returns the chunk decoder's parse error instead of converting a
+    /// malformed body into a successful truncated response.
+    fn pump(&mut self, data: &[u8]) -> Result<usize, Error> {
+        let mut out = [0u8; BLOCK_SIZE];
+        match &mut self.framing {
+            InternalFraming::Done => {
+                self.body_done = true;
+                Ok(0)
             }
-            to_take
-        }
-        InternalFraming::Chunked { decoder } => {
-            let mut pos = 0;
-            while pos < data.len() && !decoder.is_done() {
-                let (result, consumed) = decoder.decode(&data[pos..], &mut out);
-                pos += consumed;
-                match result {
-                    DecodeResult::Data(n) => {
-                        resp.body_buf.extend_from_slice(&out[..n]);
-                        if decoder.is_done() {
-                            resp.body_done = true;
+            InternalFraming::ContentLength { remaining } => {
+                #[allow(clippy::cast_possible_truncation)]
+                let to_take = data.len().min(*remaining as usize);
+                self.body_buf.extend_from_slice(&data[..to_take]);
+                *remaining -= to_take as u64;
+                if *remaining == 0 {
+                    self.body_done = true;
+                }
+                Ok(to_take)
+            }
+            InternalFraming::Chunked { decoder } => {
+                let mut pos = 0;
+                while pos < data.len() && !decoder.is_done() {
+                    let (result, consumed) = decoder.decode(&data[pos..], &mut out);
+                    pos += consumed;
+                    match result {
+                        DecodeResult::Data(n) => {
+                            self.body_buf.extend_from_slice(&out[..n]);
+                            if decoder.is_done() {
+                                self.body_done = true;
+                                break;
+                            }
+                        }
+                        DecodeResult::Done => {
+                            self.body_done = true;
                             break;
                         }
+                        DecodeResult::NeedMore => break,
+                        DecodeResult::Error(error) => return Err(error.into()),
                     }
-                    DecodeResult::Done | DecodeResult::Error(_) => {
-                        resp.body_done = true;
-                        break;
-                    }
-                    DecodeResult::NeedMore => break,
                 }
+                if decoder.is_done() {
+                    self.body_done = true;
+                }
+                Ok(pos)
             }
-            if decoder.is_done() {
-                resp.body_done = true;
+            InternalFraming::UntilClose => {
+                self.body_buf.extend_from_slice(data);
+                Ok(data.len())
             }
-            pos
-        }
-        // UntilClose body is accumulated but only marked done on EOF.
-        InternalFraming::UntilClose => {
-            resp.body_buf.extend_from_slice(data);
-            data.len()
         }
     }
 }
@@ -1075,7 +1162,9 @@ fn blocking_connect_resolved(addr: &ResolvedAddr) -> Result<usize, ()> {
 fn result_id(r: &ConnResult) -> RequestId {
     match r {
         ConnResult::Response(resp) => resp.request_id,
-        ConnResult::Error { request_id, .. } => *request_id,
+        ConnResult::Error { request_id, .. } | ConnResult::ProtocolError { request_id, .. } => {
+            *request_id
+        }
         ConnResult::Timeout => 0,
     }
 }
@@ -1207,6 +1296,56 @@ mod tests {
     }
 
     #[test]
+    fn malformed_response_head_returns_protocol_error() {
+        let mut parser = ResponseParser::new();
+        assert_eq!(
+            parser
+                .feed(b"HTTP/1.1 200X\r\nContent-Length: 0\r\n\r\n", 7)
+                .unwrap_err(),
+            Error::Parse(xibalba_proto::error::ParseError::InvalidStatusCode)
+        );
+    }
+
+    #[test]
+    fn conflicting_content_length_returns_protocol_error() {
+        let mut parser = ResponseParser::new();
+        assert_eq!(
+            parser
+                .feed(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n",
+                    8,
+                )
+                .unwrap_err(),
+            Error::Parse(xibalba_proto::error::ParseError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn malformed_chunked_body_returns_protocol_error() {
+        let mut parser = ResponseParser::new();
+        assert_eq!(
+            parser
+                .feed(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZ\r\n",
+                    9,
+                )
+                .unwrap_err(),
+            Error::Parse(xibalba_proto::error::ParseError::InvalidChunkSize)
+        );
+    }
+
+    #[test]
+    fn oversized_unterminated_head_returns_protocol_error() {
+        let mut parser = ResponseParser::new();
+        assert_eq!(
+            parser
+                .feed(&vec![b'a'; MAX_RESPONSE_HEAD + 1], 10)
+                .unwrap_err(),
+            Error::Connection(ConnectionError::HeadTooLarge)
+        );
+    }
+
+    #[test]
     fn test_happy_path() {
         let port = keep_alive_server();
         let mut pool = Pool::<256, 64, 8192, 8192>::new().unwrap();
@@ -1218,6 +1357,7 @@ mod tests {
             match pool.recv(id).unwrap() {
                 ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
                 ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
+                ConnResult::ProtocolError { error, .. } => panic!("protocol error: {error}"),
                 ConnResult::Timeout => panic!("timeout"),
             }
         }
@@ -1269,6 +1409,7 @@ mod tests {
         match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"hello"),
             ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
+            ConnResult::ProtocolError { error, .. } => panic!("protocol error: {error}"),
             ConnResult::Timeout => panic!("timeout"),
         }
     }
@@ -1284,6 +1425,7 @@ mod tests {
         match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"hello"),
             ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
+            ConnResult::ProtocolError { error, .. } => panic!("protocol error: {error}"),
             ConnResult::Timeout => panic!("timeout"),
         }
     }
@@ -1307,6 +1449,7 @@ mod tests {
         match pool.recv(id).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
             ConnResult::Error { errno, .. } => panic!("unexpected error errno={errno}"),
+            ConnResult::ProtocolError { error, .. } => panic!("protocol error: {error}"),
             ConnResult::Timeout => panic!("timeout"),
         }
     }
@@ -1332,6 +1475,7 @@ mod tests {
                 pool.disconnect(err_conn);
             }
             ConnResult::Response(_) => panic!("unexpected response from drop server"),
+            ConnResult::ProtocolError { error, .. } => panic!("protocol error: {error}"),
             ConnResult::Timeout => panic!("timeout"),
         }
         // The pool is still alive and can open a fresh connection to a live server.
@@ -1342,6 +1486,7 @@ mod tests {
         match pool.recv(id2).unwrap() {
             ConnResult::Response(r) => assert_eq!(&r.body, b"ok"),
             ConnResult::Error { errno, .. } => panic!("error on live conn: errno={errno}"),
+            ConnResult::ProtocolError { error, .. } => panic!("protocol error: {error}"),
             ConnResult::Timeout => panic!("timeout"),
         }
     }
@@ -1374,6 +1519,9 @@ mod tests {
         match result {
             Some(ConnResult::Response(r)) => assert_eq!(&r.body, b"ok"),
             Some(ConnResult::Error { errno, .. }) => panic!("error errno={errno}"),
+            Some(ConnResult::ProtocolError { error, .. }) => {
+                panic!("protocol error: {error}")
+            }
             Some(ConnResult::Timeout) => panic!("unexpected timeout variant"),
             None => panic!("timed out unexpectedly"),
         }
@@ -1433,6 +1581,7 @@ mod tests {
                 );
             }
             ConnResult::Error { errno, .. } => panic!("error errno={errno}"),
+            ConnResult::ProtocolError { error, .. } => panic!("protocol error: {error}"),
             ConnResult::Timeout => panic!("timeout"),
         }
     }
