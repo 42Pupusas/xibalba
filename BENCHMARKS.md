@@ -62,23 +62,42 @@ This is the one place xibalba loses, and the crossover depends on header count.
 
 | Fixture | xibalba | `httparse` | Ratio |
 |---|---|---|---|
-| minimal (no headers) | 22.67 ns | 34.17 ns | **1.51x faster** |
-| typical (6 headers) | 183.7 ns | 115.5 ns | 0.63x — 1.59x slower |
-| heavy (22 headers) | 588.4 ns | 320.7 ns | 0.55x — 1.83x slower |
+| minimal (no headers) | 20.35 ns | 29.12 ns | **1.43x faster** |
+| typical (6 headers) | 124.9 ns | 105.2 ns | 0.84x — 1.19x slower |
+| heavy (22 headers) | 376.7 ns | 280.7 ns | 0.75x — 1.34x slower |
 
 xibalba is faster on the status line and slower per header. `httparse` uses
 runtime-dispatched SSE4.2/AVX2 to scan header bytes in 16- and 32-byte strides;
 `ResponseHead::parse` is scalar and validates each byte against the RFC 9110
-`tchar` and field-value rules in one pass. Cost per header is therefore roughly
-constant for xibalba and sublinear for `httparse`, so the two cross over at a
-handful of headers and the gap widens from there.
+`tchar` and field-value rules. Cost per header is therefore roughly constant for
+xibalba and sublinear for `httparse`, so the two still cross over as headers
+accumulate.
 
-This has not been optimized yet, and header-heavy parsing is the clearest
-remaining target: the value scan is the hot loop and is vectorizable without
-weakening validation.
+The scalar path has since been tightened by removing redundant passes over each
+value (see below), which closed roughly half the gap:
 
-Note also that end-to-end xibalba still wins by ~1.4x on responses carrying
-three headers, because syscall and body-handling costs dominate head parsing at
+| Fixture | before | after | Gain |
+|---|---|---|---|
+| typical | 183.7 ns | 124.9 ns | 1.47x |
+| heavy | 588.4 ns | 376.7 ns | 1.56x |
+
+Two changes did this, neither of them weakening validation:
+
+- **Fused the value scan.** Locating the terminating CR and rejecting illegal
+  control bytes were separate passes over the same bytes. CR is itself a control
+  byte, so one predicate now answers both: the first match is either the
+  terminator or an illegal byte. This also made bare LF inside a value a hard
+  error instead of a silently accepted line terminator.
+- **Made the OWS trim conditional.** Trailing whitespace is rare, so testing the
+  final byte skips the backward scan for essentially every real header.
+
+Remaining headroom is in the name scan, which must stay byte-at-a-time: it has
+to stop at the first non-`tchar` so a malformed name cannot run past its own
+CRLF and consume following headers. Going faster means explicit SIMD with a
+validating predicate, not a simple delimiter search.
+
+Note also that end-to-end xibalba wins by ~1.4x on responses carrying three
+headers, because syscall and body-handling costs dominate head parsing at
 realistic header counts.
 
 ## Blocking client vs the io_uring pool

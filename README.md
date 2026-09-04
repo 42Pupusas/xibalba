@@ -60,7 +60,7 @@ xibalba is about 1.4-1.5x faster on small responses, 64 KiB responses, and
 sequential throughput. URL parsing and request serialization are several times
 faster than the `url` and `http` crates, though those crates do strictly more
 work. Response-head parsing is faster than `httparse` with no headers and
-**1.6-1.8x slower** once six or more headers are present, since `httparse` is
+**1.2-1.3x slower** once six or more headers are present, since `httparse` is
 SIMD-accelerated and `ResponseHead::parse` is scalar.
 
 The experimental io_uring pool is currently slower than the blocking client on

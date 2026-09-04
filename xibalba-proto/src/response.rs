@@ -97,21 +97,24 @@ impl<'a> ResponseHead<'a> {
             return Err(ParseError::InvalidHeaderName.into());
         }
 
-        // Phase 1: scan name, validating tchars and stopping at ':'
-        let mut i = 0;
-        loop {
-            if i >= line.len() {
-                return Err(ParseError::MissingColon.into());
-            }
-            let b = line[i];
+        // Phase 1: scan name, validating tchars and stopping at ':'. Iterating
+        // rather than indexing keeps one bounds check per byte instead of two.
+        //
+        // Validation must run in the same loop as the ':' search, not after it.
+        // Searching for ':' alone would run past this line's CRLF and into
+        // later headers when a name is malformed; stopping at the first
+        // non-tchar keeps a bad line from consuming the rest of the buffer.
+        let mut name_len = None;
+        for (idx, &b) in line.iter().enumerate() {
             if b == b':' {
+                name_len = Some(idx);
                 break;
             }
             if !Tchar::is_valid(b) {
                 return Err(ParseError::InvalidHeaderName.into());
             }
-            i += 1;
         }
+        let mut i = name_len.ok_or(ParseError::MissingColon)?;
         if i == 0 {
             return Err(ParseError::InvalidHeaderName.into());
         }
@@ -124,30 +127,40 @@ impl<'a> ResponseHead<'a> {
         }
         let value_start = i;
 
-        // Phase 3: use iterator position so LLVM can auto-vectorize the \r scan
-        let cr_pos = line[i..]
+        // Phase 3: one vectorizable pass locates the CR *and* validates the
+        // value. CR is itself a control byte, so the first byte matching the
+        // control-character predicate is either the terminating CR or an
+        // illegal byte — a separate validation pass would re-read the same
+        // bytes to learn what this one already knows. Tab is legal inside a
+        // value, and obs-text (>= 0x80) is accepted per RFC 9110.
+        let ctl_pos = line[i..]
             .iter()
-            .position(|&b| b == b'\r')
+            .position(|&b| (b < 0x20 || b == 0x7f) && b != b'\t')
             .ok_or(ParseError::Incomplete)?;
-        let crlf = i + cr_pos;
+        let crlf = i + ctl_pos;
+        if line[crlf] != b'\r' {
+            return Err(ParseError::InvalidHeaderValue.into());
+        }
         if crlf + 1 >= line.len() || line[crlf + 1] != b'\n' {
             return Err(ParseError::Incomplete.into());
         }
 
-        // Trim trailing OWS in one backward pass — only paid when OWS is present
+        // Trailing OWS is rare, so test the last byte before walking backwards;
+        // the scan is skipped entirely for the overwhelmingly common value.
         let raw_value = &line[value_start..crlf];
-        if raw_value
-            .iter()
-            .any(|&b| b != b'\t' && (b < 0x20 || b == 0x7f))
-        {
-            return Err(ParseError::InvalidHeaderValue.into());
-        }
-        let value_end = raw_value
-            .iter()
-            .rposition(|&b| b != b' ' && b != b'\t')
-            .map_or(0, |p| p + 1);
+        let trimmed = match raw_value.last() {
+            Some(&b' ' | &b'\t') => {
+                let value_end = raw_value
+                    .iter()
+                    .rposition(|&b| b != b' ' && b != b'\t')
+                    .map_or(0, |p| p + 1);
+                &raw_value[..value_end]
+            }
+            #[allow(clippy::match_same_arms)]
+            None | Some(_) => raw_value,
+        };
 
-        Ok((name_bytes, &raw_value[..value_end], crlf + 2))
+        Ok((name_bytes, trimmed, crlf + 2))
     }
 }
 
@@ -1075,6 +1088,49 @@ mod tests {
         let mut headers = [const { Header::empty() }; 4];
         let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
         assert_eq!(err, Error::Parse(ParseError::InvalidHeaderValue));
+    }
+
+    #[test]
+    fn malformed_name_does_not_scan_past_its_own_line() {
+        // The colon here belongs to a *later* header. A name scan that looked
+        // for ':' without stopping at the first non-tchar would swallow the
+        // CRLF and treat "bad\r\nX-Next" as one name.
+        let raw = b"HTTP/1.1 200 OK\r\nbad\r\nX-Next: v\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
+    }
+
+    #[test]
+    fn header_value_with_bare_lf_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Bad: a\nb\r\nContent-Length: 0\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderValue));
+    }
+
+    #[test]
+    fn header_value_with_del_byte_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Bad: a\x7fb\r\nContent-Length: 0\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderValue));
+    }
+
+    #[test]
+    fn header_value_unterminated_is_incomplete_not_invalid() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Name: value";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::Incomplete));
+    }
+
+    #[test]
+    fn header_value_cr_without_lf_is_incomplete() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Name: value\r";
+        let mut headers = [const { Header::empty() }; 4];
+        let err = ResponseHead::parse(raw, &mut headers).unwrap_err();
+        assert_eq!(err, Error::Parse(ParseError::Incomplete));
     }
 
     #[test]
