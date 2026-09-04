@@ -176,6 +176,9 @@ fn run_io_uring(response: Vec<u8>) {
             xibalba_iouring::driver::ConnResult::Error { errno, .. } => {
                 panic!("io_uring error: errno {errno}")
             }
+            xibalba_iouring::driver::ConnResult::ProtocolError { error, .. } => {
+                panic!("io_uring protocol error: {error}")
+            }
             xibalba_iouring::driver::ConnResult::Timeout => panic!("unexpected timeout"),
         };
         black_box(&resp.body);
