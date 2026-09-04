@@ -3,6 +3,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
@@ -101,24 +102,33 @@ impl Connector for TcpConnector {
 
 // --- TLS config builder ---
 
-fn build_tls_config() -> Result<Arc<ClientConfig>, Error> {
-    let provider = rustls::crypto::ring::default_provider();
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| xibalba_proto::error::TlsError {
-            message: e.to_string(),
-        })?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
+/// Builds a rustls `ClientConfig` from a caller-supplied `CryptoProvider`.
+///
+/// The provider is a parameter rather than a default. `ClientConfig::builder()`
+/// would instead resolve rustls' process-wide default provider, which makes the
+/// active cryptography depend on enabled features and installation order
+/// elsewhere in the binary.
+struct RustlsConfig;
+
+impl RustlsConfig {
+    fn with_provider(provider: CryptoProvider) -> Result<Arc<ClientConfig>, Error> {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| xibalba_proto::error::TlsError {
+                message: e.to_string(),
+            })?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
 }
 
 // --- main ---
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let tls_config = build_tls_config()?;
+    let tls_config = RustlsConfig::with_provider(rustls::crypto::ring::default_provider())?;
     let mut client =
         Client::<TcpConnector>::connect_default(b"https://httpbin.org/get", tls_config)?;
     let response = client.get(b"/get")?;

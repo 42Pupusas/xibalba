@@ -4,7 +4,7 @@ A minimal HTTP/1.1 client for Rust with a streaming body reader and zero-copy pa
 
 ## Features
 
-- HTTP and HTTPS (TLS 1.2+) via [rustls](https://github.com/rustls/rustls)
+- HTTP, and HTTPS through a TLS stack you supply — the library depends on none
 - Chunked and `Content-Length` transfer encoding
 - Streaming body reader — no full response buffering
 - Zero-copy URL and header parsing (borrows input)
@@ -55,12 +55,30 @@ loop {
 
 ## Transport and TLS
 
-`xibalba-client` is transport-agnostic. Implement its `Connector` trait for the
-TCP/TLS stack your application already uses; the included
-[`tcp-rustls` example](examples/tcp-rustls) shows a complete rustls connector.
-Keeping TLS out of the core crate lets applications choose certificate roots,
-crypto providers, proxy behavior, and their runtime without pulling an unused
-TLS stack into every consumer.
+`xibalba-client` is transport-agnostic, and deliberately so: its only
+dependencies are `xibalba-proto` and `quetzalcoatl`. It links no TLS
+implementation, names no crypto crate in its types, and installs no default
+provider. HTTPS reaches it entirely through the `Connector` trait, whose
+associated `TlsConfig` type is chosen by the implementor.
+
+That means the choice of TLS library, certificate roots, crypto provider,
+protocol versions, and proxy behavior belongs to the application, and no
+consumer pays for a stack it does not use.
+
+The [`tcp-rustls` example](examples/tcp-rustls) shows a complete connector. It
+takes a `rustls::crypto::CryptoProvider` as an argument rather than reaching for
+a default, so swapping `ring` for `aws-lc-rs` or a custom provider is a
+one-line change at the call site:
+
+```rust
+let tls_config = RustlsConfig::with_provider(rustls::crypto::ring::default_provider())?;
+```
+
+Note that rustls itself has a process-wide default provider, reachable via
+`ClientConfig::builder()` and enabled by rustls' own default features. The
+example opts out on both counts — `default-features = false` in its manifest,
+and `builder_with_provider` at the call site — so the provider in use is always
+the one passed in.
 
 ## Response-head limits
 
