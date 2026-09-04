@@ -48,6 +48,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         tls_config: C::TlsConfig,
         config: Config,
     ) -> Result<Self, Error> {
+        config.validate()?;
         let url = Url::parse(url_bytes)?;
         let stream = C::connect(&url, &tls_config)?;
         let host = url.host.to_vec();
@@ -256,7 +257,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
         match self.send_head_once(params) {
             Ok(head) => Ok(head),
-            Err(e) if Self::is_stale_connection(&e) => {
+            Err(e) if Self::is_stale_connection(&e) && self.head_buf.is_empty() => {
                 self.reconnect_same_host()?;
                 self.send_head_once(params)
             }
@@ -271,6 +272,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         &mut self,
         params: &RequestParams<'_>,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
+        self.head_buf.clear();
         let host_value = self.host_header_value();
         let content_len_str;
         let mut headers = Vec::with_capacity(2 + params.extra_headers.len());
@@ -284,8 +286,10 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             value: v,
         }));
 
-        if let Some(data) = params.body {
-            content_len_str = data.len().to_string();
+        if let Some(len) = params.body.map(<[u8]>::len).or_else(|| {
+            matches!(params.method, Method::Post | Method::Put | Method::Patch).then_some(0)
+        }) {
+            content_len_str = len.to_string();
             headers.push(Header {
                 name: HeaderName::ContentLength,
                 value: content_len_str.as_bytes(),
@@ -357,7 +361,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         let mut collector =
             BodyCollector::new(self.config.max_response_body, self.config.stream_silence);
         let data = collector.read(&mut self.stream, framing, &self.head_buf[tail_offset..]);
-        if data.is_err() {
+        if data.is_err() || !collector.is_reusable() {
             self.discard_partial_response();
         }
         data
@@ -366,6 +370,9 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     pub(crate) fn send_one(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
         let (head_data, framing, tail_offset) = self.send_head(params)?;
         let body_data = self.read_full_body(&framing, tail_offset)?;
+        if head_data.status == xibalba_proto::status::StatusCode::SWITCHING_PROTOCOLS {
+            self.discard_partial_response();
+        }
 
         Ok(Response {
             version: head_data.version,

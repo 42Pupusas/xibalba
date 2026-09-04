@@ -46,6 +46,22 @@ pub struct Config {
     pub stream_silence: Duration,
 }
 
+impl Config {
+    /// # Errors
+    ///
+    /// Returns [`xibalba_proto::error::ConnectionError::InfiniteReadTimeout`]
+    /// when `read_timeout` is `None`: silence budgets can only observe time
+    /// after a socket read returns.
+    pub(crate) const fn validate(&self) -> Result<(), xibalba_proto::error::Error> {
+        if self.read_timeout.is_none() {
+            return Err(xibalba_proto::error::Error::Connection(
+                xibalba_proto::error::ConnectionError::InfiniteReadTimeout,
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {

@@ -939,6 +939,38 @@ fn streaming_chunked_delivers_incrementally() {
 }
 
 #[test]
+fn streaming_excess_bytes_after_content_length_force_reconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        read_request(&mut first);
+        first
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokgarbage")
+            .unwrap();
+        first.flush().unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        read_request(&mut second);
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+    });
+
+    let mut client = connect(port);
+    {
+        let mut response = client
+            .send_streaming(client.build(Method::Get, b"/first"))
+            .unwrap();
+        let mut body = Vec::new();
+        response.body.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"ok");
+    }
+    assert_eq!(client.get(b"/second").unwrap().text().unwrap(), "fresh");
+    server.join().unwrap();
+}
+
+#[test]
 fn streaming_dropped_midway_reconnects() {
     // Drop the streaming response before draining it; the next request
     // must reconnect instead of reading the stale body.
@@ -1132,6 +1164,81 @@ fn very_large_header_value() {
 }
 
 #[test]
+fn partial_response_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut accepted = 0;
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    accepted += 1;
+                    read_request(&mut stream);
+                    if accepted == 1 {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nX-Partial:").unwrap();
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+        accepted
+    });
+
+    let mut client = connect(port);
+    assert!(client.post(b"/non-idempotent", b"charge").is_err());
+    assert_eq!(
+        server.join().unwrap(),
+        1,
+        "partial response triggered a replay"
+    );
+}
+
+#[test]
+fn excess_bytes_after_content_length_force_reconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        read_request(&mut first);
+        first
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokgarbage")
+            .unwrap();
+        first.flush().unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        read_request(&mut second);
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh")
+            .unwrap();
+    });
+
+    let mut client = connect(port);
+    assert_eq!(client.get(b"/first").unwrap().text().unwrap(), "ok");
+    assert_eq!(client.get(b"/second").unwrap().text().unwrap(), "fresh");
+    server.join().unwrap();
+}
+
+#[test]
+fn infinite_read_timeout_is_rejected() {
+    let config = Config {
+        read_timeout: None,
+        ..Config::default()
+    };
+    let error = Client::<PlainConnector>::connect(b"http://127.0.0.1:1/", (), config)
+        .err()
+        .expect("an infinite read timeout must be rejected before connect");
+    assert_eq!(
+        error,
+        Error::Connection(ConnectionError::InfiniteReadTimeout)
+    );
+}
+
+#[test]
 fn server_closes_connection_before_response() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1293,6 +1400,22 @@ fn post_with_body() {
     assert_eq!(resp.text().unwrap(), "hello world");
     let echoed = server.join().unwrap();
     assert_eq!(echoed, b"hello world");
+}
+
+#[test]
+fn bodyless_post_sends_content_length_zero() {
+    let (port, server) = echo_request_server();
+    let mut client = connect(port);
+
+    let response = client
+        .request(Method::Post, b"/submit", None, None)
+        .unwrap();
+    assert_eq!(response.text().unwrap(), "");
+    let request = String::from_utf8_lossy(&server.join().unwrap()).into_owned();
+    assert!(
+        request.contains("Content-Length: 0\r\n"),
+        "bodyless POST omitted its explicit zero length:\n{request}"
+    );
 }
 
 #[test]

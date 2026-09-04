@@ -87,9 +87,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
 
     const fn finish(&mut self) {
         self.state = StreamState::Done;
-        // An until-close body ends with a dead connection; everything
-        // else leaves it positioned at the next response.
-        *self.dirty = false;
+        *self.dirty = self.raw_pos != self.raw.len();
     }
 
     /// Bytes available without touching the socket; refills from the

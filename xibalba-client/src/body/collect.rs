@@ -16,6 +16,7 @@ use crate::silence::SilenceBudget;
 pub struct BodyCollector {
     max_body: usize,
     budget: SilenceBudget,
+    reusable: bool,
 }
 
 impl BodyCollector {
@@ -23,6 +24,7 @@ impl BodyCollector {
         Self {
             max_body,
             budget: SilenceBudget::new(silence),
+            reusable: true,
         }
     }
 
@@ -34,12 +36,24 @@ impl BodyCollector {
     ) -> Result<Vec<u8>, Error> {
         use xibalba_proto::response::BodyFraming as ProtoFraming;
 
+        self.reusable = true;
         match *framing {
-            ProtoFraming::None => Ok(Vec::new()),
+            ProtoFraming::None => {
+                self.reusable = tail.is_empty();
+                Ok(Vec::new())
+            }
             ProtoFraming::ContentLength(len) => self.read_content_length(stream, len, tail),
             ProtoFraming::Chunked => self.read_chunked(stream, tail),
-            ProtoFraming::UntilClose => self.read_until_close(stream, tail),
+            ProtoFraming::UntilClose => {
+                self.reusable = false;
+                self.read_until_close(stream, tail)
+            }
         }
+    }
+
+    #[must_use]
+    pub const fn is_reusable(&self) -> bool {
+        self.reusable
     }
 
     fn read_content_length<S: Read>(
@@ -53,6 +67,7 @@ impl BodyCollector {
         if len > self.max_body {
             return Err(ConnectionError::BodyTooLarge.into());
         }
+        self.reusable = tail.len() <= len;
         let mut body = Vec::with_capacity(len);
         let from_tail = tail.len().min(len);
         body.extend_from_slice(&tail[..from_tail]);
@@ -82,10 +97,14 @@ impl BodyCollector {
                         return Err(ConnectionError::BodyTooLarge.into());
                     }
                     if decoder.is_done() {
+                        self.reusable = input.is_empty();
                         return Ok(body);
                     }
                 }
-                DecodeResult::Done => return Ok(body),
+                DecodeResult::Done => {
+                    self.reusable = input.is_empty();
+                    return Ok(body);
+                }
                 DecodeResult::NeedMore => break,
                 DecodeResult::Error(e) => return Err(Error::Parse(e)),
             }
@@ -108,10 +127,14 @@ impl BodyCollector {
                             return Err(ConnectionError::BodyTooLarge.into());
                         }
                         if decoder.is_done() {
+                            self.reusable = pos == n;
                             return Ok(body);
                         }
                     }
-                    DecodeResult::Done => return Ok(body),
+                    DecodeResult::Done => {
+                        self.reusable = pos == n;
+                        return Ok(body);
+                    }
                     DecodeResult::NeedMore => break,
                     DecodeResult::Error(e) => return Err(Error::Parse(e)),
                 }
