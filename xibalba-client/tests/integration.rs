@@ -717,6 +717,61 @@ fn async_request_queued_during_stream_is_not_dropped() {
     server.join().unwrap();
 }
 
+#[test]
+fn async_cancelled_queued_request_never_reaches_wire() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(200));
+        stream.write_all(b"0\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                false
+            }
+            Err(error) => panic!("request probe failed: {error}"),
+        }
+    });
+
+    let client = connect_async(port);
+    let mut first = client
+        .submit(Method::Get, b"/first".to_vec(), None, None, vec![])
+        .unwrap();
+    assert!(matches!(first.next_block(), Some(Chunk::Head { .. })));
+    assert_eq!(first.next_block(), Some(Chunk::Body(b"first".to_vec())));
+
+    let mut queued = client
+        .submit(Method::Get, b"/must-not-send".to_vec(), None, None, vec![])
+        .unwrap();
+    queued.cancel().unwrap();
+
+    assert_eq!(first.next_block(), Some(Chunk::Eof));
+    assert_eq!(queued.next_block(), Some(Chunk::Aborted));
+    assert!(!queued.has_started());
+    drop(client);
+    assert!(
+        !server.join().unwrap(),
+        "cancelled queued request reached the wire"
+    );
+}
+
 // ── Original tests (updated API) ─────────────────────────────────────────────
 
 #[test]

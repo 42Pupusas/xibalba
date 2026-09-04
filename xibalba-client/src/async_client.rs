@@ -373,11 +373,13 @@ impl<const MAX_HEAD_SIZE: usize> Drop for AsyncClient<MAX_HEAD_SIZE> {
         // behind a stalled in-flight response.
         self.shutting_down.store(true, Ordering::Release);
 
-        // Close the control ring first. The reader's `pop_block`
-        // observes the closed producer and returns `None`,
-        // unwinding to the outer loop and exiting the thread.
-        // Without this, the reader would block forever in
-        // `pop_block` and `join.join()` below would deadlock.
+        // Handles clone the producer, so dropping this client's producer
+        // does not necessarily close the ring. Push a wakeup after setting
+        // the flag: an idle reader leaves pop_block, and an active reader's
+        // next control poll interrupts its socket read.
+        if let Some(control_tx) = &self.control_tx {
+            let _ = control_tx.push_block(Control::Cancel(CANCEL_ANY));
+        }
         drop(self.control_tx.take());
 
         // Best-effort join: the flag above bounds the wait to at most one
@@ -471,10 +473,14 @@ fn poll_control(
         match control_rx.pop() {
             Some(Control::Cancel(ticket)) => {
                 if current.is_some_and(|c| ticket == CANCEL_ANY || ticket == c) {
-                    // Keep draining rather than returning early: a stale
-                    // cancel queued behind this one must not survive to be
-                    // misread as targeting the next request.
                     cancelled = true;
+                } else if ticket != CANCEL_ANY
+                    && let Some(index) = pending.iter().position(|request| request.ticket == ticket)
+                {
+                    let request = pending
+                        .remove(index)
+                        .expect("pending index came from the same queue");
+                    let _ = request.chunk_tx.push_block(Chunk::Aborted);
                 }
             }
             Some(Control::Request(request)) => pending.push_back(request),
@@ -496,6 +502,15 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
 ) where
     C: crate::connector::Connector,
 {
+    // A cancel can queue directly behind this request while it waits for
+    // an earlier response. Match it to this request before reconnecting or
+    // publishing started: a cancelled queued request must never reach the
+    // wire.
+    if poll_control(control_rx, pending, Some(request.ticket), shutting_down) {
+        let _ = request.chunk_tx.push_block(Chunk::Aborted);
+        return;
+    }
+
     // If a previous streaming response was abandoned mid-body,
     // reconnect before we send the next request. `send_head` does
     // not call `ensure_clean()` itself, and the previous response's
@@ -517,12 +532,6 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
             .push_block(Chunk::Error(std::sync::Arc::new(e)));
         return;
     }
-
-    // Drain any stale cancel messages that may have accumulated while
-    // no request was in flight, stashing any queued requests so they
-    // are not dropped. `None` means "nothing in flight yet", so every
-    // cancel found here is by definition stale and is discarded.
-    poll_control(control_rx, pending, None, shutting_down);
 
     let AsyncRequest {
         method,
