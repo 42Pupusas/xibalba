@@ -7,6 +7,7 @@ use xibalba_proto::url::Url;
 use crate::client::Client;
 use crate::connector::Connector;
 use crate::params::RequestParams;
+use crate::reference::UriReference;
 use crate::response::Response;
 
 /// Per-request state carried across redirect hops.
@@ -62,8 +63,9 @@ impl RedirectState {
         params: &RequestParams<'_>,
     ) -> Result<Response, Error> {
         let mut current = Self::new(params);
+        let mut hops_left = client.config.max_redirects;
 
-        for _ in 0..=client.config.max_redirects {
+        loop {
             let resp = client.send_one(&current.to_params())?;
 
             if !Self::is_followed_status(resp.status) {
@@ -80,11 +82,18 @@ impl RedirectState {
                 None => return Ok(resp),
             };
 
+            // Check the budget before applying the Location. Applying it first
+            // opens a connection to the next hop -- possibly cross-origin --
+            // only to discard it, which with max_redirects = 0 contacts a host
+            // the caller never agreed to reach.
+            if hops_left == 0 {
+                return Err(ConnectionError::TooManyRedirects.into());
+            }
+            hops_left -= 1;
+
             current.apply_method_redirect(resp.status);
             current.apply_location(client, &location)?;
         }
-
-        Err(ConnectionError::TooManyRedirects.into())
     }
 
     const fn is_followed_status(status: StatusCode) -> bool {
@@ -120,7 +129,7 @@ impl RedirectState {
             .position(|&b| b == b'#')
             .map_or(location, |pos| &location[..pos]);
 
-        if without_fragment.starts_with(b"http://") || without_fragment.starts_with(b"https://") {
+        if Self::has_absolute_scheme(without_fragment) {
             return self.apply_absolute_location(client, without_fragment);
         }
         if without_fragment.starts_with(b"//") {
@@ -148,7 +157,7 @@ impl RedirectState {
         }
 
         self.path = if path_part.starts_with(b"/") {
-            path_part.to_vec()
+            UriReference::remove_dot_segments(path_part)
         } else {
             self.resolve_relative_path(path_part)
         };
@@ -169,24 +178,30 @@ impl RedirectState {
         self.path = if url.path.is_empty() {
             b"/".to_vec()
         } else {
-            url.path.to_vec()
+            UriReference::remove_dot_segments(url.path)
         };
         self.query = url.query.map(<[u8]>::to_vec);
         Ok(())
     }
 
-    fn resolve_relative_path(&self, relative: &[u8]) -> Vec<u8> {
-        let base_end = self
-            .path
+    /// Whether `location` begins with an absolute HTTP(S) scheme.
+    ///
+    /// Schemes are case-insensitive, and `Url::parse` accepts mixed case, so
+    /// matching only lowercase here would treat `HTTPS://host/` as a relative
+    /// path and graft the whole URL onto the current one.
+    fn has_absolute_scheme(location: &[u8]) -> bool {
+        location
             .iter()
-            .rposition(|&b| b == b'/')
-            .map_or(0, |pos| pos + 1);
-        let mut resolved = self.path[..base_end].to_vec();
-        if resolved.is_empty() {
-            resolved.push(b'/');
-        }
-        resolved.extend_from_slice(relative);
-        resolved
+            .position(|&b| b == b':')
+            .is_some_and(|colon| {
+                let scheme = &location[..colon];
+                (scheme.ascii_eq_ignore_case(b"http") || scheme.ascii_eq_ignore_case(b"https"))
+                    && location[colon..].starts_with(b"://")
+            })
+    }
+
+    fn resolve_relative_path(&self, relative: &[u8]) -> Vec<u8> {
+        UriReference::resolve(&self.path, relative)
     }
 }
 
