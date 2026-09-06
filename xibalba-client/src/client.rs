@@ -159,9 +159,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         if !self.dirty {
             return Ok(());
         }
-        self.reconnect_same_host()?;
-        self.dirty = false;
-        Ok(())
+        self.reconnect_same_host()
     }
 
     pub(crate) fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
@@ -170,6 +168,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         self.port = url.effective_port();
         self.scheme = url.scheme;
         self.apply_timeouts()?;
+        self.dirty = false;
         Ok(())
     }
 
@@ -193,6 +192,13 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// would otherwise be interpreted as a new status line.
     pub(crate) const fn discard_partial_response(&mut self) {
         self.dirty = true;
+    }
+
+    /// Declare the connection safe to reuse for the next request. Only
+    /// valid once this exchange has reached a point where no unread bytes
+    /// of it remain addressed to a later request.
+    const fn mark_reusable(&mut self) {
+        self.dirty = false;
     }
 
     /// Whether `err` is the signature of a server-closed idle keep-alive
@@ -304,7 +310,16 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             headers: &headers,
         };
         self.write_buf.clear();
+        // Serialization runs before anything reaches the peer, so a request
+        // rejected here leaves the connection untouched and reusable.
         req.serialize_to_writer(&mut self.write_buf)?;
+
+        // Past this point bytes may have reached the peer, leaving its parser
+        // mid-request on any failure. Poison first and clear only once the
+        // exchange is known to be recoverable: a write that fails partway
+        // through would otherwise let the next request append itself to a
+        // truncated one, which the server reads as a single smuggled request.
+        self.discard_partial_response();
 
         match params.body {
             Some(data) if self.inline_body_fits(data.len()) => {
@@ -319,23 +334,18 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         }
         self.stream.flush()?;
 
-        match HeadData::read_response(
+        // A rejected head (notably HeadTooLarge) may already have consumed a
+        // prefix of the response, so the poison above stands on every error
+        // path: a later request would read the remainder as its own head.
+        let parts = HeadData::read_response(
             &mut self.stream,
             &mut self.head_buf,
             MAX_HEAD_SIZE,
             self.config.head_silence,
             params.method == Method::Head,
-        ) {
-            Ok(parts) => Ok(parts),
-            Err(error) => {
-                // The parser may have consumed a prefix of this response even
-                // though it rejected the head (notably HeadTooLarge). Never
-                // reuse that socket: a later request would see the response
-                // remainder as its own head and corrupt the session.
-                self.discard_partial_response();
-                Err(error)
-            }
-        }
+        )?;
+        self.mark_reusable();
+        Ok(parts)
     }
 
     /// Largest request body written as part of the head buffer instead of

@@ -270,7 +270,7 @@ impl BodyFraming {
 pub struct ChunkedDecoder {
     state: ChunkedState,
     chunk_size: u64,
-    size_digits: u8,
+    saw_size_digit: bool,
     remaining: u64,
     trailer_line_empty: bool,
 }
@@ -313,7 +313,7 @@ impl ChunkedDecoder {
         Self {
             state: ChunkedState::ReadingSize,
             chunk_size: 0,
-            size_digits: 0,
+            saw_size_digit: false,
             remaining: 0,
             trailer_line_empty: true,
         }
@@ -388,7 +388,7 @@ impl ChunkedDecoder {
             match self.state {
                 ChunkedState::ReadingSize => {
                     if let Some(digit) = HexDigit::decode(b) {
-                        self.size_digits += 1;
+                        self.saw_size_digit = true;
                         self.chunk_size = match self
                             .chunk_size
                             .checked_mul(16)
@@ -402,7 +402,7 @@ impl ChunkedDecoder {
                                 ));
                             }
                         };
-                    } else if (b == b'\r' || b == b';') && self.size_digits > 0 {
+                    } else if (b == b'\r' || b == b';') && self.saw_size_digit {
                         if b == b'\r' {
                             self.remaining = self.chunk_size;
                             self.state = ChunkedState::ReadingSizeLf;
@@ -485,7 +485,7 @@ impl ChunkedDecoder {
                         ));
                     }
                     self.chunk_size = 0;
-                    self.size_digits = 0;
+                    self.saw_size_digit = false;
                     self.state = ChunkedState::ReadingSize;
                     return Step::Advance(i + 1);
                 }
@@ -1255,6 +1255,61 @@ mod tests {
             result,
             DecodeResult::Error(ParseError::InvalidChunkSize)
         ));
+    }
+
+    #[test]
+    fn chunk_size_many_leading_zeros_decodes_normally() {
+        for zeros in [255usize, 256, 257, 512] {
+            let mut input = vec![b'0'; zeros];
+            input.extend_from_slice(b"7\r\nabcdefg\r\n0\r\n\r\n");
+
+            let mut decoder = ChunkedDecoder::new();
+            let mut output = [0u8; 64];
+            let mut total = Vec::new();
+            let mut pos = 0;
+
+            loop {
+                let (result, consumed) = decoder.decode(&input[pos..], &mut output);
+                pos += consumed;
+                match result {
+                    DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                    DecodeResult::Done => break,
+                    DecodeResult::NeedMore => {}
+                    DecodeResult::Error(e) => panic!("unexpected error at {zeros} zeros: {e}"),
+                }
+            }
+
+            assert_eq!(total, b"abcdefg", "{zeros} leading zeros");
+            assert!(decoder.is_done(), "{zeros} leading zeros");
+        }
+    }
+
+    #[test]
+    fn chunk_size_leading_zeros_split_across_feeds() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let mut total = Vec::new();
+
+        for _ in 0..300 {
+            let (result, _) = decoder.decode(b"0", &mut output);
+            assert_eq!(result, DecodeResult::NeedMore);
+        }
+
+        let rest = b"7\r\nabcdefg\r\n0\r\n\r\n";
+        let mut pos = 0;
+        loop {
+            let (result, consumed) = decoder.decode(&rest[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                DecodeResult::Done => break,
+                DecodeResult::NeedMore => {}
+                DecodeResult::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        assert_eq!(total, b"abcdefg");
+        assert!(decoder.is_done());
     }
 
     #[test]
