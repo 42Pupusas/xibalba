@@ -27,6 +27,9 @@ thread_local! {
     /// Request lines written on each connection, so a hop's resolved target
     /// can be checked and not just its host.
     static REQUESTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Full request heads, in order, for assertions about which headers a
+    /// rewritten request still carries.
+    static HEADS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 struct Script;
@@ -38,6 +41,16 @@ impl Script {
         });
         DIALED.with(|d| d.borrow_mut().clear());
         REQUESTED.with(|r| r.borrow_mut().clear());
+        HEADS.with(|h| h.borrow_mut().clear());
+    }
+
+    fn record_head(head: String) {
+        HEADS.with(|h| h.borrow_mut().push(head));
+    }
+
+    /// The full head of the `index`-th request written, in order.
+    fn head_of_request(index: usize) -> String {
+        HEADS.with(|h| h.borrow().get(index).cloned().unwrap_or_default())
     }
 
     fn record_request(line: String) {
@@ -80,8 +93,18 @@ impl Read for ScriptedStream {
 impl ScriptedStream {
     /// Release the next scripted response once a full request head has been
     /// written, mirroring a server that reads before it answers.
+    ///
+    /// A recorded head starts at its request line: any request body still in
+    /// the buffer belongs to the previous request and would otherwise be
+    /// prepended to the next one.
     fn note_request_bytes(&mut self) {
         while let Some(end) = self.request_acc.windows(4).position(|w| w == b"\r\n\r\n") {
+            let raw = String::from_utf8_lossy(&self.request_acc[..end]).into_owned();
+            let head = raw
+                .split_inclusive('\n')
+                .skip_while(|line| !line.contains(" HTTP/1."))
+                .collect::<String>();
+            Script::record_head(head);
             self.request_acc.drain(..end + 4);
             self.response.extend_from_slice(&Script::next_response());
         }
@@ -131,12 +154,15 @@ impl Connector for RecordingConnector {
 
 impl RecordingConnector {
     fn client(max_redirects: u8) -> Client<Self> {
+        Self::client_for(b"http://origin.test/", max_redirects)
+    }
+
+    fn client_for(url: &[u8], max_redirects: u8) -> Client<Self> {
         let config = Config {
             max_redirects,
             ..Config::default()
         };
-        Client::<Self>::connect(b"http://origin.test/", (), config)
-            .expect("the scripted connect always succeeds")
+        Client::<Self>::connect(url, (), config).expect("the scripted connect always succeeds")
     }
 }
 
@@ -221,6 +247,70 @@ fn an_uppercase_scheme_is_treated_as_absolute() {
         Script::dialed(),
         vec!["origin.test:80".to_owned(), "other.test:80".to_owned()],
         "the uppercase-scheme target must be contacted as a new origin"
+    );
+}
+
+#[test]
+fn an_https_to_http_redirect_is_refused_before_connecting() {
+    // Following a downgrade moves the request, and any credentials it carries,
+    // onto an unprotected connection. Detecting it after reconnecting would
+    // mean the plaintext connection had already been opened.
+    Script::load(&[&redirect_to("http://plain.test/target"), OK]);
+    let mut client = RecordingConnector::client_for(b"https://secure.test/", 5);
+
+    let err = client
+        .get(b"/start")
+        .expect_err("an https-to-http redirect must be refused");
+    assert!(
+        matches!(err, Error::Connection(ConnectionError::InsecureRedirect)),
+        "expected InsecureRedirect, got {err:?}"
+    );
+    assert_eq!(
+        Script::dialed(),
+        vec!["secure.test:443".to_owned()],
+        "the plaintext target must never have been contacted"
+    );
+}
+
+#[test]
+fn an_http_to_https_redirect_is_allowed() {
+    // Upgrades are not downgrades; the guard must not block them.
+    Script::load(&[&redirect_to("https://secure.test/target"), OK]);
+    let mut client = RecordingConnector::client(5);
+
+    let response = client.get(b"/start").expect("an upgrade is permitted");
+    assert_eq!(response.text().unwrap(), "hi");
+    assert_eq!(
+        Script::dialed(),
+        vec!["origin.test:80".to_owned(), "secure.test:443".to_owned()]
+    );
+}
+
+#[test]
+fn a_post_rewritten_to_get_drops_representation_headers() {
+    // A 303 turns POST into a bodyless GET. Keeping Content-Type describes a
+    // body that is no longer being sent.
+    const SEE_OTHER: &[u8] =
+        b"HTTP/1.1 303 See Other\r\nLocation: /done\r\nContent-Length: 0\r\n\r\n";
+    Script::load(&[SEE_OTHER, OK]);
+    let mut client = RecordingConnector::client(5);
+
+    let request = client
+        .build(xibalba_client::proto::method::Method::Post, b"/submit")
+        .header(b"Content-Type", b"application/json")
+        .header(b"X-Keep", b"kept")
+        .body(b"{}");
+    let response = client.send(request).expect("the redirect is followed");
+    assert_eq!(response.text().unwrap(), "hi");
+
+    let second = Script::head_of_request(1);
+    assert!(
+        !second.to_ascii_lowercase().contains("content-type"),
+        "the rewritten GET must not describe a body it no longer sends: {second}"
+    );
+    assert!(
+        second.contains("X-Keep: kept"),
+        "unrelated headers must survive the rewrite: {second}"
     );
 }
 

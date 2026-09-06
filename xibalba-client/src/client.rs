@@ -4,6 +4,7 @@ use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
+use xibalba_proto::scheme::Scheme;
 use xibalba_proto::url::Url;
 use xibalba_proto::version::Version;
 
@@ -231,6 +232,10 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
 
     pub(crate) const fn scheme_bytes(&self) -> &'static [u8] {
         self.scheme.as_bytes()
+    }
+
+    pub(crate) const fn scheme(&self) -> Scheme {
+        self.scheme
     }
 
     fn host_header_value(&self) -> Vec<u8> {

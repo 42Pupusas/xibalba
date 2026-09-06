@@ -9,6 +9,7 @@ use crate::connector::Connector;
 use crate::params::RequestParams;
 use crate::reference::UriReference;
 use crate::response::Response;
+use xibalba_proto::scheme::Scheme;
 
 /// Per-request state carried across redirect hops.
 #[derive(Debug)]
@@ -116,7 +117,21 @@ impl RedirectState {
         if becomes_get {
             self.method = Method::Get;
             self.body = None;
+            self.strip_representation_headers();
         }
+    }
+
+    /// Drop headers that describe a body the rewritten request no longer
+    /// carries. Leaving `Content-Type` on a bodyless GET misdescribes it, and
+    /// `Content-Length`/`Transfer-Encoding` are serialized by the client
+    /// itself.
+    fn strip_representation_headers(&mut self) {
+        self.extra_headers.retain(|(name, _)| {
+            !(name.ascii_eq_ignore_case(b"Content-Type")
+                || name.ascii_eq_ignore_case(b"Content-Encoding")
+                || name.ascii_eq_ignore_case(b"Content-Language")
+                || name.ascii_eq_ignore_case(b"Content-Location"))
+        });
     }
 
     fn apply_location<C: Connector, const MAX_HEAD_SIZE: usize>(
@@ -171,6 +186,11 @@ impl RedirectState {
         location: &[u8],
     ) -> Result<(), Error> {
         let url = Url::parse(location)?;
+        // Refuse before reconnecting: a downgrade must not be detected by
+        // observing that we already opened a plaintext connection.
+        if client.scheme() == Scheme::Https && url.scheme == Scheme::Http {
+            return Err(ConnectionError::InsecureRedirect.into());
+        }
         if !client.is_same_origin(&url) {
             client.reconnect(&url)?;
             self.strip_cross_origin_headers();

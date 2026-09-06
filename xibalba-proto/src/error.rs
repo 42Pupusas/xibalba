@@ -41,6 +41,10 @@ pub enum ConnectionError {
     InfiniteReadTimeout,
     /// The async client's background reader thread has exited.
     ReaderGone,
+    /// A redirect from an HTTPS origin to a plaintext HTTP target. Following
+    /// it would move the request, and any credentials it carries, onto an
+    /// unprotected connection.
+    InsecureRedirect,
     /// Too many requests are already in flight. Backpressure rather than a
     /// transport failure: the request was not sent, and submitting again
     /// once an earlier response finishes will succeed.
@@ -140,6 +144,7 @@ impl fmt::Display for ConnectionError {
             Self::InfiniteReadTimeout => f.write_str("read timeout must be finite"),
             Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::TooManyRequests => f.write_str("too many requests are already in flight"),
+            Self::InsecureRedirect => f.write_str("redirect downgrades https to http"),
             Self::Other(msg) => f.write_str(msg),
         }
     }
