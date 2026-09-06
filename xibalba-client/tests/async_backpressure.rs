@@ -69,6 +69,10 @@ impl SetReadTimeout for PlainStream {
     fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
         self.0.set_read_timeout(dur)
     }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        self.0.set_write_timeout(dur)
+    }
 }
 
 impl Read for PlainStream {
@@ -355,6 +359,188 @@ fn finished_requests_release_their_admission_slots() {
     );
 
     drop(client);
+    let _ = server.join();
+}
+
+/// Accepts a connection, reads the request, and then answers with nothing.
+/// The reader is left parked on a head that never arrives.
+struct SilentHeadServer {
+    port: u16,
+    handle: thread::JoinHandle<()>,
+}
+
+impl SilentHeadServer {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Never answer. Hold the socket open so the client waits on the
+            // head rather than seeing EOF.
+            thread::sleep(Duration::from_secs(20));
+        });
+        Self { port, handle }
+    }
+
+    /// `head_silence` is deliberately far longer than the test's patience:
+    /// if cancellation does not reach the head read, the only thing that can
+    /// end the wait is this budget, and the watchdog fires first.
+    fn client(&self) -> AsyncClient {
+        let url = format!("http://127.0.0.1:{}/", self.port);
+        let config = Config {
+            read_timeout: Some(Duration::from_millis(50)),
+            head_silence: Duration::from_mins(5),
+            stream_silence: Duration::from_mins(5),
+            ..Config::default()
+        };
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config)
+            .expect("connect to the local silent server")
+    }
+
+    fn shutdown(self) {
+        let _ = self.handle.join();
+    }
+}
+
+#[test]
+fn cancel_interrupts_a_silent_response_head() {
+    // Cancellation used to wrap body reads only, so a head that never arrived
+    // left the request pinned for the whole head-silence budget. The cancel
+    // must be observed on the next read tick instead.
+    let server = SilentHeadServer::spawn();
+    let client = server.client();
+
+    let mut handle = client
+        .submit(Method::Get, b"/silent".to_vec(), None, None, vec![])
+        .expect("submit succeeds");
+
+    // Wait until the request is actually on the wire, so the cancel lands
+    // during the head read rather than while it is still queued.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handle.has_started() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.has_started(), "the request never reached the wire");
+    thread::sleep(Duration::from_millis(100));
+
+    handle.cancel().expect("cancel reaches the reader");
+
+    let chunk = Watchdog::run(
+        Duration::from_secs(10),
+        "cancel during a silent response head",
+        move || {
+            let chunk = handle.next_block();
+            (chunk, handle)
+        },
+    );
+    assert!(
+        matches!(chunk.0, Some(Chunk::Aborted)),
+        "expected Aborted, got {:?}",
+        chunk.0
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn drop_interrupts_a_silent_response_head() {
+    // The same gap reached through shutdown: dropping the client while the
+    // reader waits on a head must not block for the silence budget.
+    let server = SilentHeadServer::spawn();
+    let client = server.client();
+
+    let handle = client
+        .submit(Method::Get, b"/silent".to_vec(), None, None, vec![])
+        .expect("submit succeeds");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handle.has_started() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.has_started(), "the request never reached the wire");
+    thread::sleep(Duration::from_millis(100));
+
+    let elapsed = Watchdog::run(
+        Duration::from_secs(10),
+        "drop during a silent response head",
+        move || {
+            let started = Instant::now();
+            drop(client);
+            started.elapsed()
+        },
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "drop took {elapsed:?}; shutdown did not reach the head read"
+    );
+
+    drop(handle);
+    server.shutdown();
+}
+
+#[test]
+fn drop_interrupts_a_blocked_request_upload() {
+    // A peer that accepts the connection and then stops reading fills the
+    // socket buffer, blocking the request write. Cancellation covered reads
+    // only, so the writing reader had no path back to the control channel.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let server = thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        // Never read. Hold the connection so the client's write blocks once
+        // the kernel buffers fill.
+        thread::sleep(Duration::from_secs(20));
+        drop(stream);
+    });
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(50)),
+        // The write-side granularity at which shutdown becomes observable.
+        // Without a bound here the write blocks inside one syscall and no
+        // cancellation check is ever reached.
+        write_timeout: Some(Duration::from_millis(50)),
+        head_silence: Duration::from_mins(5),
+        stream_silence: Duration::from_mins(5),
+        ..Config::default()
+    };
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config).expect("connect");
+
+    // Large enough that it cannot fit in the socket buffers, so the write
+    // must block partway rather than completing into the kernel.
+    let body = vec![b'x'; 8 * 1024 * 1024];
+    let handle = client
+        .submit(Method::Post, b"/upload".to_vec(), None, Some(body), vec![])
+        .expect("submit succeeds");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handle.has_started() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    let elapsed = Watchdog::run(
+        Duration::from_secs(15),
+        "drop during a blocked request upload",
+        move || {
+            let started = Instant::now();
+            drop(client);
+            started.elapsed()
+        },
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "drop took {elapsed:?} while the request write was blocked"
+    );
+
+    drop(handle);
     let _ = server.join();
 }
 

@@ -27,6 +27,15 @@ impl SetReadTimeout for Stream {
             Self::Tls(tls) => tls.get_ref().set_read_timeout(dur),
         }
     }
+
+    // Forwarded so a peer that stops reading cannot block a write
+    // indefinitely; that is what bounds cancellation during an upload.
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(tcp) => tcp.set_write_timeout(dur),
+            Self::Tls(tls) => tls.get_ref().set_write_timeout(dur),
+        }
+    }
 }
 
 impl Read for Stream {

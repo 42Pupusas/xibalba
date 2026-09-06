@@ -60,6 +60,7 @@ use crate::body::{BodyCollector, StreamingBody};
 use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 use crate::config::HEAD_BUF_SIZE;
 use crate::delivery::{ChunkSink, ChunkStream, ConsumerGuard};
+use crate::interrupt::Interrupt;
 use crate::params::RequestParams;
 
 /// Default capacity for the per-request chunk ring: a few SSE
@@ -611,10 +612,25 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         extra_headers: headers,
         allow_replay: method.is_replay_eligible(),
     };
-    let send_result = client.send_head(&request_params);
+    let send_result = client.send_head_interruptible(
+        &request_params,
+        ControlInterrupt {
+            control_rx,
+            pending,
+            ticket,
+            shutting_down,
+        },
+    );
 
     let (head_data, framing, tail_offset) = match send_result {
         Ok(parts) => parts,
+        // A cancel observed during the request write or head read arrives as
+        // Interrupted. Report it as Aborted, matching the body path, so the
+        // caller can tell its own cancellation from a transport failure.
+        Err(Error::Io(e)) if e.kind == std::io::ErrorKind::Interrupted => {
+            sink.send_terminal(Chunk::Aborted);
+            return;
+        }
         Err(e) => {
             sink.send_terminal(Chunk::Error(std::sync::Arc::new(e)));
             return;
@@ -735,6 +751,31 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
                 return;
             }
         }
+    }
+}
+
+/// Answers "should this request stop?" from the control channel, so the
+/// client can consult it during writes and head reads without knowing the
+/// channel exists.
+///
+/// It borrows the control channel and pending queue, which are disjoint from
+/// the `Client` that owns the stream — that is what lets a single request's
+/// write, head read, and stale-connection retry all be covered.
+struct ControlInterrupt<'a> {
+    control_rx: &'a mut MpscConsumer<Control>,
+    pending: &'a mut VecDeque<AsyncRequest>,
+    ticket: u64,
+    shutting_down: &'a AtomicBool,
+}
+
+impl Interrupt for ControlInterrupt<'_> {
+    fn is_cancelled(&mut self) -> bool {
+        poll_control(
+            self.control_rx,
+            self.pending,
+            Some(self.ticket),
+            self.shutting_down,
+        )
     }
 }
 

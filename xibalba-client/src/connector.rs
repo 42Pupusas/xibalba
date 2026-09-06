@@ -10,6 +10,26 @@ pub trait SetReadTimeout {
     /// # Errors
     /// Returns `std::io::Error` if the operation fails.
     fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()>;
+
+    /// Bound how long a single write may block, mirroring
+    /// `TcpStream::set_write_timeout`.
+    ///
+    /// A peer that stops reading fills the socket buffers and a write blocks
+    /// inside one call. The client checks for cancellation *between* I/O
+    /// calls, so without this bound there is no point at which a cancel or a
+    /// shutdown can be observed: `AsyncClient::drop` waits for the peer.
+    ///
+    /// The default does nothing, which keeps existing connectors compiling.
+    /// A connector that leaves it unimplemented is declaring that its writes
+    /// cannot block indefinitely; a TCP-backed one should forward this to the
+    /// socket, or cancellation during an upload is unbounded.
+    ///
+    /// # Errors
+    /// Returns `std::io::Error` if the operation fails.
+    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
+        let _ = dur;
+        Ok(())
+    }
 }
 
 /// A network connector: opens a bidirectional stream to the given URL.

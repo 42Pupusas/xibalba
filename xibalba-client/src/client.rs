@@ -5,6 +5,8 @@ use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
 use xibalba_proto::scheme::Scheme;
+
+use crate::interrupt::{Interrupt, InterruptibleStream, NeverCancelled};
 use xibalba_proto::url::Url;
 use xibalba_proto::version::Version;
 
@@ -152,6 +154,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
 
     fn apply_timeouts(&self) -> Result<(), Error> {
         self.stream.set_read_timeout(self.config.read_timeout)?;
+        self.stream.set_write_timeout(self.config.write_timeout)?;
         Ok(())
     }
 
@@ -267,15 +270,36 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         &mut self,
         params: &RequestParams<'_>,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
-        match self.send_head_once(params) {
+        self.send_head_interruptible(params, NeverCancelled)
+    }
+
+    /// [`send_head`](Self::send_head) with `interrupt` consulted before every
+    /// write and every head read, so a caller that can cancel is not left
+    /// waiting out the head-silence budget.
+    ///
+    /// The retry after a stale connection re-checks the interrupt through the
+    /// same path, so a cancel arriving during the reconnect is observed
+    /// rather than being overtaken by the resent request.
+    pub(crate) fn send_head_interruptible<I: Interrupt>(
+        &mut self,
+        params: &RequestParams<'_>,
+        mut interrupt: I,
+    ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
+        match self.send_head_once(params, &mut interrupt) {
             Ok(head) => Ok(head),
             Err(e)
                 if params.allow_replay
                     && Self::is_stale_connection(&e)
                     && self.head_buf.is_empty() =>
             {
+                if interrupt.is_cancelled() {
+                    return Err(Error::from(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "request cancelled",
+                    )));
+                }
                 self.reconnect_same_host()?;
-                self.send_head_once(params)
+                self.send_head_once(params, &mut interrupt)
             }
             Err(e) => Err(e),
         }
@@ -284,9 +308,10 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// Write one request and read the response head, leaving the body
     /// unread on the stream. Returns the head, its framing, and the
     /// offset of the body's first byte within `self.head_buf`.
-    fn send_head_once(
+    fn send_head_once<I: Interrupt>(
         &mut self,
         params: &RequestParams<'_>,
+        interrupt: &mut I,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
         self.head_buf.clear();
         let host_value = self.host_header_value();
@@ -331,24 +356,29 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         // truncated one, which the server reads as a single smuggled request.
         self.discard_partial_response();
 
+        // Both the write and the head read run through the interrupt, so a
+        // peer that stops reading mid-upload, or never answers, cannot pin the
+        // caller until the silence budget expires.
+        let inline = params.body.is_some_and(|d| self.inline_body_fits(d.len()));
+        let mut wire = InterruptibleStream::new(&mut self.stream, interrupt);
         match params.body {
-            Some(data) if self.inline_body_fits(data.len()) => {
+            Some(data) if inline => {
                 self.write_buf.extend_from_slice(data);
-                self.stream.write_all(&self.write_buf)?;
+                wire.write_all(&self.write_buf)?;
             }
             Some(data) => {
-                self.stream.write_all(&self.write_buf)?;
-                self.stream.write_all(data)?;
+                wire.write_all(&self.write_buf)?;
+                wire.write_all(data)?;
             }
-            None => self.stream.write_all(&self.write_buf)?,
+            None => wire.write_all(&self.write_buf)?,
         }
-        self.stream.flush()?;
+        wire.flush()?;
 
         // A rejected head (notably HeadTooLarge) may already have consumed a
         // prefix of the response, so the poison above stands on every error
         // path: a later request would read the remainder as its own head.
         let parts = HeadData::read_response(
-            &mut self.stream,
+            &mut wire,
             &mut self.head_buf,
             MAX_HEAD_SIZE,
             self.config.head_silence,

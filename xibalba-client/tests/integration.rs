@@ -21,6 +21,10 @@ impl SetReadTimeout for PlainStream {
     fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
         self.0.set_read_timeout(dur)
     }
+
+    fn set_write_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.0.set_write_timeout(dur)
+    }
 }
 
 impl Read for PlainStream {

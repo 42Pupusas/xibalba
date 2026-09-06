@@ -25,6 +25,16 @@ pub struct Config {
     /// be finite: with `None` the reader parks in the kernel until data
     /// arrives and the silence budgets can never trip.
     pub read_timeout: Option<Duration>,
+    /// Per-socket-write ceiling (`SO_SNDTIMEO`), the write-side twin of
+    /// `read_timeout`. A peer that stops reading fills the socket buffers and
+    /// a single write blocks; this is the granularity at which a cancel or
+    /// shutdown is observed during a request upload.
+    ///
+    /// Only effective when the connector implements
+    /// [`SetWriteTimeout`](crate::connector::SetReadTimeout::set_write_timeout);
+    /// the default implementation ignores it, so such a connector is
+    /// declaring its writes cannot block indefinitely.
+    pub write_timeout: Option<Duration>,
     pub max_response_body: usize,
     pub max_redirects: u8,
     /// Total wall-clock silence tolerated while waiting for a response
@@ -66,6 +76,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             read_timeout: Some(Duration::from_secs(30)),
+            write_timeout: Some(Duration::from_secs(30)),
             max_response_body: 10 * 1024 * 1024,
             max_redirects: 10,
             head_silence: Duration::from_mins(2),
