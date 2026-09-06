@@ -210,15 +210,17 @@ The root is a virtual workspace, so root integration tests are not discovered. T
 
 Work on one behavior or extraction at a time; do not combine the following phases into one refactor.
 
-### Phase 1 — Prevent panics, replay, and connection corruption
+### Phase 1 — Prevent panics, replay, and connection corruption — **complete**
 
-1. **A01:** repair chunk digit accounting; add debug/release regression tests.
-2. **A04:** make all transport-write failures poison the connection; test scripted partial failures.
-3. **A03:** enforce clean dispatch on every redirect hop.
-4. **A07:** centralize persistence/upgrade/tunnel disposition for buffered, streaming, and async paths.
-5. **A02:** introduce explicit replay policy with safe non-idempotent defaults.
+1. ~~**A01:** repair chunk digit accounting; add debug/release regression tests.~~ Done (`dee3cd2`). The counter only ever answered "was there a digit?", so it is now a `bool` and cannot overflow.
+2. ~~**A04:** make all transport-write failures poison the connection; test scripted partial failures.~~ Done (`dee3cd2`). Poisoning happens before the first byte is written and clears only after the head is read.
+3. ~~**A03:** enforce clean dispatch on every redirect hop.~~ Done (`5bae5c6`). The earlier green run was the stale-retry path masking the defect while silently writing the hop to a dead connection twice; `sent_on` assertions now pin the hop to the fresh connection.
+4. ~~**A07:** centralize persistence/upgrade/tunnel disposition for buffered, streaming, and async paths.~~ Done (`a63417f`), via `ConnectionReuse` in `reuse.rs`. CONNECT tunnelling remains open and is tracked in A07's finding above.
+5. ~~**A02:** introduce explicit replay policy with safe non-idempotent defaults.~~ Done (`c7bb141`). `Method::is_replay_eligible` gates the retry; `RequestBuilder::allow_replay` is the opt-in.
 
-Acceptance: every failure/reuse test records which connection carried each request and exactly how many requests reached the peer. No retry assertion should rely only on the final returned body.
+Acceptance met: the scripted connector records per-connection bytes, and every failure/reuse test asserts on connection count and on which connection carried the request. 291 tests pass in debug and release; Clippy is clean under `-D warnings`.
+
+Carried into later phases: CONNECT tunnel handling (A07), and the async paths still retry via `send_head` without the cancellation coverage A06 describes.
 
 ### Phase 2 — Make cancellation and resource bounds real
 
