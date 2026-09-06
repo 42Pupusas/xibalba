@@ -14,6 +14,7 @@ pub mod params;
 pub mod redirect;
 pub mod response;
 
+mod delivery;
 mod reuse;
 mod silence;
 
@@ -22,5 +23,6 @@ pub use xibalba_proto as proto;
 pub use async_client::{AsyncClient, AsyncRequest, Chunk, StreamHandle};
 pub use client::Client;
 pub use config::{Config, DEFAULT_MAX_HEAD_SIZE, HEAD_BUF_SIZE};
+pub use delivery::ChunkStream;
 pub use params::RequestBuilder;
 pub use response::{Response, StreamingResponse};

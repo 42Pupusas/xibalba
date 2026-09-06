@@ -1,0 +1,146 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use quetzalcoatl::spsc::{Consumer, Producer};
+
+use crate::async_client::Chunk;
+
+/// Yields before falling back to sleeping while the ring stays full.
+const SPIN_LIMIT: u32 = 128;
+
+/// How often a blocked send re-checks shutdown and consumer liveness once
+/// spinning has not freed a slot. Also the upper bound on how long shutdown
+/// can go unnoticed by a reader waiting for capacity.
+const FULL_RING_POLL: Duration = Duration::from_millis(1);
+
+/// Why a chunk could not be handed to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undelivered {
+    /// The caller dropped its handle; nobody will read the rest.
+    ConsumerGone,
+    /// The client is shutting down and the ring never freed a slot.
+    ShuttingDown,
+}
+
+/// Tracks whether the caller still holds the receiving end of a chunk ring.
+///
+/// `quetzalcoatl`'s producer reports a dropped consumer only through
+/// `push_block`, which parks until a slot frees. The reader cannot afford to
+/// park, so liveness is published here instead: the guard travels with the
+/// consumer and clears the flag when that consumer is dropped.
+#[derive(Debug)]
+pub struct ConsumerGuard(Arc<AtomicBool>);
+
+impl ConsumerGuard {
+    pub(crate) fn new() -> (Self, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(true));
+        (Self(Arc::clone(&flag)), flag)
+    }
+}
+
+impl Drop for ConsumerGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The receiving end of one request's chunk ring.
+///
+/// Returned by [`StreamHandle::into_consumer`](crate::StreamHandle::into_consumer)
+/// so a caller can park on the ring directly. It owns a [`ConsumerGuard`], so
+/// dropping it tells the reader to stop producing rather than leaving the
+/// reader waiting for capacity on a ring nobody will drain.
+pub struct ChunkStream {
+    rx: Consumer<Chunk>,
+    _guard: ConsumerGuard,
+}
+
+impl std::fmt::Debug for ChunkStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkStream").finish_non_exhaustive()
+    }
+}
+
+impl ChunkStream {
+    pub(crate) const fn new(rx: Consumer<Chunk>, guard: ConsumerGuard) -> Self {
+        Self { rx, _guard: guard }
+    }
+
+    /// The next chunk, or `None` when none is buffered.
+    pub fn try_next(&mut self) -> Option<Chunk> {
+        self.rx.pop()
+    }
+
+    /// Park until a chunk arrives, or return `None` once the reader closes
+    /// the ring.
+    pub fn next_block(&mut self) -> Option<Chunk> {
+        self.rx.pop_block()
+    }
+}
+
+/// Hands response chunks to the caller without ever parking indefinitely.
+///
+/// `Producer::push_block` parks until the consumer frees a slot. A caller that
+/// holds a handle and stops reading therefore wedges the reader thread: it is
+/// no longer polling the shutdown flag, so `AsyncClient::drop` waits on a
+/// `join` that cannot finish. This retries a non-blocking push and gives up as
+/// soon as either shutdown is signalled or the consumer goes away.
+pub struct ChunkSink<'a> {
+    tx: &'a Producer<Chunk>,
+    consumer_alive: &'a AtomicBool,
+    shutting_down: &'a AtomicBool,
+}
+
+impl<'a> ChunkSink<'a> {
+    pub(crate) const fn new(
+        tx: &'a Producer<Chunk>,
+        consumer_alive: &'a AtomicBool,
+        shutting_down: &'a AtomicBool,
+    ) -> Self {
+        Self {
+            tx,
+            consumer_alive,
+            shutting_down,
+        }
+    }
+
+    /// Deliver `chunk`, waiting for ring capacity while the client is live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Undelivered::ConsumerGone`] when the handle was dropped and
+    /// [`Undelivered::ShuttingDown`] when shutdown began before a slot freed.
+    pub(crate) fn send(&self, chunk: Chunk) -> Result<(), Undelivered> {
+        let mut pending = chunk;
+        let mut spins = 0u32;
+        loop {
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(Undelivered::ShuttingDown);
+            }
+            if !self.consumer_alive.load(Ordering::Acquire) {
+                return Err(Undelivered::ConsumerGone);
+            }
+            match self.tx.push(pending) {
+                Ok(()) => return Ok(()),
+                Err(returned) => pending = returned,
+            }
+            // A consumer that reads slowly can keep the ring full for a long
+            // time. Spinning throughout would burn a core, and parking would
+            // reintroduce the unbounded wait this type exists to avoid, so
+            // back off to a short sleep and keep re-checking both flags.
+            if spins < SPIN_LIMIT {
+                spins += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(FULL_RING_POLL);
+            }
+        }
+    }
+
+    /// Deliver a terminal chunk, where failure is not actionable: the caller
+    /// is either gone or shutting down.
+    pub(crate) fn send_terminal(&self, chunk: Chunk) {
+        let _ = self.send(chunk);
+    }
+}

@@ -58,6 +58,7 @@ use xibalba_proto::method::Method;
 use crate::body::{BodyCollector, StreamingBody};
 use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 use crate::config::HEAD_BUF_SIZE;
+use crate::delivery::{ChunkSink, ChunkStream, ConsumerGuard};
 use crate::params::RequestParams;
 
 /// Default capacity for the per-request chunk ring: a few SSE
@@ -139,6 +140,10 @@ pub struct AsyncRequest {
     body: Option<Vec<u8>>,
     headers: Vec<(Vec<u8>, Vec<u8>)>,
     chunk_tx: spsc::Producer<Chunk>,
+    /// Cleared when the caller drops its side of the chunk ring, so the
+    /// reader can stop producing instead of waiting for capacity that
+    /// nobody will free.
+    consumer_alive: Arc<AtomicBool>,
     /// Identifies this request on the shared control ring so a cancel
     /// can name it precisely.
     ticket: u64,
@@ -170,6 +175,9 @@ impl std::fmt::Debug for AsyncRequest {
 /// method.
 pub struct StreamHandle {
     chunk_rx: SpscConsumer<Chunk>,
+    /// Clears the request's `consumer_alive` flag when this handle is
+    /// dropped. Held for its `Drop`, never read directly.
+    guard: ConsumerGuard,
     control_tx: MpscProducer<Control>,
     /// This request's ticket, so [`cancel`](Self::cancel) targets only
     /// this request and never a successor that reused the reader.
@@ -223,13 +231,14 @@ impl StreamHandle {
         self.chunk_rx.pop_block()
     }
 
-    /// Take the chunk consumer out of the handle. The caller can then
-    /// `pop_block` directly on the consumer — useful when integrating
-    /// with an existing event loop that already parks on its own
-    /// consumer.
+    /// Take the chunk stream out of the handle. The caller can then park on
+    /// it directly — useful when integrating with an existing event loop.
+    ///
+    /// The returned stream carries the same liveness guard as the handle, so
+    /// dropping it still releases the reader.
     #[must_use]
-    pub fn into_consumer(self) -> SpscConsumer<Chunk> {
-        self.chunk_rx
+    pub fn into_stream(self) -> ChunkStream {
+        ChunkStream::new(self.chunk_rx, self.guard)
     }
 }
 
@@ -328,6 +337,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             spsc::RingBuffer::<Chunk>::new(Capacity::at_least(CHUNK_RING_CAP)).split();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         let started = Arc::new(AtomicBool::new(false));
+        let (guard, consumer_alive) = ConsumerGuard::new();
         let request = AsyncRequest {
             method,
             path,
@@ -335,6 +345,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             body,
             headers,
             chunk_tx,
+            consumer_alive,
             ticket,
             started: Arc::clone(&started),
         };
@@ -344,6 +355,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             .map_err(|_| Error::Connection(ConnectionError::ReaderGone))?;
         Ok(StreamHandle {
             chunk_rx,
+            guard,
             control_tx: control_tx.clone(),
             ticket,
             started,
@@ -480,7 +492,8 @@ fn poll_control(
                     let request = pending
                         .remove(index)
                         .expect("pending index came from the same queue");
-                    let _ = request.chunk_tx.push_block(Chunk::Aborted);
+                    ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutting_down)
+                        .send_terminal(Chunk::Aborted);
                 }
             }
             Some(Control::Request(request)) => pending.push_back(request),
@@ -507,7 +520,8 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // publishing started: a cancelled queued request must never reach the
     // wire.
     if poll_control(control_rx, pending, Some(request.ticket), shutting_down) {
-        let _ = request.chunk_tx.push_block(Chunk::Aborted);
+        ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutting_down)
+            .send_terminal(Chunk::Aborted);
         return;
     }
 
@@ -527,9 +541,8 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     if client.dirty
         && let Err(e) = client.ensure_clean()
     {
-        let _ = request
-            .chunk_tx
-            .push_block(Chunk::Error(std::sync::Arc::new(e)));
+        ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutting_down)
+            .send_terminal(Chunk::Error(std::sync::Arc::new(e)));
         return;
     }
 
@@ -540,9 +553,11 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         body,
         headers,
         chunk_tx,
+        consumer_alive,
         ticket,
         started,
     } = request;
+    let sink = ChunkSink::new(&chunk_tx, &consumer_alive, shutting_down);
 
     // Publish "this request has left the queue" before the first byte is
     // written. A caller's response-head deadline keys off this, so it
@@ -566,7 +581,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     let (head_data, framing, tail_offset) = match send_result {
         Ok(parts) => parts,
         Err(e) => {
-            let _ = chunk_tx.push_block(Chunk::Error(std::sync::Arc::new(e)));
+            sink.send_terminal(Chunk::Error(std::sync::Arc::new(e)));
             return;
         }
     };
@@ -588,8 +603,8 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     // N's data to request N+1.
     client.dirty = true;
 
-    if chunk_tx
-        .push_block(Chunk::Head {
+    if sink
+        .send(Chunk::Head {
             status,
             headers: header_vec,
         })
@@ -621,20 +636,20 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         match collector.read(&mut cancellable, &framing, &tail) {
             Ok(bytes) => {
                 client.dirty = !collector.is_reusable() || !reuse.is_keep();
-                if !bytes.is_empty() && chunk_tx.push_block(Chunk::Body(bytes)).is_err() {
+                if !bytes.is_empty() && sink.send(Chunk::Body(bytes)).is_err() {
                     return;
                 }
             }
             Err(Error::Io(error)) if error.kind == std::io::ErrorKind::Interrupted => {
-                let _ = chunk_tx.push_block(Chunk::Aborted);
+                sink.send_terminal(Chunk::Aborted);
                 return;
             }
             Err(error) => {
-                let _ = chunk_tx.push_block(Chunk::Error(std::sync::Arc::new(error)));
+                sink.send_terminal(Chunk::Error(std::sync::Arc::new(error)));
                 return;
             }
         }
-        let _ = chunk_tx.push_block(Chunk::Eof);
+        sink.send_terminal(Chunk::Eof);
         return;
     }
 
@@ -668,20 +683,20 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     loop {
         match body.read(&mut buf) {
             Ok(0) => {
-                let _ = chunk_tx.push_block(Chunk::Eof);
+                sink.send_terminal(Chunk::Eof);
                 return;
             }
             Ok(n) => {
-                if chunk_tx.push_block(Chunk::Body(buf[..n].to_vec())).is_err() {
+                if sink.send(Chunk::Body(buf[..n].to_vec())).is_err() {
                     return;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                let _ = chunk_tx.push_block(Chunk::Aborted);
+                sink.send_terminal(Chunk::Aborted);
                 return;
             }
             Err(e) => {
-                let _ = chunk_tx.push_block(Chunk::Error(std::sync::Arc::new(Error::from(e))));
+                sink.send_terminal(Chunk::Error(std::sync::Arc::new(Error::from(e))));
                 return;
             }
         }
