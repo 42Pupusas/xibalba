@@ -88,6 +88,11 @@ pub enum ParseError {
     InvalidChunkSize,
     /// Chunked encoding: expected CRLF but got something else.
     InvalidChunkTerminator,
+    /// Chunked encoding: a chunk extension or trailer section exceeded the
+    /// decoder's metadata budget, or contained a byte the grammar forbids.
+    /// A peer can otherwise send metadata forever without ever delivering
+    /// body data or ending the stream.
+    InvalidChunkMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +184,7 @@ impl fmt::Display for ParseError {
             Self::InvalidContentLength => "invalid Content-Length value",
             Self::InvalidChunkSize => "invalid chunk size",
             Self::InvalidChunkTerminator => "invalid chunk terminator",
+            Self::InvalidChunkMetadata => "chunk extension or trailer is invalid or too large",
         };
         f.write_str(msg)
     }

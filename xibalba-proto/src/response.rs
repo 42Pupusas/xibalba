@@ -265,6 +265,50 @@ impl BodyFraming {
 
 // --- Chunked transfer decoder state machine ---
 
+/// Largest chunk extension, in bytes, accepted on a single chunk.
+pub const MAX_CHUNK_EXTENSION: usize = 4096;
+
+/// Largest trailer section, in bytes, accepted after the final chunk.
+pub const MAX_TRAILER_SECTION: usize = 8192;
+
+/// Bounds the metadata a peer may send between body bytes.
+///
+/// Extensions and trailers carry no payload, so a peer that streams them
+/// indefinitely keeps a request occupied without ever making progress. The
+/// budget is charged per byte and refuses the stream once exhausted.
+#[derive(Debug, Clone)]
+struct MetadataBudget {
+    extension: usize,
+    trailer: usize,
+}
+
+impl MetadataBudget {
+    const fn new() -> Self {
+        Self {
+            extension: 0,
+            trailer: 0,
+        }
+    }
+
+    /// Charge one extension byte. Reset per chunk, since each chunk is
+    /// allowed its own extension.
+    const fn charge_extension(&mut self) -> bool {
+        self.extension += 1;
+        self.extension <= MAX_CHUNK_EXTENSION
+    }
+
+    /// Charge one trailer byte. Not reset: the whole trailer section shares
+    /// one budget, so many small trailer lines cannot evade it.
+    const fn charge_trailer(&mut self) -> bool {
+        self.trailer += 1;
+        self.trailer <= MAX_TRAILER_SECTION
+    }
+
+    const fn reset_extension(&mut self) {
+        self.extension = 0;
+    }
+}
+
 /// State machine for decoding chunked `Transfer-Encoding`.
 #[derive(Debug, Clone)]
 pub struct ChunkedDecoder {
@@ -273,6 +317,7 @@ pub struct ChunkedDecoder {
     saw_size_digit: bool,
     remaining: u64,
     trailer_line_empty: bool,
+    metadata: MetadataBudget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +361,7 @@ impl ChunkedDecoder {
             saw_size_digit: false,
             remaining: 0,
             trailer_line_empty: true,
+            metadata: MetadataBudget::new(),
         }
     }
 
@@ -417,6 +463,11 @@ impl ChunkedDecoder {
                     if b == b'\r' {
                         self.remaining = self.chunk_size;
                         self.state = ChunkedState::ReadingSizeLf;
+                    } else if !Self::is_metadata_byte(b) || !self.metadata.charge_extension() {
+                        return Step::Yield((
+                            DecodeResult::Error(ParseError::InvalidChunkMetadata),
+                            i,
+                        ));
                     }
                 }
                 ChunkedState::ReadingSizeLf => {
@@ -429,6 +480,7 @@ impl ChunkedDecoder {
                     if self.chunk_size == 0 {
                         self.state = ChunkedState::ReadingTrailer;
                         self.trailer_line_empty = true;
+                        self.metadata.reset_extension();
                         // Hand control back to `decode`, which routes the
                         // remaining bytes to `read_trailer`. Falling through
                         // would re-enter this loop in `ReadingTrailer`, a
@@ -486,6 +538,7 @@ impl ChunkedDecoder {
                     }
                     self.chunk_size = 0;
                     self.saw_size_digit = false;
+                    self.metadata.reset_extension();
                     self.state = ChunkedState::ReadingSize;
                     return Step::Advance(i + 1);
                 }
@@ -501,8 +554,13 @@ impl ChunkedDecoder {
                 ChunkedState::ReadingTrailer => {
                     if b == b'\r' {
                         self.state = ChunkedState::ReadingTrailerLf;
-                    } else {
+                    } else if Self::is_metadata_byte(b) && self.metadata.charge_trailer() {
                         self.trailer_line_empty = false;
+                    } else {
+                        return Step::Yield((
+                            DecodeResult::Error(ParseError::InvalidChunkMetadata),
+                            i,
+                        ));
                     }
                 }
                 ChunkedState::ReadingTrailerLf => {
@@ -528,6 +586,15 @@ impl ChunkedDecoder {
             }
         }
         Step::Advance(input.len())
+    }
+
+    /// Whether `b` may appear inside a chunk extension or trailer line.
+    ///
+    /// Bare LF, NUL, and the other C0 controls are excluded: accepting them
+    /// lets a peer smuggle line structure past a downstream parser that
+    /// treats LF alone as a line ending. HTAB is allowed, as in field values.
+    const fn is_metadata_byte(b: u8) -> bool {
+        b == b'\t' || (b >= 0x20 && b != 0x7f)
     }
 }
 
@@ -850,6 +917,125 @@ mod tests {
 
         assert_eq!(total, b"hello");
         assert!(decoder.is_done());
+    }
+
+    /// Feed `input` until the decoder yields a terminal result.
+    fn drive(decoder: &mut ChunkedDecoder, input: &[u8]) -> DecodeResult {
+        let mut output = [0u8; 256];
+        let mut pos = 0;
+        loop {
+            let (result, consumed) = decoder.decode(&input[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(_) if pos < input.len() => {}
+                other => return other,
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_chunk_extension_is_rejected() {
+        // Extensions carry no payload, so an unbounded one lets a peer occupy
+        // the connection forever without delivering a single body byte.
+        let mut input = b"5;".to_vec();
+        input.extend(std::iter::repeat_n(b'x', MAX_CHUNK_EXTENSION + 1));
+        input.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, &input),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    #[test]
+    fn extension_within_the_budget_is_accepted() {
+        // The bound must not reject ordinary extensions.
+        let mut input = b"5;".to_vec();
+        input.extend(std::iter::repeat_n(b'x', MAX_CHUNK_EXTENSION - 1));
+        input.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(drive(&mut decoder, &input), DecodeResult::Data(5));
+    }
+
+    #[test]
+    fn extension_budget_resets_between_chunks() {
+        // Each chunk gets its own extension allowance; a long stream of
+        // normally-extended chunks must not accumulate into a refusal.
+        let mut input = Vec::new();
+        for _ in 0..8 {
+            input.extend_from_slice(b"1;");
+            input.extend(std::iter::repeat_n(b'x', MAX_CHUNK_EXTENSION - 1));
+            input.extend_from_slice(b"\r\na\r\n");
+        }
+        input.extend_from_slice(b"0\r\n\r\n");
+
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 256];
+        let mut total = Vec::new();
+        let mut pos = 0;
+        loop {
+            let (result, consumed) = decoder.decode(&input[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                DecodeResult::Done => break,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert_eq!(total, b"aaaaaaaa");
+    }
+
+    #[test]
+    fn oversized_trailer_section_is_rejected() {
+        // Many small trailer lines share one budget, so the section cannot be
+        // extended indefinitely by splitting it up. CRLF is not charged, so
+        // the loop counts the field bytes the budget actually sees.
+        const LINE: &[u8] = b"X-Pad: value\r\n";
+        let charged_per_line = LINE.len() - 2;
+        let lines = MAX_TRAILER_SECTION / charged_per_line + 2;
+
+        let mut input = b"0\r\n".to_vec();
+        for _ in 0..lines {
+            input.extend_from_slice(LINE);
+        }
+        input.extend_from_slice(b"\r\n");
+
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, &input),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    #[test]
+    fn bare_lf_in_a_chunk_extension_is_rejected() {
+        // A bare LF inside metadata lets a peer smuggle line structure past a
+        // downstream parser that treats LF alone as a line ending.
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;ext\nvalue\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    #[test]
+    fn nul_in_a_chunk_extension_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;ext\0bad\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    #[test]
+    fn bare_lf_in_a_trailer_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"0\r\nTrailer: a\nb\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
     }
 
     #[test]
