@@ -6,6 +6,23 @@ use xibalba_proto::url::Url;
 
 /// Abstraction over anything that can set a read timeout.
 /// Mirrors `TcpStream::set_read_timeout`.
+///
+/// # Blocking and error contract
+///
+/// The client drives a blocking stream and regains control between I/O calls,
+/// so an implementor must hold to three things:
+///
+/// 1. **Reads block up to the configured timeout, then report a tick.** Either
+///    `WouldBlock` or `TimedOut` is accepted; both are read as "nothing yet",
+///    retried against the silence budget, and never surfaced to the caller.
+///    Any other error kind ends the request.
+/// 2. **The stream stays in blocking mode.** A non-blocking stream returns a
+///    tick immediately and turns the retry loop into a spin. The client paces
+///    such a stream rather than burning a core, but the cost is real and the
+///    read timeout stops being observed.
+/// 3. **`Interrupted` means a signal arrived, nothing more.** The client
+///    marks its own cancellation with a private payload, so a connector
+///    forwarding a genuine `EINTR` is never mistaken for a cancel.
 pub trait SetReadTimeout {
     /// # Errors
     /// Returns `std::io::Error` if the operation fails.

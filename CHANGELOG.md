@@ -54,6 +54,16 @@ These compile without error and return different results. Check them first.
 - **The reason phrase is validated.** A phrase containing NUL or another C0
   control now fails with `ParseError::InvalidReasonPhrase`; HTAB and obs-text
   remain accepted.
+- **`Config::validate` rejects zero durations and oversized read timeouts.**
+  A zero read timeout makes every read tick instantly and a zero budget is
+  spent before the first read returns; a read timeout longer than a silence
+  budget lets one blocked read overshoot the budget it subdivides. Both now
+  fail at `connect` with `ConnectionError::ZeroDuration` or
+  `TimeoutExceedsBudget` instead of failing every request at runtime.
+- **`TimedOut` is accepted as a read-timeout tick alongside `WouldBlock`.**
+  Only `WouldBlock` was absorbed, which is a Linux detail; a connector or
+  platform reporting `TimedOut` ended the request on the first tick, cutting
+  the silence budget to a single `read_timeout`.
 - **A cancel during a request write or response head now aborts it.**
   Cancellation covered body reads only, so a head that never arrived pinned
   the request for the whole `head_silence` budget and `cancel`/`drop` waited
@@ -110,8 +120,20 @@ These compile without error and return different results. Check them first.
   leaves the default in place is declaring its writes cannot block
   indefinitely. `Config::write_timeout` sets the value (30 s by default).
 - New `xibalba_client::interrupt` module with `Interrupt`,
-  `InterruptibleStream`, and `NeverCancelled`, the seam through which a caller
-  that can cancel tells the client to stop between I/O calls.
+  `InterruptibleStream`, `NeverCancelled`, `Cancelled`, and `Latch`, the seam
+  through which a caller that can cancel tells the client to stop between I/O
+  calls. Cancellation is marked by the `Cancelled` payload rather than
+  `ErrorKind::Interrupted`, which `write_all` and `read_exact` retry
+  internally — a cancelled `write_all` previously never returned.
+- `SetReadTimeout` documents the blocking and error contract an implementor
+  must satisfy: blocking mode, a tick reported as `WouldBlock` or `TimedOut`,
+  and `Interrupted` reserved for genuine signals.
+
+### Removed
+
+- `xibalba_client::async_client::CancellableStream`. It wrapped reads alone and
+  duplicated the control-channel poll now performed by the request's single
+  latched interrupt, which also covers writes and the response head.
 - `AsyncClient::submit` returns `ConnectionError::TooManyRequests` once
   `DEFAULT_MAX_OUTSTANDING` requests are in flight, and no longer blocks when
   the control ring is full. This is backpressure, not a transport failure.

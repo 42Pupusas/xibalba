@@ -1379,6 +1379,85 @@ fn infinite_read_timeout_is_rejected() {
     );
 }
 
+/// A zero duration is always a configuration mistake: a zero read timeout
+/// makes every read tick instantly and a zero budget is spent before the
+/// first read returns, so every request fails immediately. Rejecting it at
+/// connect turns a puzzling runtime failure into a startup error.
+#[test]
+fn zero_durations_are_rejected() {
+    let zero = Duration::ZERO;
+    let cases = [
+        Config {
+            read_timeout: Some(zero),
+            ..Config::default()
+        },
+        Config {
+            write_timeout: Some(zero),
+            ..Config::default()
+        },
+        Config {
+            head_silence: zero,
+            ..Config::default()
+        },
+        Config {
+            stream_silence: zero,
+            ..Config::default()
+        },
+    ];
+    for config in cases {
+        let error = Client::<PlainConnector>::connect(b"http://127.0.0.1:1/", (), config)
+            .err()
+            .expect("a zero duration must be rejected before connect");
+        assert_eq!(error, Error::Connection(ConnectionError::ZeroDuration));
+    }
+}
+
+/// The silence budgets are only consulted between reads, so a per-read
+/// timeout longer than a budget lets one blocked read overshoot it.
+#[test]
+fn a_read_timeout_longer_than_a_silence_budget_is_rejected() {
+    let cases = [
+        Config {
+            read_timeout: Some(Duration::from_secs(30)),
+            head_silence: Duration::from_secs(5),
+            ..Config::default()
+        },
+        Config {
+            read_timeout: Some(Duration::from_secs(30)),
+            stream_silence: Duration::from_secs(5),
+            ..Config::default()
+        },
+    ];
+    for config in cases {
+        let error = Client::<PlainConnector>::connect(b"http://127.0.0.1:1/", (), config)
+            .err()
+            .expect("a read timeout exceeding a silence budget must be rejected");
+        assert_eq!(
+            error,
+            Error::Connection(ConnectionError::TimeoutExceedsBudget)
+        );
+    }
+}
+
+/// A read timeout equal to the budget subdivides it exactly once, which is
+/// the boundary the check must not reject.
+#[test]
+fn a_read_timeout_equal_to_the_budget_is_accepted() {
+    let config = Config {
+        read_timeout: Some(Duration::from_secs(5)),
+        head_silence: Duration::from_secs(5),
+        stream_silence: Duration::from_secs(5),
+        ..Config::default()
+    };
+    let error = Client::<PlainConnector>::connect(b"http://127.0.0.1:1/", (), config)
+        .err()
+        .expect("nothing is listening on port 1");
+    assert!(
+        matches!(error, Error::Io(_)),
+        "expected the connect to fail on the socket, not on validation: {error:?}"
+    );
+}
+
 #[test]
 fn server_closes_connection_before_response() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

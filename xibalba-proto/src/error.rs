@@ -39,6 +39,13 @@ pub enum ConnectionError {
     /// A blocking socket timeout is required for silence budgets and async
     /// cancellation to regain control from a read.
     InfiniteReadTimeout,
+    /// A timeout or budget was configured as zero. A zero read timeout makes
+    /// every read tick instantly and a zero budget expires before the first
+    /// read completes, so both turn every request into an immediate failure.
+    ZeroDuration,
+    /// A per-read timeout is longer than a silence budget it subdivides, so
+    /// the first blocked read overshoots the budget it is meant to enforce.
+    TimeoutExceedsBudget,
     /// The async client's background reader thread has exited.
     ReaderGone,
     /// A redirect from an HTTPS origin to a plaintext HTTP target. Following
@@ -152,6 +159,10 @@ impl fmt::Display for ConnectionError {
             Self::TooManyRedirects => f.write_str("too many redirects"),
             Self::TooManyInterimResponses => f.write_str("too many 1xx interim responses"),
             Self::InfiniteReadTimeout => f.write_str("read timeout must be finite"),
+            Self::ZeroDuration => f.write_str("timeouts and silence budgets must be non-zero"),
+            Self::TimeoutExceedsBudget => {
+                f.write_str("per-read timeout exceeds the silence budget it subdivides")
+            }
             Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::TooManyRequests => f.write_str("too many requests are already in flight"),
             Self::InsecureRedirect => f.write_str("redirect downgrades https to http"),

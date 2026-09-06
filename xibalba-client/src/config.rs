@@ -59,14 +59,34 @@ pub struct Config {
 impl Config {
     /// # Errors
     ///
-    /// Returns [`xibalba_proto::error::ConnectionError::InfiniteReadTimeout`]
-    /// when `read_timeout` is `None`: silence budgets can only observe time
-    /// after a socket read returns.
+    /// - [`InfiniteReadTimeout`](xibalba_proto::error::ConnectionError::InfiniteReadTimeout)
+    ///   when `read_timeout` is `None`: silence budgets can only observe time
+    ///   after a socket read returns.
+    /// - [`ZeroDuration`](xibalba_proto::error::ConnectionError::ZeroDuration)
+    ///   when any timeout or budget is zero. A zero read timeout makes every
+    ///   read tick instantly and a zero budget is already spent when the
+    ///   first read starts, so every request fails immediately.
+    /// - [`TimeoutExceedsBudget`](xibalba_proto::error::ConnectionError::TimeoutExceedsBudget)
+    ///   when a per-read timeout is longer than a budget it subdivides. The
+    ///   budget is only consulted between reads, so one blocked read would
+    ///   overshoot it by the difference.
     pub(crate) const fn validate(&self) -> Result<(), xibalba_proto::error::Error> {
-        if self.read_timeout.is_none() {
-            return Err(xibalba_proto::error::Error::Connection(
-                xibalba_proto::error::ConnectionError::InfiniteReadTimeout,
-            ));
+        use xibalba_proto::error::{ConnectionError, Error};
+
+        let Some(read_timeout) = self.read_timeout else {
+            return Err(Error::Connection(ConnectionError::InfiniteReadTimeout));
+        };
+        if read_timeout.is_zero()
+            || self.head_silence.is_zero()
+            || self.stream_silence.is_zero()
+            || matches!(self.write_timeout, Some(w) if w.is_zero())
+        {
+            return Err(Error::Connection(ConnectionError::ZeroDuration));
+        }
+        if read_timeout.as_nanos() > self.head_silence.as_nanos()
+            || read_timeout.as_nanos() > self.stream_silence.as_nanos()
+        {
+            return Err(Error::Connection(ConnectionError::TimeoutExceedsBudget));
         }
         Ok(())
     }
