@@ -60,7 +60,7 @@ use crate::body::{BodyCollector, StreamingBody};
 use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 use crate::config::HEAD_BUF_SIZE;
 use crate::delivery::{ChunkSink, ChunkStream, ConsumerGuard};
-use crate::interrupt::Interrupt;
+use crate::interrupt::{Cancelled, Interrupt, InterruptibleStream, Latch};
 use crate::params::RequestParams;
 
 /// Default capacity for the per-request chunk ring: a few SSE
@@ -628,22 +628,24 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         extra_headers: headers,
         allow_replay: method.is_replay_eligible(),
     };
-    let send_result = client.send_head_interruptible(
-        &request_params,
-        ControlInterrupt {
-            control_rx,
-            pending,
-            ticket,
-            shutting_down,
-        },
-    );
+    // The latch, not the returned error, is what classifies a cancel: the
+    // `std::io::Error` payload marking one is dropped at the `proto::Error`
+    // boundary, which keeps only a kind and a message. Asking the interrupt
+    // whether it fired is authoritative.
+    let mut interrupt = Latch::new(ControlInterrupt {
+        control_rx,
+        pending,
+        ticket,
+        shutting_down,
+    });
+    let send_result = client.send_head_interruptible(&request_params, &mut interrupt);
 
     let (head_data, framing, tail_offset) = match send_result {
         Ok(parts) => parts,
-        // A cancel observed during the request write or head read arrives as
-        // Interrupted. Report it as Aborted, matching the body path, so the
-        // caller can tell its own cancellation from a transport failure.
-        Err(Error::Io(e)) if e.kind == std::io::ErrorKind::Interrupted => {
+        // Report a cancel during the request write or head read as Aborted,
+        // matching the body path, so the caller can tell its own cancellation
+        // from a transport failure.
+        Err(_) if interrupt.fired() => {
             sink.send_terminal(Chunk::Aborted);
             return;
         }
@@ -684,30 +686,24 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     }
 
     // Non-2xx: drain the body as a single chunk for the caller to inspect.
-    // It still runs through CancellableStream: an error response can stall
-    // exactly like a success response, and client drop/cancel must interrupt
-    // both paths.
+    // It still runs through the interrupt: an error response can stall exactly
+    // like a success response, and client drop/cancel must interrupt both.
     if !(200..300).contains(&status) {
         let tail = client.head_buf[tail_offset..].to_vec();
-        let mut cancellable = CancellableStream::new(
-            &mut client.stream,
-            control_rx,
-            pending,
-            ticket,
-            shutting_down,
-        );
+        let mut cancellable = InterruptibleStream::new(&mut client.stream, &mut interrupt);
         let mut collector = BodyCollector::new(
             client.config.max_response_body,
             client.config.stream_silence,
         );
-        match collector.read(&mut cancellable, &framing, &tail) {
+        let collected = collector.read(&mut cancellable, &framing, &tail);
+        match collected {
             Ok(bytes) => {
                 client.dirty = !collector.is_reusable() || !reuse.is_keep();
                 if !bytes.is_empty() && sink.send(Chunk::Body(bytes)).is_err() {
                     return;
                 }
             }
-            Err(Error::Io(error)) if error.kind == std::io::ErrorKind::Interrupted => {
+            Err(_) if interrupt.fired() => {
                 sink.send_terminal(Chunk::Aborted);
                 return;
             }
@@ -720,24 +716,15 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         return;
     }
 
-    // 2xx: streaming body. The cancel message is observed by the
-    // `CancellableStream` wrapper around the live connection; it
-    // checks the control channel at the start of every read, so the
-    // cancel is observed on the next read attempt (bounded by the
-    // client's `read_timeout`).
+    // 2xx: streaming body. The same interrupt covers it, checked at the start
+    // of every read, so a cancel is observed within one read timeout.
     //
     // `dirty` is already set above; `StreamingBody` clears it when the
     // body is read to completion, so cancelling/abandoning the stream
     // leaves the connection in a state the next request reconnects from.
     let tail = client.head_buf[tail_offset..].to_vec();
     let silence = client.config.stream_silence;
-    let mut cancellable = CancellableStream::new(
-        &mut client.stream,
-        control_rx,
-        pending,
-        ticket,
-        shutting_down,
-    );
+    let mut cancellable = InterruptibleStream::new(&mut client.stream, &mut interrupt);
     let mut body = StreamingBody::new(
         &mut cancellable,
         &mut client.dirty,
@@ -758,7 +745,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
                     return;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            Err(e) if Cancelled::marks(&e) => {
                 sink.send_terminal(Chunk::Aborted);
                 return;
             }
@@ -792,59 +779,5 @@ impl Interrupt for ControlInterrupt<'_> {
             Some(self.ticket),
             self.shutting_down,
         )
-    }
-}
-
-/// A read wrapper that returns `Interrupted` when a cancel message
-/// is waiting on the control channel.
-///
-/// The reader constructs one around the Client's stream before each
-/// read; the wrapper checks the channel at the start of every read,
-/// so the cancel is observed on the next read attempt (bounded by the
-/// client's `read_timeout`).
-pub struct CancellableStream<'a, S: Read> {
-    inner: &'a mut S,
-    control_rx: &'a mut MpscConsumer<Control>,
-    pending: &'a mut VecDeque<AsyncRequest>,
-    /// The in-flight request's ticket; only a cancel naming it (or
-    /// `CANCEL_ANY`) interrupts this stream.
-    ticket: u64,
-    /// Set when the owning [`AsyncClient`] is dropping; the next read
-    /// unwinds instead of waiting out the silence budget.
-    shutting_down: &'a AtomicBool,
-}
-
-impl<'a, S: Read> CancellableStream<'a, S> {
-    const fn new(
-        inner: &'a mut S,
-        control_rx: &'a mut MpscConsumer<Control>,
-        pending: &'a mut VecDeque<AsyncRequest>,
-        ticket: u64,
-        shutting_down: &'a AtomicBool,
-    ) -> Self {
-        Self {
-            inner,
-            control_rx,
-            pending,
-            ticket,
-            shutting_down,
-        }
-    }
-}
-
-impl<S: Read> Read for CancellableStream<'_, S> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if poll_control(
-            self.control_rx,
-            self.pending,
-            Some(self.ticket),
-            self.shutting_down,
-        ) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "request cancelled",
-            ));
-        }
-        self.inner.read(buf)
     }
 }
