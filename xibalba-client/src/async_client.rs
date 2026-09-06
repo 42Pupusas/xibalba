@@ -197,9 +197,24 @@ pub struct StreamHandle {
 }
 
 impl StreamHandle {
-    /// Signal the reader to abandon this response. The next body read
-    /// observes the cancel message, pushes [`Chunk::Aborted`], and the
-    /// handle yields no more chunks.
+    /// Signal the reader to abandon this request. The next request write,
+    /// response-head read, or body read observes the cancel, pushes
+    /// [`Chunk::Aborted`], and the handle yields no more chunks.
+    ///
+    /// How soon that happens depends on where the request is:
+    ///
+    /// | Stage | Observed within |
+    /// |-------|-----------------|
+    /// | Queued, not yet written | immediately, before reaching the wire |
+    /// | Request write | one `write_timeout` tick |
+    /// | Response head | one `read_timeout` tick |
+    /// | Response body | one `read_timeout` tick |
+    /// | Connect / TLS handshake | **not bounded** |
+    ///
+    /// The write bound holds only for connectors implementing
+    /// [`set_write_timeout`](crate::connector::SetReadTimeout::set_write_timeout).
+    /// A connect or handshake in progress is inside `Connector::connect` and
+    /// cannot be interrupted by this call.
     ///
     /// Idempotent: sending a second cancel is a no-op.
     ///
@@ -427,10 +442,11 @@ impl<const MAX_HEAD_SIZE: usize> Drop for AsyncClient<MAX_HEAD_SIZE> {
         }
         drop(self.control_tx.take());
 
-        // Best-effort join: the flag above bounds the wait to at most one
-        // read-timeout window; if the reader is wedged below the kernel's
-        // cancel reach (e.g. a stuck TLS handshake), we don't hang the
-        // drop indefinitely.
+        // The flag above bounds this join to one read-timeout tick while the
+        // reader waits on a head or body, and one write-timeout tick while it
+        // writes a request. It is *not* bounded when the reader is inside
+        // `Connector::connect`: a stuck DNS lookup, TCP connect, or TLS
+        // handshake is beyond this flag's reach and drop waits for it.
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }

@@ -54,6 +54,10 @@ These compile without error and return different results. Check them first.
 - **The reason phrase is validated.** A phrase containing NUL or another C0
   control now fails with `ParseError::InvalidReasonPhrase`; HTAB and obs-text
   remain accepted.
+- **A cancel during a request write or response head now aborts it.**
+  Cancellation covered body reads only, so a head that never arrived pinned
+  the request for the whole `head_silence` budget and `cancel`/`drop` waited
+  it out. The cancel is reported as `Chunk::Aborted`, matching the body path.
 
 - **`HeaderName` comparison is now case-insensitive for unrecognized names.**
   `HeaderName::from_bytes(b"X-Custom") == HeaderName::from_bytes(b"x-custom")`
@@ -100,6 +104,14 @@ These compile without error and return different results. Check them first.
   InvalidTransferEncoding, UnsupportedTransferCoding}`.
 - New `xibalba_proto::coding` module with `TransferCodings` and
   `TransferCoding`, which own `Transfer-Encoding` list parsing.
+- `SetReadTimeout` gains `set_write_timeout`, defaulted to a no-op so existing
+  connectors keep compiling. A peer that stops reading blocks `write_all`
+  inside one syscall, where no cancellation check is reached; a connector that
+  leaves the default in place is declaring its writes cannot block
+  indefinitely. `Config::write_timeout` sets the value (30 s by default).
+- New `xibalba_client::interrupt` module with `Interrupt`,
+  `InterruptibleStream`, and `NeverCancelled`, the seam through which a caller
+  that can cancel tells the client to stop between I/O calls.
 - `AsyncClient::submit` returns `ConnectionError::TooManyRequests` once
   `DEFAULT_MAX_OUTSTANDING` requests are in flight, and no longer blocks when
   the control ring is full. This is backpressure, not a transport failure.
