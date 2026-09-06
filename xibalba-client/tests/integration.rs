@@ -862,6 +862,50 @@ fn get_until_close_response() {
 }
 
 #[test]
+fn gzip_transfer_coding_surfaces_as_an_error() {
+    // Transfer-coded gzip is not something this client can decode. Returning
+    // the bytes as the body hands the caller compressed data presented as the
+    // decoded response, with nothing indicating it is still encoded.
+    let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n\x1f\x8b\x08";
+    let (port, server) = one_shot_server(response);
+    let mut client = connect(port);
+
+    let err = client
+        .request(Method::Get, b"/", None, None)
+        .expect_err("an undecodable transfer coding must surface");
+    assert!(
+        matches!(
+            err,
+            Error::Parse(xibalba_client::proto::error::ParseError::UnsupportedTransferCoding)
+        ),
+        "expected UnsupportedTransferCoding, got {err:?}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn gzip_over_chunked_surfaces_as_an_error() {
+    // The dangerous shape: framing is readable, so the body was dechunked and
+    // returned while still gzip-encoded.
+    let response =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+    let (port, server) = one_shot_server(response);
+    let mut client = connect(port);
+
+    let err = client
+        .request(Method::Get, b"/", None, None)
+        .expect_err("a chunked body still gzip-coded must surface");
+    assert!(
+        matches!(
+            err,
+            Error::Parse(xibalba_client::proto::error::ParseError::UnsupportedTransferCoding)
+        ),
+        "expected UnsupportedTransferCoding, got {err:?}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn response_headers_accessible() {
     let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nhi";
     let (port, server) = one_shot_server(response);

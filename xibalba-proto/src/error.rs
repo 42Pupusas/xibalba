@@ -88,6 +88,16 @@ pub enum ParseError {
     TooManyHeaders,
     /// `Content-Length` value is not valid ASCII digits.
     InvalidContentLength,
+    /// The reason phrase contains a byte outside HTAB / SP / VCHAR /
+    /// obs-text.
+    InvalidReasonPhrase,
+    /// `Transfer-Encoding` violates the grammar: `chunked` appears more than
+    /// once, or a coding is empty.
+    InvalidTransferEncoding,
+    /// `Transfer-Encoding` names a coding this client cannot decode, such as
+    /// `gzip`. Framing the body anyway would present still-encoded bytes as
+    /// the decoded response.
+    UnsupportedTransferCoding,
     /// Chunked encoding: chunk size line is malformed.
     InvalidChunkSize,
     /// Chunked encoding: expected CRLF but got something else.
@@ -187,6 +197,9 @@ impl fmt::Display for ParseError {
             Self::InvalidHeaderValue => "invalid header value byte",
             Self::TooManyHeaders => "caller header buffer is too small",
             Self::InvalidContentLength => "invalid Content-Length value",
+            Self::InvalidReasonPhrase => "invalid reason phrase",
+            Self::InvalidTransferEncoding => "invalid transfer-encoding",
+            Self::UnsupportedTransferCoding => "unsupported transfer coding",
             Self::InvalidChunkSize => "invalid chunk size",
             Self::InvalidChunkTerminator => "invalid chunk terminator",
             Self::InvalidChunkMetadata => "chunk extension or trailer is invalid or too large",

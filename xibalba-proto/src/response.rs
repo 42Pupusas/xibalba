@@ -1,4 +1,5 @@
 use crate::bytes::ByteSliceExt;
+use crate::coding::{TransferCoding, TransferCodings};
 use crate::error::{ConnectionError, Error, ParseError};
 use crate::header::{Header, HeaderName, Tchar};
 use crate::status::StatusCode;
@@ -46,6 +47,16 @@ impl<'a> ResponseHead<'a> {
             Some(b' ') => &status_line[13..],
             Some(_) => return Err(ParseError::InvalidStatusCode.into()),
         };
+        // reason-phrase = *( HTAB / SP / VCHAR / obs-text ). CR and LF cannot
+        // appear (the line ended at CRLF), but NUL and the other C0 controls
+        // otherwise reach the caller inside a field the grammar forbids them
+        // from occupying.
+        if reason
+            .iter()
+            .any(|&b| b != b'\t' && (b < 0x20 || b == 0x7f))
+        {
+            return Err(ParseError::InvalidReasonPhrase.into());
+        }
 
         let mut pos = status_line_end + 2;
         let mut count = 0;
@@ -220,8 +231,12 @@ impl BodyFraming {
 
         let hdrs = &headers[..header_count];
 
-        if let Some(framing) = Self::from_transfer_encoding(hdrs) {
-            return Ok(framing);
+        match TransferCodings::parse(hdrs)? {
+            TransferCoding::Chunked => return Ok(Self::Chunked),
+            // A header applying no encoding still takes precedence over
+            // Content-Length, and leaves the body delimited by the close.
+            TransferCoding::Identity => return Ok(Self::UntilClose),
+            TransferCoding::Absent => {}
         }
 
         let mut content_length: Option<u64> = None;
@@ -243,35 +258,6 @@ impl BodyFraming {
         }
 
         Ok(Self::UntilClose)
-    }
-
-    /// Framing dictated by `Transfer-Encoding`, or `None` when the
-    /// header is absent. The codings of every `Transfer-Encoding`
-    /// header form one list in order; only a trailing `chunked` frames
-    /// the body.
-    fn from_transfer_encoding(headers: &[Header<'_>]) -> Option<Self> {
-        let mut last_coding: Option<&[u8]> = None;
-        for h in headers {
-            if h.name != HeaderName::TransferEncoding {
-                continue;
-            }
-            for coding in h.value.split(|&b| b == b',') {
-                let coding = coding.trim_ows();
-                if !coding.is_empty() {
-                    last_coding = Some(coding);
-                }
-            }
-            if last_coding.is_none() {
-                last_coding = Some(b"");
-            }
-        }
-        last_coding.map(|coding| {
-            if coding.ascii_eq_ignore_case(b"chunked") {
-                Self::Chunked
-            } else {
-                Self::UntilClose
-            }
-        })
     }
 }
 
@@ -1394,22 +1380,43 @@ mod tests {
 
     #[test]
     fn transfer_encoding_not_chunked() {
+        // gzip is a coding this client cannot undo. Framing the body as
+        // UntilClose would present compressed bytes as the response body.
         let headers = [Header {
             name: HeaderName::TransferEncoding,
             value: b"gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
-            BodyFraming::UntilClose
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            ParseError::UnsupportedTransferCoding
         );
     }
 
     #[test]
     fn transfer_encoding_overrides_content_length() {
+        // Transfer-Encoding still takes precedence over Content-Length: the
+        // unsupported coding decides the outcome, not the length header.
         let headers = [
             Header {
                 name: HeaderName::TransferEncoding,
                 value: b"gzip",
+            },
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"42",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            ParseError::UnsupportedTransferCoding
+        );
+
+        // identity applies no encoding, so the precedence is still visible
+        // without an unsupported coding masking it.
+        let headers = [
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"identity",
             },
             Header {
                 name: HeaderName::ContentLength,
@@ -1423,19 +1430,39 @@ mod tests {
     }
 
     #[test]
-    fn chunked_not_final_coding_is_until_close() {
+    fn chunked_before_another_coding_is_rejected() {
+        // chunked delimits the body, so a coding applied after it would have
+        // to be decoded before the framing could be read.
         let headers = [Header {
             name: HeaderName::TransferEncoding,
             value: b"chunked, gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
-            BodyFraming::UntilClose
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            ParseError::InvalidTransferEncoding
         );
     }
 
     #[test]
     fn chunked_final_across_multiple_transfer_encoding_headers() {
+        // The codings of every header form one list in order, so a trailing
+        // chunked frames the body even when split across headers.
+        let headers = [
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"identity",
+            },
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"Chunked",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::Chunked
+        );
+
+        // The same list with an undecodable coding underneath is refused.
         let headers = [
             Header {
                 name: HeaderName::TransferEncoding,
@@ -1447,8 +1474,8 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
-            BodyFraming::Chunked
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            ParseError::UnsupportedTransferCoding
         );
     }
 
@@ -1471,7 +1498,80 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_transfer_encoding_both_chunked() {
+    fn reason_phrase_with_nul_is_rejected() {
+        // The status line ends at CRLF, so a reason phrase cannot contain
+        // CR or LF -- but NUL and the other C0 controls reach the caller as
+        // part of a field the RFC restricts to HTAB / SP / VCHAR / obs-text.
+        let raw = b"HTTP/1.1 200 O\0K\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        assert_eq!(
+            ResponseHead::parse(raw, &mut headers).unwrap_err(),
+            Error::Parse(ParseError::InvalidReasonPhrase)
+        );
+    }
+
+    #[test]
+    fn reason_phrase_allows_tab_and_obs_text() {
+        // The permitted set is wider than ASCII graphic characters; the
+        // check must not reject phrases servers legitimately send.
+        let raw = b"HTTP/1.1 200 OK\tdone\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let (head, _) = ResponseHead::parse(raw, &mut headers).expect("HTAB is permitted");
+        assert_eq!(head.reason, b"OK\tdone");
+
+        let raw = b"HTTP/1.1 200 caf\xc3\xa9\r\n\r\n";
+        let mut headers = [const { Header::empty() }; 4];
+        let (head, _) = ResponseHead::parse(raw, &mut headers).expect("obs-text is permitted");
+        assert_eq!(head.reason, b"caf\xc3\xa9");
+    }
+
+    #[test]
+    fn unsupported_transfer_coding_is_rejected() {
+        // gzip is a transfer coding this client cannot decode. Framing the
+        // body as UntilClose hands the caller compressed bytes as though they
+        // were the response body.
+        let headers = [Header {
+            name: HeaderName::TransferEncoding,
+            value: b"gzip",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            ParseError::UnsupportedTransferCoding
+        );
+    }
+
+    #[test]
+    fn chunked_over_an_unsupported_coding_is_rejected() {
+        // "gzip, chunked" was dechunked and returned as the body, still gzip
+        // transfer-coded, with no indication anything was left encoded.
+        let headers = [Header {
+            name: HeaderName::TransferEncoding,
+            value: b"gzip, chunked",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            ParseError::UnsupportedTransferCoding
+        );
+    }
+
+    #[test]
+    fn repeated_chunked_is_rejected() {
+        // RFC 9112 6.1: chunked must not be applied more than once. Accepting
+        // it is a framing difference an intermediary may not share.
+        let headers = [Header {
+            name: HeaderName::TransferEncoding,
+            value: b"chunked, chunked",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            ParseError::InvalidTransferEncoding
+        );
+    }
+
+    #[test]
+    fn repeated_chunked_across_headers_is_rejected() {
+        // The codings of every Transfer-Encoding header form one list, so
+        // splitting the repeat across two headers must not evade the check.
         let headers = [
             Header {
                 name: HeaderName::TransferEncoding,
@@ -1483,8 +1583,43 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
-            BodyFraming::Chunked
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            ParseError::InvalidTransferEncoding
+        );
+    }
+
+    #[test]
+    fn identity_coding_is_accepted_as_unframed() {
+        // "identity" applies no encoding, so it neither frames the body nor
+        // leaves it encoded.
+        let headers = [Header {
+            name: HeaderName::TransferEncoding,
+            value: b"identity",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
+            BodyFraming::UntilClose
+        );
+    }
+
+    #[test]
+    fn duplicate_transfer_encoding_both_chunked() {
+        // Previously accepted as Chunked. RFC 9112 6.1 forbids applying
+        // chunked more than once, and accepting it is a framing difference an
+        // intermediary may not share.
+        let headers = [
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"chunked",
+            },
+            Header {
+                name: HeaderName::TransferEncoding,
+                value: b"chunked",
+            },
+        ];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            ParseError::InvalidTransferEncoding
         );
     }
 

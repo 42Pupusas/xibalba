@@ -1,4 +1,5 @@
 pub mod bytes;
+pub mod coding;
 pub mod error;
 
 pub use method::Token;
