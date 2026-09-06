@@ -41,6 +41,19 @@ impl Method {
             Self::Patch => "PATCH",
         }
     }
+
+    /// Whether resending after an ambiguous transport failure cannot repeat
+    /// a side effect: the request only reads, or its semantics are defined
+    /// as idempotent or safe to repeat by RFC 9110 §9.2.2. POST and PATCH
+    /// are excluded because a server may already have applied them when the
+    /// response went missing.
+    #[must_use]
+    pub const fn is_replay_eligible(self) -> bool {
+        matches!(
+            self,
+            Self::Get | Self::Head | Self::Put | Self::Delete | Self::Options | Self::Trace
+        )
+    }
 }
 
 impl Token for Method {

@@ -17,6 +17,7 @@ pub(crate) struct RedirectState {
     query: Option<Vec<u8>>,
     body: Option<Vec<u8>>,
     extra_headers: Vec<(Vec<u8>, Vec<u8>)>,
+    allow_replay: bool,
 }
 
 impl RedirectState {
@@ -27,6 +28,7 @@ impl RedirectState {
             query: params.query.map(<[u8]>::to_vec),
             body: params.body.map(<[u8]>::to_vec),
             extra_headers: params.extra_headers.clone(),
+            allow_replay: params.allow_replay,
         }
     }
 
@@ -37,6 +39,7 @@ impl RedirectState {
             query: self.query.as_deref(),
             body: self.body.as_deref(),
             extra_headers: self.extra_headers.clone(),
+            allow_replay: self.allow_replay,
         }
     }
 
@@ -201,6 +204,7 @@ mod tests {
                 .iter()
                 .map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec()))
                 .collect(),
+            allow_replay: true,
         }
     }
 
@@ -249,6 +253,7 @@ mod tests {
             query: Some(b"a=1"),
             body: Some(b"payload"),
             extra_headers: Vec::new(),
+            allow_replay: false,
         });
         state.apply_method_redirect(StatusCode::MOVED_PERMANENTLY);
         let p = state.to_params();

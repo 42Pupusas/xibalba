@@ -559,6 +559,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         query: query.as_deref(),
         body: body.as_deref(),
         extra_headers: headers,
+        allow_replay: method.is_replay_eligible(),
     };
     let send_result = client.send_head(&request_params);
 

@@ -70,6 +70,16 @@ impl StreamPlan {
     fn serving(response: &[u8]) -> Self {
         Self::serving_each(&[response])
     }
+
+    /// Accept a whole request and answer with nothing. The client reads a
+    /// clean EOF, the signature of a keep-alive connection the server had
+    /// already closed.
+    fn silently_closed() -> Self {
+        Self {
+            responses: VecDeque::new(),
+            ..Self::healthy()
+        }
+    }
 }
 
 thread_local! {
@@ -458,6 +468,71 @@ fn switching_protocols_connection_is_never_reused() {
         Script::connects(),
         2,
         "an upgraded connection is no longer carrying HTTP and must not be reused"
+    );
+}
+
+#[test]
+fn post_is_not_replayed_after_an_ambiguous_failure() {
+    // The server may have applied the POST and lost the response on the way
+    // back. Resending would apply it twice, so the error must surface.
+    Script::load(&[StreamPlan::silently_closed(), StreamPlan::healthy()]);
+    let mut client = ScriptedConnector::client();
+
+    client
+        .post(b"/charge", b"amount=100")
+        .expect_err("an ambiguous POST failure must surface, not be retried");
+
+    assert_eq!(
+        Script::connects(),
+        1,
+        "a non-idempotent request must not be resent on a fresh connection"
+    );
+    assert!(
+        !Script::sent_on(0).is_empty(),
+        "the POST is expected to have reached the wire once"
+    );
+}
+
+#[test]
+fn get_is_still_replayed_after_a_stale_keepalive() {
+    // The counterpart: replay-eligible methods must keep their retry, or the
+    // fix for POST would be a regression for every idle keep-alive.
+    Script::load(&[StreamPlan::silently_closed(), StreamPlan::serving(RESPONSE)]);
+    let mut client = ScriptedConnector::client();
+
+    let response = client
+        .get(b"/read")
+        .expect("a stale keep-alive must be retried transparently for GET");
+
+    assert_eq!(response.text().unwrap(), "hi");
+    assert_eq!(
+        Script::connects(),
+        2,
+        "the retry must run on a fresh connection"
+    );
+}
+
+#[test]
+fn post_is_replayed_when_the_caller_opts_in() {
+    // An endpoint keyed by an idempotency token is safe to resend, but only
+    // the caller can know that.
+    Script::load(&[StreamPlan::silently_closed(), StreamPlan::serving(RESPONSE)]);
+    let mut client = ScriptedConnector::client();
+
+    let request = client
+        .build(xibalba_client::proto::method::Method::Post, b"/charge")
+        .header(b"Idempotency-Key", b"abc123")
+        .body(b"amount=100")
+        .allow_replay(true);
+    let response = client
+        .send(request)
+        .expect("an opted-in POST must be retried");
+
+    assert_eq!(response.text().unwrap(), "hi");
+    assert_eq!(
+        Script::connects(),
+        2,
+        "the opted-in retry must run on a fresh connection"
     );
 }
 

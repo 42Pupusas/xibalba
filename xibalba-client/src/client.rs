@@ -129,6 +129,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             query,
             body,
             extra_headers: Vec::new(),
+            allow_replay: method.is_replay_eligible(),
         })
     }
 
@@ -263,7 +264,11 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
         match self.send_head_once(params) {
             Ok(head) => Ok(head),
-            Err(e) if Self::is_stale_connection(&e) && self.head_buf.is_empty() => {
+            Err(e)
+                if params.allow_replay
+                    && Self::is_stale_connection(&e)
+                    && self.head_buf.is_empty() =>
+            {
                 self.reconnect_same_host()?;
                 self.send_head_once(params)
             }

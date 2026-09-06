@@ -16,6 +16,10 @@ pub(crate) struct RequestParams<'a> {
     /// the `Location` header, so extra headers cannot share one lifetime
     /// with the original request data.
     pub(crate) extra_headers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Whether this request may be resent after an ambiguous transport
+    /// failure. The client resends automatically only when the method is
+    /// replay-eligible and this is set; see [`Method::is_replay_eligible`].
+    pub(crate) allow_replay: bool,
 }
 
 impl RequestParams<'_> {
@@ -80,6 +84,7 @@ pub struct RequestBuilder<'a> {
     query: Option<&'a [u8]>,
     body: Option<&'a [u8]>,
     extra_headers: Vec<(&'a [u8], &'a [u8])>,
+    allow_replay: bool,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -90,7 +95,21 @@ impl<'a> RequestBuilder<'a> {
             query: None,
             body: None,
             extra_headers: Vec::new(),
+            allow_replay: method.is_replay_eligible(),
         }
+    }
+
+    /// Allow this request to be resent after an ambiguous transport
+    /// failure even when its method is not replay-eligible.
+    ///
+    /// A resend can repeat a side effect the server already applied but
+    /// whose response was lost. Set this only when the endpoint is
+    /// idempotent by construction, such as one keyed by an
+    /// caller-supplied idempotency token.
+    #[must_use]
+    pub const fn allow_replay(mut self, allow: bool) -> Self {
+        self.allow_replay = allow;
+        self
     }
 
     /// Attach a header to the request. Multiple `Cookie` headers are
@@ -151,6 +170,7 @@ impl<'a> RequestBuilder<'a> {
                 .iter()
                 .map(|(n, v)| (n.to_vec(), v.to_vec()))
                 .collect(),
+            allow_replay: self.allow_replay,
         };
         RequestParams::validate_extra_headers(&params.extra_headers)?;
         Ok(params)
