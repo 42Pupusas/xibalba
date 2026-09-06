@@ -96,6 +96,7 @@ impl<'a> Url<'a> {
                 .position(|&b| b == b']')
                 .ok_or(UrlError::InvalidByte(0))?;
             let host = &authority[..=bracket_end];
+            Self::validate_ip_literal(&authority[1..bracket_end])?;
             let after_bracket = &authority[bracket_end + 1..];
             if after_bracket.is_empty() {
                 Ok((host, None))
@@ -105,16 +106,70 @@ impl<'a> Url<'a> {
             } else {
                 Err(UrlError::InvalidByte(bracket_end + 1).into())
             }
+        } else if let Some(colon_pos) = authority.iter().rposition(|&b| b == b':') {
+            let host = &authority[..colon_pos];
+            Self::validate_reg_name(host)?;
+            let port = Self::parse_port(&authority[colon_pos + 1..])?;
+            Ok((host, Some(port)))
         } else {
-            match authority.iter().rposition(|&b| b == b':') {
-                Some(colon_pos) => {
-                    let host = &authority[..colon_pos];
-                    let port = Self::parse_port(&authority[colon_pos + 1..])?;
-                    Ok((host, Some(port)))
-                }
-                None => Ok((authority, None)),
+            Self::validate_reg_name(authority)?;
+            Ok((authority, None))
+        }
+    }
+
+    /// Check the bytes between brackets look like an `IP-literal`
+    /// (RFC 3986 §3.2.2): an IPv6 address, optionally with a zone ID, or an
+    /// `IPvFuture` form. A reg-name in brackets is malformed rather than a
+    /// hostname, and empty brackets name no host at all.
+    fn validate_ip_literal(inner: &[u8]) -> Result<(), Error> {
+        if inner.is_empty() {
+            return Err(UrlError::InvalidByte(1).into());
+        }
+        if inner[0] == b'v' || inner[0] == b'V' {
+            return Self::validate_ipvfuture(inner);
+        }
+        // A zone ID is separated by a percent-encoded '%' ("%25"); only the
+        // address part is subject to the IPv6 character set.
+        let address = inner
+            .windows(3)
+            .position(|w| w == b"%25")
+            .map_or(inner, |pos| &inner[..pos]);
+        if address.is_empty() || !address.contains(&b':') {
+            return Err(UrlError::InvalidByte(1).into());
+        }
+        for (i, &b) in address.iter().enumerate() {
+            if !b.is_ascii_hexdigit() && b != b':' && b != b'.' {
+                return Err(UrlError::InvalidByte(i + 1).into());
             }
         }
+        Ok(())
+    }
+
+    /// `IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )`
+    fn validate_ipvfuture(inner: &[u8]) -> Result<(), Error> {
+        let dot = inner
+            .iter()
+            .position(|&b| b == b'.')
+            .ok_or(UrlError::InvalidByte(1))?;
+        let version = &inner[1..dot];
+        let rest = &inner[dot + 1..];
+        if version.is_empty() || rest.is_empty() || !version.iter().all(u8::is_ascii_hexdigit) {
+            return Err(UrlError::InvalidByte(1).into());
+        }
+        Ok(())
+    }
+
+    /// Check an unbracketed host is a `reg-name`: no colons (the port
+    /// delimiter has already been split off) and no brackets, which belong
+    /// only to an IP-literal.
+    fn validate_reg_name(host: &[u8]) -> Result<(), Error> {
+        if let Some(pos) = host
+            .iter()
+            .position(|&b| b == b':' || b == b'[' || b == b']')
+        {
+            return Err(UrlError::InvalidByte(pos).into());
+        }
+        Ok(())
     }
 
     /// Bytes allowed in a host: `reg-name` / `IPv4address` / bracketed
@@ -465,6 +520,49 @@ mod tests {
         input.extend_from_slice(b"/path");
         let url = Url::parse(&input).unwrap();
         assert_eq!(url.host.len(), 256);
+    }
+
+    #[test]
+    fn empty_bracket_literal_rejected() {
+        // "[]" contains no address at all. Accepting it hands a connector an
+        // authority it cannot resolve.
+        assert!(Url::parse(b"http://[]/").is_err());
+    }
+
+    #[test]
+    fn bracket_literal_must_look_like_an_ip() {
+        // A bracketed literal is an IP-literal by definition; a reg-name in
+        // brackets is malformed, not a hostname.
+        assert!(Url::parse(b"http://[not-an-ip]/").is_err());
+        assert!(Url::parse(b"http://[example.com]/").is_err());
+    }
+
+    #[test]
+    fn unbracketed_host_rejects_extra_colons() {
+        // "a:b:80" parses as host "a:b" with port 80, so a colon inside an
+        // unbracketed reg-name silently becomes part of the host.
+        assert!(Url::parse(b"http://a:b:80/").is_err());
+    }
+
+    #[test]
+    fn unbracketed_host_rejects_brackets() {
+        // Brackets delimit an IP-literal; inside a reg-name they are junk.
+        assert!(Url::parse(b"http://ex[ample.com/").is_err());
+        assert!(Url::parse(b"http://example]com/").is_err());
+    }
+
+    #[test]
+    fn valid_ipv6_literals_are_still_accepted() {
+        // The stricter check must not reject real IP literals.
+        assert_eq!(Url::parse(b"http://[::1]/").unwrap().host, b"[::1]");
+        assert_eq!(
+            Url::parse(b"http://[2001:db8::1]:8080/").unwrap().host,
+            b"[2001:db8::1]"
+        );
+        assert_eq!(
+            Url::parse(b"http://[fe80::1%25eth0]/").unwrap().host,
+            b"[fe80::1%25eth0]"
+        );
     }
 
     #[test]
