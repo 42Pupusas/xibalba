@@ -637,12 +637,17 @@ impl HexDigit {
 
 pub const MAX_HEADERS: usize = 64;
 
+/// Largest response head, in bytes, whose header positions can be
+/// represented. Offsets are `u32`, so this is the ceiling a
+/// `MAX_HEAD_SIZE` const generic can usefully take.
+pub const MAX_ADDRESSABLE_HEAD: usize = u32::MAX as usize;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HeaderRange {
-    pub name_start: u16,
-    pub name_len: u16,
-    pub value_start: u16,
-    pub value_len: u16,
+    pub name_start: u32,
+    pub name_len: u32,
+    pub value_start: u32,
+    pub value_len: u32,
 }
 
 impl HeaderRange {
@@ -653,7 +658,7 @@ impl HeaderRange {
     /// Returns [`ParseError::TooManyHeaders`] if `headers` exceeds
     /// [`MAX_HEADERS`], [`ConnectionError::HeaderNotInBuffer`] if a header name
     /// cannot be located in `src`, or [`ConnectionError::HeaderRangeOverflow`]
-    /// if any offset or length overflows `u16`.
+    /// if any offset or length exceeds [`MAX_ADDRESSABLE_HEAD`].
     pub fn build_ranges(headers: &[Header<'_>], src: &[u8]) -> Result<[Self; MAX_HEADERS], Error> {
         if headers.len() > MAX_HEADERS {
             return Err(ParseError::TooManyHeaders.into());
@@ -696,10 +701,10 @@ impl HeaderRange {
     ) -> Result<Self, Error> {
         let overflow = |_| Error::from(ConnectionError::HeaderRangeOverflow);
         Ok(Self {
-            name_start: u16::try_from(name_start).map_err(overflow)?,
-            name_len: u16::try_from(name_len).map_err(overflow)?,
-            value_start: u16::try_from(value_start).map_err(overflow)?,
-            value_len: u16::try_from(value_len).map_err(overflow)?,
+            name_start: u32::try_from(name_start).map_err(overflow)?,
+            name_len: u32::try_from(name_len).map_err(overflow)?,
+            value_start: u32::try_from(value_start).map_err(overflow)?,
+            value_len: u32::try_from(value_len).map_err(overflow)?,
         })
     }
 }
@@ -1764,31 +1769,23 @@ mod tests {
             },
         ];
         let ranges = HeaderRange::build_ranges(&headers, src).unwrap();
-        assert_eq!(
-            &src[usize::from(ranges[0].name_start)
-                ..usize::from(ranges[0].name_start) + usize::from(ranges[0].name_len)],
-            b"Content-Length"
-        );
-        assert_eq!(
-            &src[usize::from(ranges[0].value_start)
-                ..usize::from(ranges[0].value_start) + usize::from(ranges[0].value_len)],
-            b"42"
-        );
-        assert_eq!(
-            &src[usize::from(ranges[1].name_start)
-                ..usize::from(ranges[1].name_start) + usize::from(ranges[1].name_len)],
-            b"Server"
-        );
-        assert_eq!(
-            &src[usize::from(ranges[1].value_start)
-                ..usize::from(ranges[1].value_start) + usize::from(ranges[1].value_len)],
-            b"test"
-        );
+        let slice = |range: &HeaderRange, name: bool| {
+            let (start, len) = if name {
+                (range.name_start as usize, range.name_len as usize)
+            } else {
+                (range.value_start as usize, range.value_len as usize)
+            };
+            &src[start..start + len]
+        };
+        assert_eq!(slice(&ranges[0], true), b"Content-Length");
+        assert_eq!(slice(&ranges[0], false), b"42");
+        assert_eq!(slice(&ranges[1], true), b"Server");
+        assert_eq!(slice(&ranges[1], false), b"test");
     }
 
     #[test]
     fn build_ranges_overflow_fails() {
-        let oversized = usize::from(u16::MAX) + 1;
+        let oversized = MAX_ADDRESSABLE_HEAD + 1;
         assert_eq!(
             HeaderRange::from_parts(oversized, 1, 0, 0).unwrap_err(),
             Error::Connection(ConnectionError::HeaderRangeOverflow)
@@ -1797,5 +1794,41 @@ mod tests {
             HeaderRange::from_parts(0, oversized, 0, 0).unwrap_err(),
             Error::Connection(ConnectionError::HeaderRangeOverflow)
         );
+    }
+
+    #[test]
+    fn offsets_past_64_kib_are_representable() {
+        // The README suggests a 128 KiB head limit. With u16 offsets a header
+        // positioned past 64 KiB failed with HeaderRangeOverflow, so that
+        // limit could not be used as documented.
+        let past_64k = usize::from(u16::MAX) + 1;
+        let range = HeaderRange::from_parts(past_64k, 4, past_64k + 6, 2)
+            .expect("a header beyond 64 KiB must be addressable");
+        assert_eq!(range.name_start as usize, past_64k);
+        assert_eq!(range.value_start as usize, past_64k + 6);
+    }
+
+    #[test]
+    fn a_header_positioned_past_64_kib_builds_its_range() {
+        // The same limit reached through the public entry point, with the
+        // header genuinely sitting beyond the old ceiling.
+        let mut src = b"HTTP/1.1 200 OK\r\n".to_vec();
+        src.extend_from_slice(b"X-Pad: ");
+        src.extend(std::iter::repeat_n(b'p', 70_000));
+        src.extend_from_slice(b"\r\nServer: late\r\n\r\n");
+
+        let value_start = src
+            .windows(4)
+            .position(|w| w == b"late")
+            .expect("the late header is present");
+        assert!(value_start > usize::from(u16::MAX));
+
+        let headers = [Header {
+            name: HeaderName::Server,
+            value: &src[value_start..value_start + 4],
+        }];
+        let ranges = HeaderRange::build_ranges(&headers, &src)
+            .expect("a late header must not overflow its range");
+        assert_eq!(ranges[0].value_start as usize, value_start);
     }
 }

@@ -98,9 +98,19 @@ the one passed in.
 
 ## Response-head limits
 
-`Client` and `AsyncClient` bound a response status line plus headers at 64 KiB
-by default. API gateways often add tracing and rate-limit headers, so the
-limit is intentionally larger than the read buffer. Set an integration-specific
+Two separate limits apply to a response head, and they are not derived from
+each other:
+
+| Limit | Value | Set by |
+|-------|-------|--------|
+| Head size in bytes | 64 KiB by default, up to 4 GiB | `MAX_HEAD_SIZE` const generic |
+| Header count | 64, fixed | `xibalba_proto::response::MAX_HEADERS` |
+
+A head within the byte limit is still rejected with `TooManyHeaders` if it
+carries more than 64 header fields.
+
+API gateways often add tracing and rate-limit headers, so the byte limit is
+intentionally larger than the read buffer. Set an integration-specific
 compile-time bound with the const generic when needed:
 
 ```rust

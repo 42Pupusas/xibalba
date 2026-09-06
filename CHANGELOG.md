@@ -17,6 +17,34 @@ hangs surface as errors, and speeds up header parsing. Both crates break API.
 
 These compile without error and return different results. Check them first.
 
+- **Redirects that downgrade https to http are refused.**
+  A `Location` of `http://...` from an https origin now fails with
+  `ConnectionError::InsecureRedirect` instead of being followed onto a
+  plaintext connection. The target is no longer contacted at all.
+- **Non-idempotent requests are no longer retried automatically.**
+  A POST or PATCH whose response is lost to an ambiguous transport failure
+  surfaces the error rather than being resent, since the server may already
+  have applied it. Opt back in per request with
+  `RequestBuilder::allow_replay(true)` where the endpoint is idempotent by
+  construction. GET and the other replay-eligible methods are unchanged.
+- **The redirect hop budget is checked before the next hop is contacted.**
+  With `max_redirects = 0` the client previously opened a connection to the
+  redirect target and then discarded it; it now returns `TooManyRedirects`
+  without connecting.
+- **Relative redirects resolve dot segments.** `/a/b` + `../c` now requests
+  `/c`, previously `/a/../c`.
+- **A `Location` with an uppercase scheme is treated as absolute.**
+  `HTTPS://host/x` was previously handled as a relative path.
+- **Rewriting POST to GET drops representation headers.** `Content-Type`,
+  `Content-Encoding`, `Content-Language` and `Content-Location` no longer
+  survive onto the bodyless GET.
+- **Truncated response heads report `ParseError::Incomplete`.** A partial
+  header name previously returned `MissingColon`, and a head split inside its
+  final CRLF returned `InvalidHeaderName`.
+- **Chunk extensions and trailers are bounded and validated.** Metadata past
+  `MAX_CHUNK_EXTENSION`/`MAX_TRAILER_SECTION`, or containing C0 controls or
+  DEL, now fails with `ParseError::InvalidChunkMetadata`.
+
 - **`HeaderName` comparison is now case-insensitive for unrecognized names.**
   `HeaderName::from_bytes(b"X-Custom") == HeaderName::from_bytes(b"x-custom")`
   was `false` and is now `true`. HTTP field names are case-insensitive, so the
@@ -49,6 +77,19 @@ These compile without error and return different results. Check them first.
   - `client::{Response, StreamingResponse}` → `response::`
 - `xibalba_client::body::MAX_HEADERS` is no longer re-exported; use
   `xibalba_proto::response::MAX_HEADERS`.
+- `HeaderRange` offsets and lengths widened from `u16` to `u32`, with the new
+  `MAX_ADDRESSABLE_HEAD` naming the ceiling. A `MAX_HEAD_SIZE` above 64 KiB
+  previously failed with `HeaderRangeOverflow` whenever a header sat past that
+  point, so the documented 128 KiB example could not be used as written. Code
+  reading these fields needs `as usize` rather than `usize::from`.
+- `StreamHandle::into_consumer` is now `into_stream`, returning a
+  `ChunkStream`. The bare ring consumer bypassed the liveness guard that lets
+  the reader stop producing when a caller drops its handle.
+- New variants: `ConnectionError::{TooManyRequests, InsecureRedirect}`,
+  `ParseError::InvalidChunkMetadata`.
+- `AsyncClient::submit` returns `ConnectionError::TooManyRequests` once
+  `DEFAULT_MAX_OUTSTANDING` requests are in flight, and no longer blocks when
+  the control ring is full. This is backpressure, not a transport failure.
 
 ### Security
 

@@ -86,9 +86,7 @@ impl HeadData {
             // Derive ranges while headers still borrow `head_acc`, then preserve the
             // complete head for the response. This keeps duplicate header names or
             // values positional rather than re-searching their byte patterns in a
-            // copy. `HeaderRange` offsets are `u16`, so the 64 KiB default is the
-            // largest useful standard limit; a custom larger head fails safely if an
-            // offset cannot be represented.
+            // copy.
             let ranges =
                 HeaderRange::build_ranges(&hdr_buf[..head.header_count], &head_acc[..head_end])?;
             let framing = BodyFraming::from_response(
