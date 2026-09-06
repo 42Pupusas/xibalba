@@ -47,7 +47,7 @@ impl Drop for ConsumerGuard {
 
 /// The receiving end of one request's chunk ring.
 ///
-/// Returned by [`StreamHandle::into_consumer`](crate::StreamHandle::into_consumer)
+/// Returned by [`StreamHandle::into_stream`](crate::StreamHandle::into_stream)
 /// so a caller can park on the ring directly. It owns a [`ConsumerGuard`], so
 /// dropping it tells the reader to stop producing rather than leaving the
 /// reader waiting for capacity on a ring nobody will drain.

@@ -5,6 +5,7 @@
 //! - [`async_client::AsyncClient`] — the same client on a dedicated reader
 //!   thread, responses delivered as chunks over ring buffers.
 
+pub mod admission;
 pub mod async_client;
 pub mod body;
 pub mod client;
@@ -20,6 +21,7 @@ mod silence;
 
 pub use xibalba_proto as proto;
 
+pub use admission::{Admission, DEFAULT_MAX_OUTSTANDING};
 pub use async_client::{AsyncClient, AsyncRequest, Chunk, StreamHandle};
 pub use client::Client;
 pub use config::{Config, DEFAULT_MAX_HEAD_SIZE, HEAD_BUF_SIZE};

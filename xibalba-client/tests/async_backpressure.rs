@@ -18,6 +18,7 @@ use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use xibalba_client::DEFAULT_MAX_OUTSTANDING;
 use xibalba_client::async_client::{AsyncClient, Chunk};
 use xibalba_client::client::Config;
 use xibalba_client::connector::{Connector, SetReadTimeout};
@@ -242,6 +243,119 @@ fn cancel_returns_while_a_full_response_ring_is_undrained() {
     drop(handle);
     drop(client);
     server.shutdown();
+}
+
+#[test]
+fn sustained_submission_against_a_slow_response_stays_bounded() {
+    // The reader drains the control ring into its pending queue whenever it
+    // polls for a cancel, so the eight-slot ring bounds nothing by itself.
+    // A caller that keeps submitting while one response crawls must be told
+    // to stop rather than growing the queue without limit.
+    let server = FloodServer::spawn(512);
+    let client = server.client();
+
+    let mut first = client
+        .submit(Method::Get, b"/slow".to_vec(), None, None, vec![])
+        .expect("the first request is admitted");
+    assert!(
+        matches!(first.next_block(), Some(Chunk::Head { status: 200, .. })),
+        "the first response must start before the flood of submissions"
+    );
+
+    let mut refusals = 0;
+    let mut admitted = 0;
+    let mut handles = Vec::new();
+    for _ in 0..512 {
+        match client.submit(Method::Get, b"/queued".to_vec(), None, None, vec![]) {
+            Ok(handle) => {
+                admitted += 1;
+                handles.push(handle);
+            }
+            Err(Error::Connection(ConnectionError::TooManyRequests)) => refusals += 1,
+            Err(other) => panic!("unexpected submit failure: {other}"),
+        }
+    }
+
+    assert!(
+        refusals > 0,
+        "submitting 512 requests behind a stalled response must hit the bound"
+    );
+    assert!(
+        admitted < 512,
+        "admitted {admitted} of 512; the queue grew without limit"
+    );
+    assert!(
+        client.outstanding() <= DEFAULT_MAX_OUTSTANDING,
+        "outstanding {} exceeded the configured bound {DEFAULT_MAX_OUTSTANDING}",
+        client.outstanding()
+    );
+
+    // Cancellation must keep working while at the admission ceiling: it
+    // travels on the control ring, which admission does not gate.
+    Watchdog::run(
+        Duration::from_secs(10),
+        "cancel while at the admission ceiling",
+        move || {
+            client.cancel().expect("cancel reaches the reader");
+            drop(handles);
+            drop(first);
+            drop(client);
+        },
+    );
+    server.shutdown();
+}
+
+#[test]
+fn finished_requests_release_their_admission_slots() {
+    // A bound that never releases is just a smaller leak.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    let server = thread::spawn(move || {
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+            let _ = stream.flush();
+        }
+    });
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(50)),
+        ..Config::default()
+    };
+    let client: AsyncClient =
+        AsyncClient::connect::<PlainConnector>(url.as_bytes(), (), config).expect("connect");
+
+    for _ in 0..4 {
+        let mut handle = client
+            .submit(Method::Get, b"/".to_vec(), None, None, vec![])
+            .expect("each request is admitted after the previous one finishes");
+        while let Some(chunk) = handle.next_block() {
+            if matches!(chunk, Chunk::Eof | Chunk::Error(_) | Chunk::Aborted) {
+                break;
+            }
+        }
+        drop(handle);
+    }
+
+    // The reader releases a permit when it finishes with the request, which
+    // races the assertion; poll briefly rather than sleeping a fixed span.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.outstanding() > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        client.outstanding(),
+        0,
+        "completed requests must release their slots"
+    );
+
+    drop(client);
+    let _ = server.join();
 }
 
 #[test]

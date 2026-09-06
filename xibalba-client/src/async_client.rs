@@ -55,6 +55,7 @@ use quetzalcoatl::spsc::{self, Consumer as SpscConsumer};
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::method::Method;
 
+use crate::admission::{Admission, DEFAULT_MAX_OUTSTANDING, Permit};
 use crate::body::{BodyCollector, StreamingBody};
 use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
 use crate::config::HEAD_BUF_SIZE;
@@ -67,10 +68,14 @@ use crate::params::RequestParams;
 /// wakeup latency, not correctness.
 const CHUNK_RING_CAP: usize = 32;
 
-/// Default capacity for the control ring feeding the reader
-/// thread. One slot per in-flight request; the worker only ever
-/// has one model round in flight, so a handful of slots is plenty.
-const CONTROL_RING_CAP: usize = 8;
+/// Capacity of the control ring feeding the reader thread.
+///
+/// Sized to hold every admissible request plus room for cancels, so
+/// [`Admission`] is the only thing that refuses a submission. A ring smaller
+/// than the admission bound would make `submit` report backpressure while the
+/// reader had merely not drained yet, and blocking instead would stall the
+/// caller for as long as the reader stayed busy.
+const CONTROL_RING_CAP: usize = DEFAULT_MAX_OUTSTANDING * 2;
 
 /// Ticket value meaning "cancel whatever request is in flight", used by
 /// [`AsyncClient::cancel`] where the caller has no specific handle.
@@ -152,6 +157,9 @@ pub struct AsyncRequest {
     /// deadline can measure time on the wire rather than time spent
     /// queued behind an earlier request.
     started: Arc<AtomicBool>,
+    /// Frees this request's admission slot when the request is dropped,
+    /// whether it completed, was cancelled, or was discarded in the queue.
+    _permit: Permit,
 }
 
 impl std::fmt::Debug for AsyncRequest {
@@ -264,6 +272,10 @@ pub struct AsyncClient<const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SIZE> {
     /// shutdown, so `drop` cannot block for `stream_silence` behind a
     /// stalled in-flight response.
     shutting_down: Arc<AtomicBool>,
+    /// Bounds requests submitted but not yet finished. The reader drains the
+    /// control ring into an unbounded pending queue, so ring capacity alone
+    /// does not limit how many requests (and their buffers) can pile up.
+    admission: Arc<Admission>,
 }
 
 impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
@@ -309,7 +321,14 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             join: Some(join),
             next_ticket: AtomicU64::new(0),
             shutting_down,
+            admission: Arc::new(Admission::new(DEFAULT_MAX_OUTSTANDING)),
         })
+    }
+
+    /// How many submitted requests have not finished yet.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.admission.outstanding()
     }
 
     /// Submit a streaming request and get back a handle. The
@@ -323,7 +342,11 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
     /// Returns `Error::Serialize(DuplicateHeader)` when `headers`
     /// contains a header the client serializes itself (`Host`,
     /// `Content-Length`, `Transfer-Encoding`) or the same name twice;
-    /// `Error::Connection` if the reader thread has already exited.
+    /// `Error::Connection` if the reader thread has already exited;
+    /// [`ConnectionError::TooManyRequests`] when
+    /// [`DEFAULT_MAX_OUTSTANDING`] requests are already in flight. That
+    /// last case is backpressure, not a transport failure: retry once an
+    /// earlier response completes.
     pub fn submit(
         &self,
         method: Method,
@@ -333,6 +356,10 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<StreamHandle, Error> {
         RequestParams::validate_extra_headers(&headers)?;
+        let permit = self
+            .admission
+            .try_admit()
+            .ok_or(Error::Connection(ConnectionError::TooManyRequests))?;
         let (chunk_tx, chunk_rx) =
             spsc::RingBuffer::<Chunk>::new(Capacity::at_least(CHUNK_RING_CAP)).split();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
@@ -348,11 +375,16 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             consumer_alive,
             ticket,
             started: Arc::clone(&started),
+            _permit: permit,
         };
         let control_tx = self.control()?;
+        // Non-blocking: `push_block` parks until the reader drains a slot,
+        // which turns a busy reader into an unbounded stall inside submit and
+        // makes the admission bound unreachable (the ring is far smaller).
+        // A full ring is backpressure and is reported as such.
         control_tx
-            .push_block(Control::Request(request))
-            .map_err(|_| Error::Connection(ConnectionError::ReaderGone))?;
+            .push(Control::Request(request))
+            .map_err(|_| Error::Connection(ConnectionError::TooManyRequests))?;
         Ok(StreamHandle {
             chunk_rx,
             guard,
@@ -556,6 +588,9 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         consumer_alive,
         ticket,
         started,
+        // Held until this function returns: the slot must stay claimed for
+        // as long as the request is on the wire, not just while queued.
+        _permit,
     } = request;
     let sink = ChunkSink::new(&chunk_tx, &consumer_alive, shutting_down);
 

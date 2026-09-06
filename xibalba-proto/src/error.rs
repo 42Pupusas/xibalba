@@ -41,6 +41,10 @@ pub enum ConnectionError {
     InfiniteReadTimeout,
     /// The async client's background reader thread has exited.
     ReaderGone,
+    /// Too many requests are already in flight. Backpressure rather than a
+    /// transport failure: the request was not sent, and submitting again
+    /// once an earlier response finishes will succeed.
+    TooManyRequests,
     Other(String),
 }
 
@@ -130,6 +134,7 @@ impl fmt::Display for ConnectionError {
             Self::TooManyInterimResponses => f.write_str("too many 1xx interim responses"),
             Self::InfiniteReadTimeout => f.write_str("read timeout must be finite"),
             Self::ReaderGone => f.write_str("background reader thread has exited"),
+            Self::TooManyRequests => f.write_str("too many requests are already in flight"),
             Self::Other(msg) => f.write_str(msg),
         }
     }
