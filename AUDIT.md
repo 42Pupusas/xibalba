@@ -232,14 +232,14 @@ Carried into later phases: CONNECT tunnel handling (A07), and the async paths st
 
 Acceptance status: queue growth is bounded and asserted; every adversarial test runs under an external `Watchdog` that fails rather than hanging. Cancel/Drop latency is bounded for body delivery but **not yet** for head reads, writes, reconnects, or handshakes — that bound arrives with A06. Body-idle versus total-duration limits are still undifferentiated, so intentional SSE streams remain supported by the idle budget alone.
 
-### Phase 3 — Protocol and URL interoperability
+### Phase 3 — Protocol and URL interoperability — **A10, A12, A13, A16 done; A11, A17, A18 open**
 
-11. **A10/A11:** incremental-head contract, status reason validation, and transfer-coding rules.
-12. **A12/A18:** consistent head capacities and encapsulated range/count invariants.
-13. **A13:** reference resolution and pre-connect redirect policy.
-14. **A16/A17:** authority validation and a reliable TCP connector example.
+11. **A10 done** (`19602da`); **A11 open.** Truncated heads now report `Incomplete` — two shapes were misreported, a partial header name as `MissingColon` and a head split inside its final CRLF as `InvalidHeaderName`. Reason-phrase validation and transfer-coding grammar/ordering are untouched: `gzip, chunked` is still dechunked and presented as a decoded body with no unsupported-coding error.
+12. **A12 done** (`c311fed`); **A18 open.** `HeaderRange` offsets widened to `u32` so the documented 128 KiB head limit works as written, and the README states the byte and header-count limits separately. The range/count invariants are still public fields rather than an encapsulated type.
+13. ~~**A13:** reference resolution and pre-connect redirect policy.~~ Done (`a71b1c5`, `a2d3e39`). Hop budget, scheme case, dot-segment resolution, https-to-http downgrade, and representation headers on a method rewrite. 307/308 still forward the body across origins, and applications cannot designate their own headers as sensitive.
+14. **A16 done** (`c0225dd`); **A17 open.** Bracketed IP-literals and unbracketed reg-names are validated separately, so malformed authorities no longer reach a connector. The in-tree TCP connector is still the thin example the audit describes.
 
-Acceptance: run table-driven RFC cases, every-prefix/fragmentation cases, and applicable IPv4/IPv6 loopback tests. Explicitly document unsupported features instead of silently treating them as supported HTTP.
+Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, and every byte-prefix of a valid response head is asserted to parse as `Incomplete`. Redirect tests assert on the hosts actually dialled, since a wrongly-contacted host is invisible in the returned response. No IPv4/IPv6 loopback connector test yet — that belongs with A17.
 
 ### Phase 4 — Structure and maintenance
 
