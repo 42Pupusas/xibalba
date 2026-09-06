@@ -384,8 +384,9 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         // close-delimited or over-long body can have spent the connection.
         self.ensure_clean()?;
         let (head_data, framing, tail_offset) = self.send_head(params)?;
+        let reuse = head_data.connection_reuse();
         let body_data = self.read_full_body(&framing, tail_offset)?;
-        if head_data.status == xibalba_proto::status::StatusCode::SWITCHING_PROTOCOLS {
+        if !reuse.is_keep() {
             self.discard_partial_response();
         }
 
@@ -415,11 +416,19 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     ) -> Result<StreamingResponse<'_, C::Stream>, Error> {
         self.ensure_clean()?;
         let (head_data, framing, tail_offset) = self.send_head(params)?;
+        let reuse = head_data.connection_reuse();
 
         let tail = self.head_buf[tail_offset..].to_vec();
         self.dirty = true;
         let silence = self.config.stream_silence;
-        let body = StreamingBody::new(&mut self.stream, &mut self.dirty, &framing, tail, silence);
+        let body = StreamingBody::new(
+            &mut self.stream,
+            &mut self.dirty,
+            &framing,
+            tail,
+            silence,
+            reuse.is_keep(),
+        );
 
         Ok(StreamingResponse {
             version: head_data.version,

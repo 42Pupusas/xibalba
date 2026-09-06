@@ -29,6 +29,11 @@ pub struct StreamingBody<'a, S: Read> {
     /// Wall-clock silence tolerance between body bytes; resets on
     /// every successful socket read. See [`SilenceBudget`].
     budget: SilenceBudget,
+    /// Whether the peer's response head permits reusing this connection
+    /// after the body is drained. A fully-read body is not enough: an
+    /// announced close, HTTP/1.0, or a protocol switch all mean the next
+    /// request must reconnect.
+    reusable: bool,
 }
 
 #[derive(Debug)]
@@ -55,6 +60,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
         framing: &xibalba_proto::response::BodyFraming,
         tail: Vec<u8>,
         silence: std::time::Duration,
+        reusable: bool,
     ) -> Self {
         use xibalba_proto::response::{BodyFraming, ChunkedDecoder};
         let state = match *framing {
@@ -72,6 +78,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
             raw: tail,
             raw_pos: 0,
             budget: SilenceBudget::new(silence),
+            reusable,
         };
         if matches!(body.state, StreamState::Done) {
             body.finish();
@@ -87,7 +94,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
 
     const fn finish(&mut self) {
         self.state = StreamState::Done;
-        *self.dirty = self.raw_pos != self.raw.len();
+        *self.dirty = !self.reusable || self.raw_pos != self.raw.len();
     }
 
     /// Bytes available without touching the socket; refills from the

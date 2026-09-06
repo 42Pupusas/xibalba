@@ -571,6 +571,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
     };
 
     let status = head_data.status.as_u16();
+    let reuse = head_data.connection_reuse();
     let header_vec: Vec<(Vec<u8>, Vec<u8>)> = head_data
         .headers()
         .map(|(n, v)| (n.to_vec(), v.to_vec()))
@@ -618,7 +619,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         );
         match collector.read(&mut cancellable, &framing, &tail) {
             Ok(bytes) => {
-                client.dirty = !collector.is_reusable();
+                client.dirty = !collector.is_reusable() || !reuse.is_keep();
                 if !bytes.is_empty() && chunk_tx.push_block(Chunk::Body(bytes)).is_err() {
                     return;
                 }
@@ -654,7 +655,14 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         ticket,
         shutting_down,
     );
-    let mut body = StreamingBody::new(&mut cancellable, &mut client.dirty, &framing, tail, silence);
+    let mut body = StreamingBody::new(
+        &mut cancellable,
+        &mut client.dirty,
+        &framing,
+        tail,
+        silence,
+        reuse.is_keep(),
+    );
     let mut buf = vec![0u8; HEAD_BUF_SIZE];
     loop {
         match body.read(&mut buf) {

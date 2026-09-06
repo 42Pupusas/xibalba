@@ -14,6 +14,7 @@ pub mod params;
 pub mod redirect;
 pub mod response;
 
+mod reuse;
 mod silence;
 
 pub use xibalba_proto as proto;

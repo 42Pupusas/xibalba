@@ -24,6 +24,12 @@ pub struct HeadData {
 }
 
 impl HeadData {
+    /// Whether the connection that carried this response may serve another
+    /// request once the body has been consumed.
+    pub(crate) fn connection_reuse(&self) -> crate::reuse::ConnectionReuse {
+        crate::reuse::ConnectionReuse::evaluate(self.version, self.status, self.headers())
+    }
+
     pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         let buf = &self.head_buf;
         self.ranges[..self.header_count]

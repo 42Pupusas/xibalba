@@ -22,7 +22,10 @@ const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
 /// bytes it accepts, and how it fails afterwards.
 #[derive(Clone)]
 struct StreamPlan {
-    response: Vec<u8>,
+    /// One entry per request this connection will answer, in order. A real
+    /// server writes a response only after reading the request, so serving
+    /// them upfront would fake pipelining the client never performs.
+    responses: VecDeque<Vec<u8>>,
     write_budget: usize,
     write_error: Option<ErrorKind>,
     flush_error: Option<ErrorKind>,
@@ -31,10 +34,18 @@ struct StreamPlan {
 impl StreamPlan {
     fn healthy() -> Self {
         Self {
-            response: RESPONSE.to_vec(),
+            responses: VecDeque::from(vec![RESPONSE.to_vec()]),
             write_budget: usize::MAX,
             write_error: None,
             flush_error: None,
+        }
+    }
+
+    /// Answer each successive request on this connection with one response.
+    fn serving_each(responses: &[&[u8]]) -> Self {
+        Self {
+            responses: responses.iter().map(|r| r.to_vec()).collect(),
+            ..Self::healthy()
         }
     }
 
@@ -57,10 +68,7 @@ impl StreamPlan {
     }
 
     fn serving(response: &[u8]) -> Self {
-        Self {
-            response: response.to_vec(),
-            ..Self::healthy()
-        }
+        Self::serving_each(&[response])
     }
 }
 
@@ -118,11 +126,29 @@ struct ScriptedStream {
     written: usize,
     read_pos: usize,
     index: usize,
+    /// Response bytes released so far: one response per request seen.
+    available: Vec<u8>,
+    /// Request bytes not yet matched to a `\r\n\r\n` request terminator.
+    request_acc: Vec<u8>,
+}
+
+impl ScriptedStream {
+    /// Release the next scripted response once a full request head has been
+    /// written, mirroring a server that reads before it answers.
+    fn note_request_bytes(&mut self, bytes: &[u8]) {
+        self.request_acc.extend_from_slice(bytes);
+        while let Some(end) = self.request_acc.windows(4).position(|w| w == b"\r\n\r\n") {
+            self.request_acc.drain(..end + 4);
+            if let Some(response) = self.plan.responses.pop_front() {
+                self.available.extend_from_slice(&response);
+            }
+        }
+    }
 }
 
 impl Read for ScriptedStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let remaining = &self.plan.response[self.read_pos..];
+        let remaining = &self.available[self.read_pos..];
         let n = remaining.len().min(buf.len());
         buf[..n].copy_from_slice(&remaining[..n]);
         self.read_pos += n;
@@ -141,6 +167,7 @@ impl Write for ScriptedStream {
         let n = buf.len().min(room);
         self.written += n;
         SENT.with(|sent| sent.borrow_mut()[self.index].extend_from_slice(&buf[..n]));
+        self.note_request_bytes(&buf[..n]);
         Ok(n)
     }
 
@@ -170,6 +197,8 @@ impl Connector for ScriptedConnector {
             written: 0,
             read_pos: 0,
             index,
+            available: Vec::new(),
+            request_acc: Vec::new(),
         })
     }
 }
@@ -344,6 +373,91 @@ fn redirect_hop_never_answers_from_a_leftover_response() {
         response.text().unwrap(),
         "hi",
         "the response must come from the redirected request, not the leftover bytes"
+    );
+}
+
+#[test]
+fn connection_close_response_is_not_reused() {
+    const CLOSING: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
+
+    Script::load(&[StreamPlan::serving(CLOSING), StreamPlan::serving(RESPONSE)]);
+    let mut client = ScriptedConnector::client();
+
+    client.get(b"/first").expect("the first request succeeds");
+    client
+        .get(b"/second")
+        .expect("the next request must open a new connection");
+
+    assert_eq!(
+        Script::connects(),
+        2,
+        "a peer that announced Connection: close must not be reused"
+    );
+    let first = Script::sent_on(0);
+    assert!(
+        !first.windows(12).any(|w| w == b"GET /second "),
+        "the second request must not be written to the closing connection"
+    );
+}
+
+#[test]
+fn http10_response_without_keep_alive_is_not_reused() {
+    const HTTP10: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+
+    Script::load(&[StreamPlan::serving(HTTP10), StreamPlan::serving(RESPONSE)]);
+    let mut client = ScriptedConnector::client();
+
+    client.get(b"/first").expect("the first request succeeds");
+    client
+        .get(b"/second")
+        .expect("the next request must open a new connection");
+
+    assert_eq!(
+        Script::connects(),
+        2,
+        "HTTP/1.0 defaults to closing unless keep-alive was announced"
+    );
+}
+
+#[test]
+fn http10_response_with_keep_alive_is_reused() {
+    const HTTP10_KEEP: &[u8] =
+        b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+
+    Script::load(&[StreamPlan::serving_each(&[HTTP10_KEEP, HTTP10_KEEP])]);
+    let mut client = ScriptedConnector::client();
+
+    client.get(b"/first").expect("the first request succeeds");
+    client
+        .get(b"/second")
+        .expect("an announced keep-alive connection must be reused");
+
+    assert_eq!(
+        Script::connects(),
+        1,
+        "HTTP/1.0 with keep-alive must not force a reconnect"
+    );
+}
+
+#[test]
+fn switching_protocols_connection_is_never_reused() {
+    const UPGRADE: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+
+    Script::load(&[StreamPlan::serving(UPGRADE), StreamPlan::serving(RESPONSE)]);
+    let mut client = ScriptedConnector::client();
+
+    let response = client
+        .get(b"/upgrade")
+        .expect("101 is surfaced to the caller");
+    assert_eq!(response.status.as_u16(), 101);
+
+    client
+        .get(b"/second")
+        .expect("the next request must open a new connection");
+    assert_eq!(
+        Script::connects(),
+        2,
+        "an upgraded connection is no longer carrying HTTP and must not be reused"
     );
 }
 
