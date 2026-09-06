@@ -55,9 +55,16 @@ impl<'a> ResponseHead<'a> {
                 return Err(ParseError::Incomplete.into());
             }
 
-            if pos + 1 < buf.len() && buf[pos] == b'\r' && buf[pos + 1] == b'\n' {
-                pos += 2;
-                break;
+            if buf[pos] == b'\r' {
+                // A lone trailing CR is the head terminator with its LF still
+                // in flight, not a header line beginning with a control byte.
+                if pos + 1 >= buf.len() {
+                    return Err(ParseError::Incomplete.into());
+                }
+                if buf[pos + 1] == b'\n' {
+                    pos += 2;
+                    break;
+                }
             }
 
             // Single left-to-right scan: validate name tchar-by-tchar, find ':', then
@@ -114,7 +121,12 @@ impl<'a> ResponseHead<'a> {
                 return Err(ParseError::InvalidHeaderName.into());
             }
         }
-        let mut i = name_len.ok_or(ParseError::MissingColon)?;
+        // Every byte so far was a valid tchar and the input ran out, so the
+        // colon may still be on its way. Reporting a malformed line here
+        // would make an incremental caller reject a response that is merely
+        // still in flight; a terminated line without a colon fails above on
+        // CR, which is not a tchar.
+        let mut i = name_len.ok_or(ParseError::Incomplete)?;
         if i == 0 {
             return Err(ParseError::InvalidHeaderName.into());
         }
@@ -741,6 +753,48 @@ mod tests {
         let mut headers = [const { Header::empty() }; 32];
         let result = ResponseHead::parse(raw, &mut headers);
         assert_eq!(result.unwrap_err(), Error::Parse(ParseError::Incomplete));
+    }
+
+    #[test]
+    fn every_prefix_of_a_valid_head_is_incomplete() {
+        // A caller feeding bytes as they arrive uses Incomplete as the only
+        // instruction to read more. Any other error on a truncated but
+        // well-formed head makes it reject a response that is merely still
+        // in flight.
+        let raw =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 42\r\nServer: test\r\n\r\n";
+        for end in 1..raw.len() {
+            let mut headers = [const { Header::empty() }; 32];
+            let err = ResponseHead::parse(&raw[..end], &mut headers)
+                .expect_err("a truncated head cannot parse");
+            assert_eq!(
+                err,
+                Error::Parse(ParseError::Incomplete),
+                "prefix of length {end} reported {err:?}: {:?}",
+                std::str::from_utf8(&raw[..end])
+            );
+        }
+    }
+
+    #[test]
+    fn partial_header_name_is_incomplete_not_missing_colon() {
+        // The specific shape behind the class above: every byte so far is a
+        // valid token character, so the colon may still be coming.
+        let mut headers = [const { Header::empty() }; 32];
+        let err = ResponseHead::parse(b"HTTP/1.1 200 OK\r\nCont", &mut headers)
+            .expect_err("a truncated header name cannot parse");
+        assert_eq!(err, Error::Parse(ParseError::Incomplete));
+    }
+
+    #[test]
+    fn complete_line_without_a_colon_is_still_rejected() {
+        // The fix must not swallow genuinely malformed lines. CR is not a
+        // tchar, so a terminated line with no colon fails on the name scan
+        // before the end of input is ever reached.
+        let mut headers = [const { Header::empty() }; 32];
+        let err = ResponseHead::parse(b"HTTP/1.1 200 OK\r\nNoColonHere\r\n\r\n", &mut headers)
+            .expect_err("a complete line without a colon is malformed");
+        assert_eq!(err, Error::Parse(ParseError::InvalidHeaderName));
     }
 
     #[test]
