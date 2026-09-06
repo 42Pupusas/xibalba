@@ -44,6 +44,16 @@ These compile without error and return different results. Check them first.
 - **Chunk extensions and trailers are bounded and validated.** Metadata past
   `MAX_CHUNK_EXTENSION`/`MAX_TRAILER_SECTION`, or containing C0 controls or
   DEL, now fails with `ParseError::InvalidChunkMetadata`.
+- **Undecodable transfer codings are refused instead of framed.**
+  `Transfer-Encoding: gzip` and `gzip, chunked` previously produced a body —
+  the latter dechunked but still compressed, with nothing marking it as
+  encoded. Both now fail with `ParseError::UnsupportedTransferCoding`.
+  `chunked` must be the final coding and may not repeat, so `chunked, gzip`
+  and a doubled `chunked` fail with `ParseError::InvalidTransferEncoding`.
+  `identity` is accepted and applies no encoding.
+- **The reason phrase is validated.** A phrase containing NUL or another C0
+  control now fails with `ParseError::InvalidReasonPhrase`; HTAB and obs-text
+  remain accepted.
 
 - **`HeaderName` comparison is now case-insensitive for unrecognized names.**
   `HeaderName::from_bytes(b"X-Custom") == HeaderName::from_bytes(b"x-custom")`
@@ -86,7 +96,10 @@ These compile without error and return different results. Check them first.
   `ChunkStream`. The bare ring consumer bypassed the liveness guard that lets
   the reader stop producing when a caller drops its handle.
 - New variants: `ConnectionError::{TooManyRequests, InsecureRedirect}`,
-  `ParseError::InvalidChunkMetadata`.
+  `ParseError::{InvalidChunkMetadata, InvalidReasonPhrase,
+  InvalidTransferEncoding, UnsupportedTransferCoding}`.
+- New `xibalba_proto::coding` module with `TransferCodings` and
+  `TransferCoding`, which own `Transfer-Encoding` list parsing.
 - `AsyncClient::submit` returns `ConnectionError::TooManyRequests` once
   `DEFAULT_MAX_OUTSTANDING` requests are in flight, and no longer blocks when
   the control ring is full. This is backpressure, not a transport failure.
