@@ -143,6 +143,11 @@ impl BodyCollector {
     }
 
     fn read_until_close<S: Read>(&mut self, stream: &mut S, tail: &[u8]) -> Result<Vec<u8>, Error> {
+        // The tail arrives with the head and can exceed the limit on its own,
+        // so it is checked before the first read rather than after it.
+        if tail.len() > self.max_body {
+            return Err(ConnectionError::BodyTooLarge.into());
+        }
         let mut body = tail.to_vec();
         let mut raw = [0u8; HEAD_BUF_SIZE];
         loop {
@@ -166,6 +171,25 @@ mod tests {
     use xibalba_proto::response::BodyFraming;
 
     const BUDGET: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn until_close_tail_alone_over_the_limit_is_rejected() {
+        // A head and a small close-delimited body can arrive in one read, so
+        // the tail is already over the limit before any further read. An
+        // immediate EOF must not hand that body back unchecked.
+        let mut collector = BodyCollector::new(4, BUDGET);
+        let err = collector
+            .read(
+                &mut Cursor::new(b""),
+                &BodyFraming::UntilClose,
+                b"0123456789",
+            )
+            .expect_err("a tail larger than max_body must be rejected");
+        assert!(matches!(
+            err,
+            Error::Connection(ConnectionError::BodyTooLarge)
+        ));
+    }
 
     #[test]
     fn until_close_overflow_is_rejected() {
