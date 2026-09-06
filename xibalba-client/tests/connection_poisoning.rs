@@ -55,11 +55,22 @@ impl StreamPlan {
             ..Self::healthy()
         }
     }
+
+    fn serving(response: &[u8]) -> Self {
+        Self {
+            response: response.to_vec(),
+            ..Self::healthy()
+        }
+    }
 }
 
 thread_local! {
     static PLANS: RefCell<VecDeque<StreamPlan>> = const { RefCell::new(VecDeque::new()) };
     static CONNECTS: Cell<usize> = const { Cell::new(0) };
+    /// Bytes accepted by each connection, in the order the connections were
+    /// opened. Asserting on this is what distinguishes a request that really
+    /// reached the wire from one answered by leftover bytes.
+    static SENT: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Test-local control over the scripted connector.
@@ -73,20 +84,32 @@ impl Script {
             queued.extend(plans.iter().cloned());
         });
         CONNECTS.with(|count| count.set(0));
+        SENT.with(|sent| sent.borrow_mut().clear());
     }
 
     fn connects() -> usize {
         CONNECTS.with(Cell::get)
     }
 
-    fn next_plan() -> StreamPlan {
-        CONNECTS.with(|count| count.set(count.get() + 1));
-        PLANS.with(|queued| {
+    /// Everything the client wrote to the connection at `index`.
+    fn sent_on(index: usize) -> Vec<u8> {
+        SENT.with(|sent| sent.borrow().get(index).cloned().unwrap_or_default())
+    }
+
+    fn next_plan() -> (StreamPlan, usize) {
+        let index = CONNECTS.with(|count| {
+            let index = count.get();
+            count.set(index + 1);
+            index
+        });
+        SENT.with(|sent| sent.borrow_mut().push(Vec::new()));
+        let plan = PLANS.with(|queued| {
             queued
                 .borrow_mut()
                 .pop_front()
                 .expect("connector opened more connections than the script allows")
-        })
+        });
+        (plan, index)
     }
 }
 
@@ -94,6 +117,7 @@ struct ScriptedStream {
     plan: StreamPlan,
     written: usize,
     read_pos: usize,
+    index: usize,
 }
 
 impl Read for ScriptedStream {
@@ -116,6 +140,7 @@ impl Write for ScriptedStream {
         }
         let n = buf.len().min(room);
         self.written += n;
+        SENT.with(|sent| sent.borrow_mut()[self.index].extend_from_slice(&buf[..n]));
         Ok(n)
     }
 
@@ -139,10 +164,12 @@ impl Connector for ScriptedConnector {
     type TlsConfig = ();
 
     fn connect(_url: &Url<'_>, (): &()) -> Result<Self::Stream, Error> {
+        let (plan, index) = Script::next_plan();
         Ok(ScriptedStream {
-            plan: Script::next_plan(),
+            plan,
             written: 0,
             read_pos: 0,
+            index,
         })
     }
 }
@@ -218,6 +245,105 @@ fn partial_body_write_forces_reconnect_before_next_request() {
         Script::connects(),
         2,
         "a connection with a half-written body must not be reused"
+    );
+}
+
+#[test]
+fn same_origin_redirect_does_not_reuse_a_close_delimited_connection() {
+    // The redirect body is close-delimited, so the connection cannot carry
+    // the next hop: the peer signalled the end of the response by ending the
+    // stream. `ensure_clean` runs once before the redirect loop, so without a
+    // per-hop check the second hop is written to this dead connection.
+    const REDIRECT: &[u8] = b"HTTP/1.1 302 Found\r\nLocation: /target\r\n\r\nignored";
+
+    Script::load(&[StreamPlan::serving(REDIRECT), StreamPlan::serving(RESPONSE)]);
+    let mut client = ScriptedConnector::client();
+
+    let response = client
+        .get(b"/start")
+        .expect("the redirect must be followed on a fresh connection");
+
+    assert_eq!(
+        Script::connects(),
+        2,
+        "the redirected hop must open a new connection"
+    );
+    let second = Script::sent_on(1);
+    assert!(
+        second.starts_with(b"GET /target "),
+        "the second hop must be written to the new connection, got: {}",
+        String::from_utf8_lossy(&second)
+    );
+    assert_eq!(response.text().unwrap(), "hi");
+
+    // The hop must not have been written to the spent connection first. If it
+    // was, the request only survived because the retry path resent it, which
+    // means the peer may have received it twice.
+    let first = Script::sent_on(0);
+    assert!(
+        !first.windows(12).any(|w| w == b"GET /target "),
+        "the redirected hop was written to the spent connection: {}",
+        String::from_utf8_lossy(&first)
+    );
+}
+
+#[test]
+fn redirect_hop_after_excess_body_bytes_uses_a_fresh_connection() {
+    // The peer sends more body than Content-Length declares. Those extra
+    // bytes stay on the socket, so the next hop must not read them as its
+    // own response head.
+    const REDIRECT: &[u8] =
+        b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 2\r\n\r\nokEXTRA";
+
+    Script::load(&[StreamPlan::serving(REDIRECT), StreamPlan::serving(RESPONSE)]);
+    let mut client = ScriptedConnector::client();
+
+    let response = client
+        .get(b"/start")
+        .expect("the redirect must be followed on a fresh connection");
+
+    assert_eq!(
+        Script::connects(),
+        2,
+        "leftover body bytes must force a reconnect before the next hop"
+    );
+    assert_eq!(response.text().unwrap(), "hi");
+}
+
+#[test]
+fn redirect_hop_never_answers_from_a_leftover_response() {
+    // The peer pipelines a second, complete response behind the redirect.
+    // Those leftover bytes parse as a perfectly valid head, so reusing the
+    // connection returns the wrong response body to the redirected hop
+    // instead of failing — the silent desync a stale-connection retry
+    // cannot catch, because nothing looks broken.
+    const REDIRECT_THEN_LEFTOVER: &[u8] = b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nLEFTOVR";
+
+    Script::load(&[
+        StreamPlan::serving(REDIRECT_THEN_LEFTOVER),
+        StreamPlan::serving(RESPONSE),
+    ]);
+    let mut client = ScriptedConnector::client();
+
+    let response = client
+        .get(b"/start")
+        .expect("the redirect must be followed on a fresh connection");
+
+    assert_eq!(
+        Script::connects(),
+        2,
+        "the hop must not be served from bytes left over by the previous hop"
+    );
+    let second = Script::sent_on(1);
+    assert!(
+        second.starts_with(b"GET /target "),
+        "the second hop must reach the wire, got: {}",
+        String::from_utf8_lossy(&second)
+    );
+    assert_eq!(
+        response.text().unwrap(),
+        "hi",
+        "the response must come from the redirected request, not the leftover bytes"
     );
 }
 

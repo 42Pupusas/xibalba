@@ -378,6 +378,11 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     }
 
     pub(crate) fn send_one(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
+        // Every dispatch reconnects first if the previous exchange left the
+        // connection unusable. Checking only once per caller request would
+        // skip the check between redirect hops, where the previous hop's
+        // close-delimited or over-long body can have spent the connection.
+        self.ensure_clean()?;
         let (head_data, framing, tail_offset) = self.send_head(params)?;
         let body_data = self.read_full_body(&framing, tail_offset)?;
         if head_data.status == xibalba_proto::status::StatusCode::SWITCHING_PROTOCOLS {
@@ -425,7 +430,6 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     }
 
     fn execute(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
-        self.ensure_clean()?;
         RedirectState::follow(self, params)
     }
 }
