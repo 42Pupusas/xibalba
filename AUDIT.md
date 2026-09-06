@@ -222,15 +222,15 @@ Acceptance met: the scripted connector records per-connection bytes, and every f
 
 Carried into later phases: CONNECT tunnel handling (A07), and the async paths still retry via `send_head` without the cancellation coverage A06 describes.
 
-### Phase 2 — Make cancellation and resource bounds real
+### Phase 2 — Make cancellation and resource bounds real — **A05, A15, A08, A09 done; A06/A14 open**
 
-6. **A05:** cancellation-aware delivery and nonblocking shutdown signaling; verify backpressure shutdown under a process watchdog.
-7. **A06/A14:** cancellation/deadline coverage through head, write, reconnect, and handshake boundaries; document connector obligations.
-8. **A15:** bound total outstanding request count/bytes, not only ring slots.
-9. **A08:** fix initial-tail body-limit enforcement.
-10. **A09:** bound and validate chunk metadata.
+6. ~~**A05:** cancellation-aware delivery and nonblocking shutdown signaling; verify backpressure shutdown under a process watchdog.~~ Done (`e001879`). `ChunkSink` replaces every `push_block` on the delivery path. `quetzalcoatl` 0.14 exposes no producer-side "consumer gone" check outside the blocking push, so `ConsumerGuard` publishes handle liveness on our side; `into_consumer` became `into_stream` so the guard cannot be bypassed.
+7. **A06/A14:** cancellation/deadline coverage through head, write, reconnect, and handshake boundaries; document connector obligations. **Still open.** `CancellableStream` wraps body reads only; `send_head`, request writes, reconnects, and connector handshakes still use the raw stream, so cancellation latency there is bounded by the head-silence budget rather than a read tick.
+8. ~~**A15:** bound total outstanding request count/bytes, not only ring slots.~~ Done (`6fe52ee`). `Admission` counts requests from submit to completion, released by `Permit`'s `Drop`. Two further stalls surfaced and were fixed: `submit` blocked on a full control ring, and a ring smaller than the admission bound reported false backpressure.
+9. ~~**A08:** fix initial-tail body-limit enforcement.~~ Done (`1a22819`).
+10. ~~**A09:** bound and validate chunk metadata.~~ Done (`38ae9cc`). `MetadataBudget` bounds extensions per chunk and the trailer section as a whole; C0 controls and DEL are rejected as they arrive.
 
-Acceptance: queue growth remains bounded; cancel/Drop latency has a documented upper bound for supported connectors; all adversarial tests themselves have a timeout. Distinguish body-idle limits from total-duration limits so intentional SSE streams remain supported.
+Acceptance status: queue growth is bounded and asserted; every adversarial test runs under an external `Watchdog` that fails rather than hanging. Cancel/Drop latency is bounded for body delivery but **not yet** for head reads, writes, reconnects, or handshakes — that bound arrives with A06. Body-idle versus total-duration limits are still undifferentiated, so intentional SSE streams remain supported by the idle budget alone.
 
 ### Phase 3 — Protocol and URL interoperability
 
