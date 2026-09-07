@@ -67,6 +67,22 @@ pub struct Config {
     /// without FIN/RST (NAT drop) surfaces as an error instead of
     /// wedging the reader forever.
     pub stream_silence: Duration,
+    /// Optional total wall-clock bound for one request: dispatch, the
+    /// response head, every redirect hop, and a buffered body share it.
+    ///
+    /// The silence budgets bound a *gap* and reset on every byte, so a peer
+    /// delivering one byte just often enough passes them forever; this
+    /// bounds the whole exchange and does not reset. It is spent
+    /// cooperatively: a hop that used most of it leaves the rest to the
+    /// next, and when it passes the request fails with
+    /// [`RequestDeadlineExceeded`](xibalba_proto::error::ConnectionError::RequestDeadlineExceeded)
+    /// rather than hanging.
+    ///
+    /// `None` (the default) imposes no total: the silence budgets alone
+    /// govern, which is what intentional SSE streams need. A streaming
+    /// body is never total-bounded even when this is set — its caller
+    /// consumes at its own pace — but the request that produced it is.
+    pub request_deadline: Option<Duration>,
 }
 
 impl Config {
@@ -106,6 +122,7 @@ impl Config {
             || self.stream_silence.is_zero()
             || matches!(self.write_timeout, Some(w) if w.is_zero())
             || matches!(self.connect_timeout, Some(c) if c.is_zero())
+            || matches!(self.request_deadline, Some(r) if r.is_zero())
         {
             return Err(Error::Connection(ConnectionError::ZeroDuration));
         }
@@ -128,6 +145,7 @@ impl Default for Config {
             max_redirects: 10,
             head_silence: Duration::from_mins(2),
             stream_silence: Duration::from_mins(5),
+            request_deadline: None,
         }
     }
 }

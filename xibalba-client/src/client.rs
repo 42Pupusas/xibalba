@@ -16,6 +16,7 @@ use crate::origin::Origin;
 use crate::params::RequestParams;
 use crate::redirect::{Hop, RedirectState};
 use crate::response::HeadData;
+use crate::silence::RequestDeadline;
 
 pub use crate::config::{Config, DEFAULT_MAX_HEAD_SIZE};
 pub use crate::params::RequestBuilder;
@@ -221,13 +222,6 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// `pub(crate)` so [`crate::async_client::AsyncClient`]'s reader
     /// thread can submit requests without going through
     /// `RequestBuilder`.
-    pub(crate) fn send_head(
-        &mut self,
-        params: &RequestParams<'_>,
-    ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
-        self.send_head_interruptible(params, NeverCancelled)
-    }
-
     /// [`send_head`](Self::send_head) with `interrupt` consulted before every
     /// write and every head read, so a caller that can cancel is not left
     /// waiting out the head-silence budget.
@@ -238,9 +232,10 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     pub(crate) fn send_head_interruptible<I: Interrupt>(
         &mut self,
         params: &RequestParams<'_>,
+        deadline: RequestDeadline,
         mut interrupt: I,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
-        match self.send_head_once(params, &mut interrupt) {
+        match self.send_head_once(params, deadline, &mut interrupt) {
             Ok(head) => Ok(head),
             Err(e)
                 if params.allow_replay
@@ -254,7 +249,9 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
                     )));
                 }
                 self.reconnect_same_host()?;
-                self.send_head_once(params, &mut interrupt)
+                // The retry shares the caller's total rather than earning a
+                // fresh one: a deadline spent on the failed attempt is spent.
+                self.send_head_once(params, deadline, &mut interrupt)
             }
             Err(e) => Err(e),
         }
@@ -266,8 +263,12 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     fn send_head_once<I: Interrupt>(
         &mut self,
         params: &RequestParams<'_>,
+        deadline: RequestDeadline,
         interrupt: &mut I,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
+        // Before the first byte, not only between reads: a hop that spent
+        // the total must not write its successor into a doomed exchange.
+        deadline.check()?;
         self.head_buf.clear();
         let host_value = self.origin.host_header_value();
         let content_len_str;
@@ -337,6 +338,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             &mut self.head_buf,
             MAX_HEAD_SIZE,
             self.config.head_silence,
+            deadline,
             params.method == Method::Head,
         )?;
         self.mark_reusable();
@@ -362,9 +364,13 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         &mut self,
         framing: &xibalba_proto::response::BodyFraming,
         tail_offset: usize,
+        deadline: RequestDeadline,
     ) -> Result<Vec<u8>, Error> {
-        let mut collector =
-            BodyCollector::new(self.config.max_response_body, self.config.stream_silence);
+        let mut collector = BodyCollector::with_deadline(
+            self.config.max_response_body,
+            self.config.stream_silence,
+            deadline,
+        );
         let data = collector.read(&mut self.stream, framing, &self.head_buf[tail_offset..]);
         if data.is_err() || !collector.is_reusable() {
             self.discard_partial_response();
@@ -372,15 +378,21 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         data
     }
 
-    pub(crate) fn send_one(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
+    fn send_one(
+        &mut self,
+        params: &RequestParams<'_>,
+        deadline: RequestDeadline,
+    ) -> Result<Response, Error> {
         // Every dispatch reconnects first if the previous exchange left the
         // connection unusable. Checking only once per caller request would
         // skip the check between redirect hops, where the previous hop's
         // close-delimited or over-long body can have spent the connection.
         self.ensure_clean()?;
-        let (head_data, framing, tail_offset) = self.send_head(params)?;
+        let (head_data, framing, tail_offset) =
+            self.send_head_interruptible(params, deadline, NeverCancelled)?;
         let reuse = head_data.connection_reuse();
-        let body_data = self.read_full_body(&framing, tail_offset)?;
+        deadline.check()?;
+        let body_data = self.read_full_body(&framing, tail_offset, deadline)?;
         if !reuse.is_keep() {
             self.discard_partial_response();
         }
@@ -410,7 +422,9 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         params: &RequestParams<'_>,
     ) -> Result<StreamingResponse<'_, C::Stream>, Error> {
         self.ensure_clean()?;
-        let (head_data, framing, tail_offset) = self.send_head(params)?;
+        let deadline = RequestDeadline::after(self.config.request_deadline);
+        let (head_data, framing, tail_offset) =
+            self.send_head_interruptible(params, deadline, NeverCancelled)?;
         let reuse = head_data.connection_reuse();
 
         let tail = self.head_buf[tail_offset..].to_vec();
@@ -441,9 +455,13 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     fn execute(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
         let mut state = RedirectState::new(params);
         let mut hops_left = self.config.max_redirects;
+        // One total for the whole redirect chain: a hop that spent the
+        // budget shortens the next, and the deadline passing anywhere
+        // surfaces here rather than restarting per hop.
+        let deadline = RequestDeadline::after(self.config.request_deadline);
 
         loop {
-            let response = self.send_one(&state.params())?;
+            let response = self.send_one(&state.params(), deadline)?;
             let Some(location) = RedirectState::location_to_follow(&response) else {
                 return Ok(response);
             };

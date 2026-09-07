@@ -16,6 +16,7 @@ use crate::control::{AsyncRequest, ControlInterrupt, ControlQueue};
 use crate::delivery::ChunkSink;
 use crate::interrupt::{Cancelled, InterruptibleStream, Latch};
 use crate::params::RequestParams;
+use crate::silence::RequestDeadline;
 use crate::{Chunk, response::HeadData, reuse::ConnectionReuse};
 
 /// Owns the connection for the reader thread's lifetime and serves one
@@ -43,14 +44,23 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
 
     fn serve(&mut self, request: &AsyncRequest) {
         let shutdown = self.queue.shutdown_flag();
-        if let Some(head) = self.dispatch(request, &shutdown) {
-            self.stream_body(request, head, &shutdown);
+        // One total per request, covering dispatch, head, and a drained error
+        // body. A success body is not bounded by it: its consumer paces the
+        // transfer, so only the silence budget applies.
+        let deadline = RequestDeadline::after(self.client.config.request_deadline);
+        if let Some(head) = self.dispatch(request, deadline, &shutdown) {
+            self.stream_body(request, head, deadline, &shutdown);
         }
     }
 
     /// Get the request onto the wire and its head back, or deliver the
     /// terminator explaining why that did not happen.
-    fn dispatch(&mut self, request: &AsyncRequest, shutdown: &AtomicBool) -> Option<ResponseStart> {
+    fn dispatch(
+        &mut self,
+        request: &AsyncRequest,
+        deadline: RequestDeadline,
+        shutdown: &AtomicBool,
+    ) -> Option<ResponseStart> {
         let sink = ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutdown);
 
         // A cancel can queue directly behind this request while it waits for
@@ -102,7 +112,9 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
         // boundary, which keeps only a kind and a message. Asking the interrupt
         // whether it fired is authoritative.
         let mut interrupt = Latch::new(ControlInterrupt::new(&mut self.queue, request.ticket));
-        let sent = self.client.send_head_interruptible(&params, &mut interrupt);
+        let sent = self
+            .client
+            .send_head_interruptible(&params, deadline, &mut interrupt);
         let fired = interrupt.fired();
 
         match sent {
@@ -125,7 +137,13 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
         }
     }
 
-    fn stream_body(&mut self, request: &AsyncRequest, start: ResponseStart, shutdown: &AtomicBool) {
+    fn stream_body(
+        &mut self,
+        request: &AsyncRequest,
+        start: ResponseStart,
+        deadline: RequestDeadline,
+        shutdown: &AtomicBool,
+    ) {
         let sink = ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutdown);
         let ResponseStart {
             head_data,
@@ -164,26 +182,38 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
         if (200..300).contains(&status) {
             Self::stream_success(client, &sink, &mut interrupt, &framing, tail, reuse);
         } else {
-            Self::drain_error_body(client, &sink, &mut interrupt, &framing, &tail, reuse);
+            Self::drain_error_body(
+                client,
+                &sink,
+                &mut interrupt,
+                &framing,
+                &tail,
+                deadline,
+                reuse,
+            );
         }
     }
 
     /// Drain a non-2xx body as a single chunk for the caller to inspect.
     ///
-    /// It still runs through the interrupt: an error response can stall
+    /// It still runs through the interrupt: an error body can stall
     /// exactly like a success response, and client drop/cancel must
-    /// interrupt both.
+    /// interrupt both. The request's total deadline bounds it — the body
+    /// belongs to this request's budget, unlike a success stream whose
+    /// consumer paces the transfer.
     fn drain_error_body(
         client: &mut Client<C, MAX_HEAD_SIZE>,
         sink: &ChunkSink<'_>,
         interrupt: &mut Latch<ControlInterrupt<'_>>,
         framing: &BodyFraming,
         tail: &[u8],
+        deadline: RequestDeadline,
         reuse: ConnectionReuse,
     ) {
-        let mut collector = BodyCollector::new(
+        let mut collector = BodyCollector::with_deadline(
             client.config.max_response_body,
             client.config.stream_silence,
+            deadline,
         );
         let collected = {
             let mut cancellable = InterruptibleStream::new(&mut client.stream, &mut *interrupt);

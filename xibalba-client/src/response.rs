@@ -7,7 +7,7 @@ use xibalba_proto::status::StatusCode;
 use xibalba_proto::version::Version;
 
 use crate::config::HEAD_BUF_SIZE;
-use crate::silence::SilenceBudget;
+use crate::silence::{RequestDeadline, SilenceBudget};
 
 /// The parsed response head: status line plus headers, kept verbatim so
 /// header ranges stay valid.
@@ -135,11 +135,12 @@ impl HeadData {
         head_acc: &mut Vec<u8>,
         max_head: usize,
         silence: std::time::Duration,
+        deadline: RequestDeadline,
         request_method_is_head: bool,
     ) -> Result<(Self, BodyFraming, usize), Error> {
         head_acc.clear();
         let mut raw = [0u8; HEAD_BUF_SIZE];
-        let mut budget = SilenceBudget::new(silence);
+        let mut budget = SilenceBudget::with_deadline(silence, deadline);
         let mut interim_seen = 0usize;
 
         let (head, ranges, head_end, framing) = loop {
@@ -223,7 +224,7 @@ impl HeadData {
             }
             scanned = head_acc.len();
 
-            let n = budget.read(stream, raw)?;
+            let n = budget.read_proto(stream, raw)?;
             if n == 0 {
                 return Err(ConnectionError::ConnectionClosed.into());
             }

@@ -31,6 +31,16 @@ impl StopSignal {
 pub(crate) struct StopPark(Receiver<()>);
 
 impl StopPark {
+    /// Block until the paired [`StopSignal`] is dropped, or `limit` passes.
+    /// `true` means released; `false` means the span elapsed and the server
+    /// may do one more unit of work.
+    pub(crate) fn wait_for(&self, limit: std::time::Duration) -> bool {
+        match self.0.recv_timeout(limit) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+        }
+    }
+
     /// Block until the paired [`StopSignal`] is dropped. The disconnect is the
     /// message, so this returns on a deliberate release and on a panicking
     /// test alike.

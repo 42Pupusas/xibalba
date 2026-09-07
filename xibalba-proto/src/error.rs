@@ -46,6 +46,11 @@ pub enum ConnectionError {
     /// A per-read timeout is longer than a silence budget it subdivides, so
     /// the first blocked read overshoots the budget it is meant to enforce.
     TimeoutExceedsBudget,
+    /// The operation ran past the total deadline configured for it. Unlike
+    /// the silence budgets, which reset on every byte received and so permit
+    /// an indefinitely slow but unbroken transfer, this bounds the exchange
+    /// as a whole; no further work was started once it passed.
+    RequestDeadlineExceeded,
     /// A plaintext connector was given an HTTPS URL. Connecting anyway would
     /// send the request, and any credentials it carries, in the clear.
     PlaintextConnectorForHttps,
@@ -169,6 +174,9 @@ impl fmt::Display for ConnectionError {
             Self::ZeroDuration => f.write_str("timeouts and silence budgets must be non-zero"),
             Self::TimeoutExceedsBudget => {
                 f.write_str("per-read timeout exceeds the silence budget it subdivides")
+            }
+            Self::RequestDeadlineExceeded => {
+                f.write_str("request deadline exceeded before the operation completed")
             }
             Self::PlaintextConnectorForHttps => {
                 f.write_str("plaintext connector refused an https url")
@@ -374,6 +382,14 @@ mod tests {
             (
                 ConnectionError::InfiniteReadTimeout,
                 "read timeout must be finite",
+            ),
+            (
+                ConnectionError::RequestDeadlineExceeded,
+                "request deadline exceeded before the operation completed",
+            ),
+            (
+                ConnectionError::ConnectDeadlineExceeded,
+                "connect deadline exceeded before the connection was established",
             ),
             (
                 ConnectionError::ReaderGone,

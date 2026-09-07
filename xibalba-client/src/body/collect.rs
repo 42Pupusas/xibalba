@@ -4,7 +4,7 @@ use std::time::Duration;
 use xibalba_proto::error::{ConnectionError, Error};
 
 use crate::config::HEAD_BUF_SIZE;
-use crate::silence::SilenceBudget;
+use crate::silence::{RequestDeadline, SilenceBudget};
 
 /// Buffered-body reader: reads one complete response body into memory
 /// according to its framing, enforcing the client's `max_response_body`.
@@ -20,10 +20,17 @@ pub(crate) struct BodyCollector {
 }
 
 impl BodyCollector {
-    pub(crate) fn new(max_body: usize, silence: Duration) -> Self {
+    /// A collector whose reads also answer to a total deadline for the
+    /// operation that asked for the body. [`RequestDeadline::NONE`] gives
+    /// plain gap-bounded collection.
+    pub(crate) fn with_deadline(
+        max_body: usize,
+        silence: Duration,
+        deadline: RequestDeadline,
+    ) -> Self {
         Self {
             max_body,
-            budget: SilenceBudget::new(silence),
+            budget: SilenceBudget::with_deadline(silence, deadline),
             reusable: true,
         }
     }
@@ -73,7 +80,8 @@ impl BodyCollector {
         body.extend_from_slice(&tail[..from_tail]);
         if body.len() < len {
             body.resize(len, 0);
-            self.budget.read_exact(stream, &mut body[from_tail..])?;
+            self.budget
+                .read_exact_proto(stream, &mut body[from_tail..])?;
         }
         Ok(body)
     }
@@ -111,7 +119,7 @@ impl BodyCollector {
         }
 
         loop {
-            let n = self.budget.read(stream, &mut raw)?;
+            let n = self.budget.read_proto(stream, &mut raw)?;
             if n == 0 {
                 return Err(ConnectionError::ConnectionClosed.into());
             }
@@ -151,7 +159,7 @@ impl BodyCollector {
         let mut body = tail.to_vec();
         let mut raw = [0u8; HEAD_BUF_SIZE];
         loop {
-            let n = self.budget.read(stream, &mut raw)?;
+            let n = self.budget.read_proto(stream, &mut raw)?;
             if n == 0 {
                 return Ok(body);
             }
@@ -177,7 +185,7 @@ mod tests {
         // A head and a small close-delimited body can arrive in one read, so
         // the tail is already over the limit before any further read. An
         // immediate EOF must not hand that body back unchecked.
-        let mut collector = BodyCollector::new(4, BUDGET);
+        let mut collector = BodyCollector::with_deadline(4, BUDGET, RequestDeadline::NONE);
         let err = collector
             .read(
                 &mut Cursor::new(b""),
@@ -193,7 +201,7 @@ mod tests {
 
     #[test]
     fn until_close_overflow_is_rejected() {
-        let mut collector = BodyCollector::new(4, BUDGET);
+        let mut collector = BodyCollector::with_deadline(4, BUDGET, RequestDeadline::NONE);
         let err = collector
             .read(
                 &mut Cursor::new(b"0123456789"),
@@ -209,7 +217,7 @@ mod tests {
 
     #[test]
     fn until_close_within_limit_is_accepted() {
-        let mut collector = BodyCollector::new(10, BUDGET);
+        let mut collector = BodyCollector::with_deadline(10, BUDGET, RequestDeadline::NONE);
         let body = collector
             .read(
                 &mut Cursor::new(b"0123456789"),
@@ -222,7 +230,7 @@ mod tests {
 
     #[test]
     fn until_close_tail_prefixes_the_body() {
-        let mut collector = BodyCollector::new(10, BUDGET);
+        let mut collector = BodyCollector::with_deadline(10, BUDGET, RequestDeadline::NONE);
         let body = collector
             .read(&mut Cursor::new(b"567"), &BodyFraming::UntilClose, b"01234")
             .unwrap();
@@ -231,7 +239,7 @@ mod tests {
 
     #[test]
     fn content_length_at_the_limit_is_accepted() {
-        let mut collector = BodyCollector::new(4, BUDGET);
+        let mut collector = BodyCollector::with_deadline(4, BUDGET, RequestDeadline::NONE);
         let body = collector
             .read(
                 &mut Cursor::new(b"34"),
@@ -244,7 +252,7 @@ mod tests {
 
     #[test]
     fn chunked_overflow_is_rejected() {
-        let mut collector = BodyCollector::new(4, BUDGET);
+        let mut collector = BodyCollector::with_deadline(4, BUDGET, RequestDeadline::NONE);
         let wire = b"4\r\n0123\r\n4\r\n4567\r\n0\r\n\r\n";
         let err = collector
             .read(&mut Cursor::new(&wire[..]), &BodyFraming::Chunked, b"")

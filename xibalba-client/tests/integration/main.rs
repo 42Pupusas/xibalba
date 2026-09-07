@@ -14,6 +14,7 @@ mod builder;
 mod host_header;
 mod redirects;
 mod request_body;
+mod request_deadline;
 mod responses;
 mod size_limits;
 mod streaming;
