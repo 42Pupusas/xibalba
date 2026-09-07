@@ -4,7 +4,7 @@
 
 Audited baseline: `18191e44cb479c8b0e91e8ac1a5054e2115f2b4d`.
 
-Primary scope: every production module in `xibalba-proto` and `xibalba-client`, including the background-reader client because it shares the standard synchronous transport. Reviewed the client integration tests, protocol tests, manifests, README, the TCP/rustls connector example, and benchmark plaintext connector. The experimental `xibalba-iouring` implementation is excluded. TLS provider internals, dependency source audits, live external endpoints, fuzzing, and performance remeasurement are not covered.
+Primary scope: every production module in `xibalba-proto` and `xibalba-client`, including the background-reader client because it shares the standard synchronous transport. Reviewed the client integration tests, protocol tests, manifests, README, the TCP/rustls connector example, and benchmark plaintext connector. The experimental `xibalba-iouring` implementation is excluded. TLS provider internals, dependency source audits, live external endpoints, fuzzing, and performance remeasurement are not covered. (Dependency advisories and fuzzing were out of scope for the *review* and were added by the action plan; see A20.)
 
 This is a source audit plus execution of existing checks, not a claim of exhaustive security verification. Findings below are derived from the named implementation paths; new adversarial regression tests have **not** been implemented or run. Test cases in the action plan are acceptance criteria, not passing reproducers. No production code was changed.
 
@@ -204,7 +204,7 @@ The async module combines public handles/events, queue scheduling, cancellation,
 
 Do not force every graph skip edge away: many protocol edges target shared error/header foundations. Record and justify these, but remove orchestration back-edges and verify graph reports after each extraction. The tool reports zero SCC cycles while dropping back-edges; report that faithfully rather than declaring the graph clean.
 
-### A20 — P3: tests and documentation give incomplete assurance
+### A20 — P3: tests and documentation give incomplete assurance — **done**
 
 **Evidence:** root `tests/integration.rs`; README; `xibalba-client/tests/integration.rs`; public module visibility.
 
@@ -261,7 +261,7 @@ Acceptance status: queue growth is bounded and asserted; every adversarial test 
 
 Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, and every byte-prefix of a valid response head is asserted to parse as `Incomplete`. Corpus discrimination was checked by deliberately miscategorising a differential case and confirming the harness fails rather than passing quietly. Redirect tests assert on the hosts actually dialled, since a wrongly-contacted host is invisible in the returned response. IPv4 and IPv6 loopback dials are covered by `dial.rs`, which also pins first-address-fails fall-through, NODELAY, and HTTPS-rejected-by-plaintext.
 
-### Phase 4 — Structure and maintenance
+### Phase 4 — Structure and maintenance — **complete (A19, A20)**
 
 15. ~~**A19:** extract one module owner at a time, retaining regression behavior and checking graph changes after each step.~~ Done (`0a52933`, `476a728`, this commit), in three steps, each verified against the full suite and the graph before the next.
 
@@ -270,7 +270,7 @@ Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, a
     **Back-edges 3 → 1**, and the survivor is judged rather than hidden: `Admission → Permit` is the shape of an RAII guard, since a guard that releases itself must reach what it borrowed from. Breaking it would mean releasing slots by hand on every exit path, including the ones easiest to forget (cancel, dropped consumer, request discarded while queued). It is documented as such on `Permit`.
 
     Skip edges stay high (135) and are *not* treated as a defect: nearly all target `Error`, `Header`, `HeaderName` and `StatusCode` — shared protocol foundations that everything legitimately depends on, exactly the case the finding says to record rather than force away. The tool still reports 0 SCC cycles while dropping the one back-edge; that is a dropped edge, not a clean graph.
-16. **A20:** compile README examples, reconcile orphan tests, modularize test fixtures, review public visibility, add CI/MSRV/advisory/fuzz checks. **In progress** (`052c71c`, this commit).
+16. ~~**A20:** compile README examples, reconcile orphan tests, modularize test fixtures, review public visibility, add CI/MSRV/advisory/fuzz checks.~~ Done (`052c71c`, `66834e8`, `6c736b6`, `a1f5dcf`, this commit).
 
     **Documentation is now executed** (`052c71c`). The root `tests/integration.rs` was deleted rather than ported: the root is a virtual workspace so it was never discovered, and it imported the pre-split `xibalba` crate, so it could not have compiled if it had been. All six of its cases were confirmed present in `xibalba-client/tests/integration.rs` first. The README had the API backwards in *both* directions — `headers` shown as a field when it is a method, `body()` as a method when it is a field — and both crates ran zero doctests, which is why nothing caught it. There are now five runnable ones against a loopback server, and `xibalba-proto` has crate documentation where it previously had none. `PlainConnector`/`PlainStream` became public: four copy-pasted duplicates existed because every test needs a cleartext connector and the crate shipped none. `cargo graph` caught the fourth, reporting both types at two levels at once.
 
@@ -298,7 +298,21 @@ Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, a
 
     `async_backpressure.rs` keeps real TCP by design and now runs in 0.06s rather than ~1.5s.
 
-    **Not done:** MSRV, advisory, fuzz and CI checks are unstarted.
+    **MSRV stated once and checked** (`a1f5dcf`). The floor was declared in two manifests and verified by nothing, so it was measured rather than trusted — `cargo +1.xx check --ignore-rust-version`, since cargo otherwise refuses on the declared metadata before compiling anything. `xibalba-client` genuinely needs **1.91** (`Duration::from_mins`, stabilised there). `xibalba-proto` compiles on **1.88**; its own floor is let-chains in `request.rs`, and its declared 1.91 was inherited folklore. Three crates declared no MSRV at all.
+
+    One workspace-wide floor at 1.91 is kept, which makes proto's 1.88 a deliberate policy choice rather than an accident — recorded here because lowering it later is compatible while raising it is a break. `msrv.rs` reads the manifests **as text**, because a parsed value reports the resolved number for both an inherited and a literal key and would miss exactly the drift it exists to catch; both assertions were mutation-verified. A trap worth naming: `rust-toolchain.toml` pins 1.95, which silently wins in CI, so the MSRV job overrides it explicitly or it rebuilds the gate's compiler and proves nothing.
+
+    **`cargo-deny` found five real advisories on its first run** (`a1f5dcf`) — not a clean bill. `RUSTSEC-2023-0071` (rsa, Marvin timing attack, no fix exists), three `rustls-webpki` 0.102.8 issues including `RUSTSEC-2026-0104`, a panic reachable *before* signature verification, and unmaintained `paste`. All five arrive through one path: `rustls-rustcrypto` 0.0.2-alpha ← `examples/tls-providers`. `cargo update` cannot fix it, since rustcrypto pins `^0.102` and the patched webpki is 0.103.
+
+    The deciding fact is what the published crates reach: `cargo tree -p xibalba-proto` is empty and `xibalba-client` has two dependencies, so **none of it is reachable from anything we ship**. The bench is therefore excluded from the workspace rather than the advisories being ignored — the audit now covers what we publish. Excluding it from the *audit* is the point; excluding it from the *build* is not, so it keeps its own lockfile and CI job and its 18 adversarial TLS tests still run. The licence allow-list is the tree's own licences read from `cargo metadata`; cargo-deny warns on an allowance nothing matches, so it cannot quietly widen.
+
+    **Fuzzing, and the defect it found** (`d0460b2`). The invariants live in `xibalba-fuzz`, driven by both a fixed-corpus test in the ordinary gate and the libFuzzer targets under `fuzz/`; two drifting sets would mean the cheap gate said nothing about the expensive campaign. The properties worth having are the ones a hand-written case cannot express: every prefix of a parsable head must report `Incomplete` (an incremental caller reads on), parsed fields must point into the caller's buffer — the zero-copy claim, checked by pointer range — and splitting a chunked stream anywhere must decode identically.
+
+    That last one failed immediately. `ChunkedDecoder::decode` returned an error while discarding body bytes it had already written to the caller's output buffer, so `1\r\na\r\nz\r\n` fed whole lost the `a` that the same bytes fed one at a time delivered. Where a socket read happens to break is not something the peer chose. The fix is the rule the code already applied three lines away — `read_trailer` defers `Done` so earlier data takes precedence — now applied to errors, which are held in the decoder state and reported on the next call and every call after it. Neither client call site was exploitable, since both discard the body on error; a decoder that answers differently depending on packet boundaries is still wrong.
+
+    Verified by campaign, not by assertion: 2.3M executions on `chunked_body`, 2.1M on `response_head`, 4.8M on `url`, no crashes and no artifacts. A test holds the surfaces, the fuzz targets and the CI matrix in step, since a renamed surface would otherwise stop being explored in silence.
+
+    **CI** (`a1f5dcf`, `d0460b2`). The hand-run gate — fmt, clippy under `-D warnings`, tests in debug *and* release — plus the three checks a human cannot perform by rebuilding: that the declared floor compiles, that no dependency carries a known advisory (on a schedule, since advisories appear against unchanged code), and that the parsers survive inputs nobody wrote. Two self-inflicted errors are worth recording: the fuzz job named three targets that did not exist for one commit, and `cargo-deny` caught the new crate declared as a wildcard dependency. Both were caught by running the tools rather than by reading the files.
 
 ### A06 residue — the connect deadline (done)
 
@@ -332,7 +346,9 @@ cargo graph --report xibalba-client
 
 For workspace compatibility, also run build/test/Clippy with `--workspace --exclude xibalba-iouring`, acknowledging the benchmark transitive dependency caveat above. Do not run benchmark workloads as ordinary correctness tests. If independent features are introduced, explicitly build, fully test, and lint each meaningful combination, including no-default-features; gate fields and provide real/no-op wrapper twins instead of scattering cfg through business logic.
 
-Before release: run on the declared MSRV and pinned toolchain; execute dependency advisory checks with a current database; run a bounded fuzz campaign for URL/head/chunk parsing; exercise cancellation under a deterministic or model-checked concurrency harness where practical. Record actual results rather than marking planned checks complete.
+Most of this is now enforced rather than remembered. `.github/workflows/ci.yml` runs the gate in debug and release, builds on the declared MSRV with the toolchain pin explicitly overridden, runs `cargo deny check all` on a weekly schedule as well as per push, and fuzzes each parser surface briefly; `cargo test` replays a fixed fuzz corpus through the same invariants. `deny.toml` and the excluded `examples/tls-providers` are the audit boundary, and `xibalba-proto/tests/msrv.rs` fails when a manifest drifts from the workspace floor or from what CI pins.
+
+Still manual before a release: a long fuzz campaign from a seeded corpus (CI runs 60s per target, which proves the target builds and catches an obvious regression — it is not a campaign), and cancellation under a deterministic or model-checked concurrency harness where practical. Record actual results rather than marking planned checks complete.
 
 ## Positive observations to preserve
 
