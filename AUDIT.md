@@ -92,6 +92,8 @@ Cancellation/shutdown checks wrap body reads, but response-head reads use the ra
 
 No reuse decision examines `Connection: close` or HTTP/1.0 persistence defaults. Buffered `send_one()` explicitly discards 101 connections, but streaming and async paths can mark a 101 with no buffered tail clean and issue a later HTTP request on an upgraded connection. `Method::Connect` is exposed, yet framing knows only whether the method is HEAD; successful CONNECT is interpreted as an ordinary response body, potentially reading or waiting on tunnel data.
 
+*Resolved* in `a63417f` and `197ef33` — see Phase 2, item 4.
+
 **Action:** derive a reusable/close/upgraded/tunnel disposition together with framing, shared by all client paths. Honor connection tokens and HTTP version. Reject unsupported upgrades/tunneling explicitly or provide a transport takeover API; never return those connections to HTTP reuse. Test buffered, streaming, and async 101 with no coalesced protocol bytes; CONNECT 2xx; HTTP/1.0 with/without keep-alive; request/response `Connection: close`.
 
 ### A08 — P2: close-delimited buffered body limit can be bypassed by head overshoot
@@ -217,12 +219,16 @@ Work on one behavior or extraction at a time; do not combine the following phase
 1. ~~**A01:** repair chunk digit accounting; add debug/release regression tests.~~ Done (`dee3cd2`). The counter only ever answered "was there a digit?", so it is now a `bool` and cannot overflow.
 2. ~~**A04:** make all transport-write failures poison the connection; test scripted partial failures.~~ Done (`dee3cd2`). Poisoning happens before the first byte is written and clears only after the head is read.
 3. ~~**A03:** enforce clean dispatch on every redirect hop.~~ Done (`5bae5c6`). The earlier green run was the stale-retry path masking the defect while silently writing the hop to a dead connection twice; `sent_on` assertions now pin the hop to the fresh connection.
-4. ~~**A07:** centralize persistence/upgrade/tunnel disposition for buffered, streaming, and async paths.~~ Done (`a63417f`), via `ConnectionReuse` in `reuse.rs`. CONNECT tunnelling remains open and is tracked in A07's finding above.
+4. ~~**A07:** centralize persistence/upgrade/tunnel disposition for buffered, streaming, and async paths.~~ Done (`a63417f`, `197ef33`), via `ConnectionReuse` in `reuse.rs` and, for tunnels, `Method::response_can_have_content`.
+
+    The CONNECT residue is now closed. Framing took `request_method_is_head: bool` — a parameter that can only answer one question — so CONNECT had nowhere to be asked about, and a `CONNECT` 200 carrying `Content-Length: 4096` was framed as a 4096-byte body: the tunnel's first bytes (a TLS ClientHello, in the test) were collected and returned to the caller as content. RFC 9110 §9.3.6 requires the opposite — any 2xx switches to tunnel mode immediately after the header section, and a client must *ignore* `Content-Length` and `Transfer-Encoding` there. The signature now takes the `Method`, and `Method::response_can_have_content` owns the rule for both special cases (HEAD, and 2xx CONNECT). The boundary is tested rather than assumed: a refused CONNECT is an ordinary response — "any response other than a successful response indicates that the tunnel has not yet been formed" — so it keeps its content and framing.
+
+    Correct framing is necessary but not sufficient, since this client has no API for surrendering the socket to a caller. CONNECT is therefore also refused *before the request is written*, as `ConnectionError::TunnelingNotSupported`. Refusing after the write would leave a proxy in tunnel mode facing a client that only speaks HTTP; refusing before it leaves the connection untouched, which a test pins with an ordinary GET afterwards. `xibalba-iouring` never carried the method to its response either (it passed `false` unconditionally, so HEAD was already mishandled there); it now passes `Method::Get`, the same behaviour spelled honestly, with the gap recorded at the call site.
 5. ~~**A02:** introduce explicit replay policy with safe non-idempotent defaults.~~ Done (`c7bb141`). `Method::is_replay_eligible` gates the retry; `RequestBuilder::allow_replay` is the opt-in.
 
 Acceptance met: the scripted connector records per-connection bytes, and every failure/reuse test asserts on connection count and on which connection carried the request. 291 tests pass in debug and release; Clippy is clean under `-D warnings`.
 
-Carried into later phases: CONNECT tunnel handling (A07), and the async paths still retry via `send_head` without the cancellation coverage A06 describes.
+Carried into later phases: the async paths still retry via `send_head` without the cancellation coverage A06 describes. (CONNECT tunnel handling, previously carried here, closed in `197ef33`.)
 
 ### Phase 2 — Make cancellation and resource bounds real — **complete (A05, A06, A08, A09, A14, A15)**
 
