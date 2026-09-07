@@ -13,7 +13,7 @@ use xibalba_proto::version::Version;
 /// from the response head so the three rules live in one place instead of
 /// being re-decided per call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionReuse {
+pub(crate) enum ConnectionReuse {
     /// Reusable once the body has been fully read.
     Keep,
     /// Must not carry another request.
@@ -21,7 +21,7 @@ pub enum ConnectionReuse {
 }
 
 impl ConnectionReuse {
-    pub fn evaluate<'a>(
+    pub(crate) fn evaluate<'a>(
         version: Version,
         status: StatusCode,
         headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
@@ -57,7 +57,7 @@ impl ConnectionReuse {
         }
     }
 
-    pub const fn is_keep(self) -> bool {
+    pub(crate) const fn is_keep(self) -> bool {
         matches!(self, Self::Keep)
     }
 }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 /// to callers when it tripped. The budget resets on every successful read:
 /// it bounds *silence*, not total transfer time.
 #[derive(Debug)]
-pub struct SilenceBudget {
+pub(crate) struct SilenceBudget {
     limit: Duration,
     last_progress: Instant,
 }
@@ -33,7 +33,7 @@ impl SilenceBudget {
         )
     }
 
-    pub fn new(limit: Duration) -> Self {
+    pub(crate) fn new(limit: Duration) -> Self {
         Self {
             limit,
             last_progress: Instant::now(),
@@ -54,7 +54,11 @@ impl SilenceBudget {
 
     /// Read from `stream`, absorbing timeout ticks until data arrives or the
     /// silence budget is exhausted. Progress resets the budget.
-    pub fn read(&mut self, stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    pub(crate) fn read(
+        &mut self,
+        stream: &mut impl Read,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
         loop {
             let tick_start = Instant::now();
             match stream.read(buf) {
@@ -87,7 +91,11 @@ impl SilenceBudget {
     const MIN_TICK: Duration = Duration::from_millis(1);
 
     /// Like [`std::io::Read::read_exact`] but through the silence budget.
-    pub fn read_exact(&mut self, stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
+    pub(crate) fn read_exact(
+        &mut self,
+        stream: &mut impl Read,
+        buf: &mut [u8],
+    ) -> std::io::Result<()> {
         let mut off = 0;
         while off < buf.len() {
             let n = self.read(stream, &mut buf[off..])?;

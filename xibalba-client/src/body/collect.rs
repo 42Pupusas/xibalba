@@ -13,14 +13,14 @@ use crate::silence::SilenceBudget;
 /// framing-specific paths an owner and keeps the buffer-sizing choices
 /// (`HEAD_BUF_SIZE` scratch, capacity preset) local to the type that makes
 /// them.
-pub struct BodyCollector {
+pub(crate) struct BodyCollector {
     max_body: usize,
     budget: SilenceBudget,
     reusable: bool,
 }
 
 impl BodyCollector {
-    pub fn new(max_body: usize, silence: Duration) -> Self {
+    pub(crate) fn new(max_body: usize, silence: Duration) -> Self {
         Self {
             max_body,
             budget: SilenceBudget::new(silence),
@@ -28,7 +28,7 @@ impl BodyCollector {
         }
     }
 
-    pub fn read<S: Read>(
+    pub(crate) fn read<S: Read>(
         &mut self,
         stream: &mut S,
         framing: &xibalba_proto::response::BodyFraming,
@@ -52,7 +52,7 @@ impl BodyCollector {
     }
 
     #[must_use]
-    pub const fn is_reusable(&self) -> bool {
+    pub(crate) const fn is_reusable(&self) -> bool {
         self.reusable
     }
 

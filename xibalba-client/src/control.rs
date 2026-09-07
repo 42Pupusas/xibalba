@@ -33,7 +33,7 @@ pub(crate) const CANCEL_ANY: u64 = u64::MAX;
 /// One streaming request handed to the reader thread. The reader
 /// takes ownership of the request buffers and the chunk-ring
 /// producer.
-pub struct AsyncRequest {
+pub(crate) struct AsyncRequest {
     pub(crate) method: Method,
     pub(crate) path: Vec<u8>,
     pub(crate) query: Option<Vec<u8>>,

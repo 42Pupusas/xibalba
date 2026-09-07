@@ -16,7 +16,7 @@ const FULL_RING_POLL: Duration = Duration::from_millis(1);
 
 /// Why a chunk could not be handed to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Undelivered {
+pub(crate) enum Undelivered {
     /// The caller dropped its handle; nobody will read the rest.
     ConsumerGone,
     /// The client is shutting down and the ring never freed a slot.
@@ -30,7 +30,7 @@ pub enum Undelivered {
 /// park, so liveness is published here instead: the guard travels with the
 /// consumer and clears the flag when that consumer is dropped.
 #[derive(Debug)]
-pub struct ConsumerGuard(Arc<AtomicBool>);
+pub(crate) struct ConsumerGuard(Arc<AtomicBool>);
 
 impl ConsumerGuard {
     pub(crate) fn new() -> (Self, Arc<AtomicBool>) {
@@ -86,7 +86,7 @@ impl ChunkStream {
 /// no longer polling the shutdown flag, so `AsyncClient::drop` waits on a
 /// `join` that cannot finish. This retries a non-blocking push and gives up as
 /// soon as either shutdown is signalled or the consumer goes away.
-pub struct ChunkSink<'a> {
+pub(crate) struct ChunkSink<'a> {
     tx: &'a Producer<Chunk>,
     consumer_alive: &'a AtomicBool,
     shutting_down: &'a AtomicBool,

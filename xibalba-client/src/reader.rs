@@ -20,13 +20,13 @@ use crate::{Chunk, response::HeadData, reuse::ConnectionReuse};
 
 /// Owns the connection for the reader thread's lifetime and serves one
 /// request at a time from the control queue.
-pub struct ReaderWorker<C: Connector, const MAX_HEAD_SIZE: usize> {
+pub(crate) struct ReaderWorker<C: Connector, const MAX_HEAD_SIZE: usize> {
     client: Client<C, MAX_HEAD_SIZE>,
     queue: ControlQueue,
 }
 
 impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
-    pub const fn new(client: Client<C, MAX_HEAD_SIZE>, queue: ControlQueue) -> Self {
+    pub(crate) const fn new(client: Client<C, MAX_HEAD_SIZE>, queue: ControlQueue) -> Self {
         Self { client, queue }
     }
 
@@ -35,7 +35,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
     /// Each request is owned for exactly one iteration, which is what frees
     /// its admission slot: the permit it carries must outlive the response,
     /// and drops with the request once the response is finished.
-    pub fn run(&mut self) {
+    pub(crate) fn run(&mut self) {
         while let Some(request) = self.queue.next_request() {
             self.serve(&request);
         }

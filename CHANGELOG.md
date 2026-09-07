@@ -98,10 +98,19 @@ These compile without error and return different results. Check them first.
   - `body::HeadData` → `response::HeadData`
   - `body::HEAD_BUF_SIZE` → `config::HEAD_BUF_SIZE`
   - `client::{Config, DEFAULT_MAX_HEAD_SIZE}` → `config::`
-  - `client::RequestBuilder` → `params::`
   - `client::{Response, StreamingResponse}` → `response::`
 - `xibalba_client::body::MAX_HEADERS` is no longer re-exported; use
   `xibalba_proto::response::MAX_HEADERS`.
+- **Modules carrying no usable public API are now private:** `control`,
+  `redirect`, `params`, and `admission`. `RequestBuilder` (from `params`) and
+  `DEFAULT_MAX_OUTSTANDING` (from `admission`) are unaffected — both are
+  reached through the crate root, which is how the documentation always
+  spelled them. `control` and `redirect` exported no public item at all.
+- `AsyncRequest`, `Admission` and `Permit` are no longer public. All three are
+  internal to `AsyncClient`: `AsyncRequest` had no public constructor and no
+  public accessor, and the admission bound is fixed at
+  `DEFAULT_MAX_OUTSTANDING`, so no caller could construct or configure one.
+  `AsyncClient::outstanding()` remains the way to read the current count.
 - `HeaderRange` offsets and lengths widened from `u16` to `u32`, with the new
   `MAX_ADDRESSABLE_HEAD` naming the ceiling. A `MAX_HEAD_SIZE` above 64 KiB
   previously failed with `HeaderRangeOverflow` whenever a header sat past that

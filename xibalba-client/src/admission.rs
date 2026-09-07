@@ -16,14 +16,13 @@ pub const DEFAULT_MAX_OUTSTANDING: usize = 64;
 /// moment it is submitted until the reader finishes with it, whether it is
 /// waiting in the ring, parked in the pending queue, or on the wire.
 #[derive(Debug)]
-pub struct Admission {
+pub(crate) struct Admission {
     outstanding: AtomicUsize,
     max: usize,
 }
 
 impl Admission {
-    #[must_use]
-    pub const fn new(max: usize) -> Self {
+    pub(crate) const fn new(max: usize) -> Self {
         Self {
             outstanding: AtomicUsize::new(0),
             max,
@@ -32,7 +31,7 @@ impl Admission {
 
     /// Take a permit, or return `None` when the client is already at its
     /// limit. The permit releases itself when dropped.
-    pub fn try_admit(self: &Arc<Self>) -> Option<Permit> {
+    pub(crate) fn try_admit(self: &Arc<Self>) -> Option<Permit> {
         let mut current = self.outstanding.load(Ordering::Acquire);
         loop {
             if current >= self.max {
@@ -51,15 +50,8 @@ impl Admission {
     }
 
     /// How many requests are currently admitted.
-    #[must_use]
-    pub fn outstanding(&self) -> usize {
+    pub(crate) fn outstanding(&self) -> usize {
         self.outstanding.load(Ordering::Acquire)
-    }
-
-    /// The configured ceiling.
-    #[must_use]
-    pub const fn max(&self) -> usize {
-        self.max
     }
 }
 
@@ -75,7 +67,7 @@ impl Admission {
 /// the paths that would have to remember include the ones that are easy to
 /// forget — a cancel, a dropped consumer, a request discarded while queued.
 #[derive(Debug)]
-pub struct Permit(Arc<Admission>);
+pub(crate) struct Permit(Arc<Admission>);
 
 impl Drop for Permit {
     fn drop(&mut self) {

@@ -21,8 +21,14 @@ xibalba-iouring = { path = "xibalba-iouring", version = "0.1.0" }
 quetzalcoatl = "0.14.0"
 ququmatz = "0.15.1"
 
+[workspace.lints.rust]
+unreachable_pub = "warn"
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+# Contradicts rust::unreachable_pub, which we keep: it is the one that catches
+# an item exported from the crate root by accident.
+redundant_pub_crate = "allow"
