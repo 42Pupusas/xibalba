@@ -141,6 +141,11 @@ These compile without error and return different results. Check them first.
   and rustls' `ServerName` both reject `[::1]`, so a connector using
   `Url::host` fails on every IPv6 URL.
 - New variant `ConnectionError::PlaintextConnectorForHttps`.
+- New `PlainConnector` and `PlainStream`: a cleartext-only `Connector` for
+  `http://` URLs, refusing `https://` rather than connecting in the clear.
+  Four private copies of it existed across the tests, benches and examples;
+  this is the one implementation. HTTPS still requires a caller-supplied
+  connector, and the crate still links no TLS stack.
 - **`RequestBuilder::send(&mut client)` is removed.** It only called
   `client.send(builder)`, which remains and is the one way to dispatch a
   built request. The convenience was what made the builder depend on the

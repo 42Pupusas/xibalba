@@ -13,13 +13,13 @@ A minimal HTTP/1.1 client for Rust with a streaming body reader and zero-copy pa
 ## Usage
 
 ```rust
-use xibalba_client::client::Client;
+use xibalba_client::Client;
 // Supply the connector for the transport/TLS stack your application uses.
-use my_connector::Connector;
+use my_connector::MyTlsConnector;
 
 fn main() -> Result<(), xibalba_client::proto::error::Error> {
-    let mut client = Client::<Connector>::connect_default(
-        b"https://example.com/", Connector::tls_config()?
+    let mut client = Client::<MyTlsConnector>::connect_default(
+        b"https://example.com/", MyTlsConnector::tls_config()?
     )?;
     let response = client.get(b"/")?;
 
@@ -29,29 +29,54 @@ fn main() -> Result<(), xibalba_client::proto::error::Error> {
 }
 ```
 
-### Accessing headers
+For plain HTTP, `PlainConnector` ships with the crate and needs no TLS config:
 
 ```rust
-for (name, value) in &response.headers {
+use xibalba_client::{Client, PlainConnector};
+
+let mut client = Client::<PlainConnector>::connect_default(b"http://127.0.0.1:8080/", ())?;
+```
+
+It refuses `https://` URLs rather than sending the request in the clear.
+
+### Accessing headers
+
+`headers()` is a method returning an iterator of `(&[u8], &[u8])`. Header
+names are compared case-insensitively, as HTTP requires:
+
+```rust
+for (name, value) in response.headers() {
     println!("{}: {}", String::from_utf8_lossy(name), String::from_utf8_lossy(value));
 }
+
+let content_type = response
+    .headers()
+    .find(|(name, _)| name.eq_ignore_ascii_case(b"content-type"))
+    .map(|(_, value)| value);
 ```
+
+Read the headers before calling `text()`, which consumes the response.
 
 ### Streaming the body
 
-`response.body()` implements `std::io::Read`:
+`response.body` is a field implementing `std::io::Read`. A `get` returns as
+soon as the head is parsed, so reading it incrementally never buffers the
+whole body:
 
 ```rust
 use std::io::Read;
 
 let mut buf = [0u8; 8192];
-let mut body = response.body();
 loop {
-    let n = body.read(&mut buf)?;
+    let n = response.body.read(&mut buf)?;
     if n == 0 { break; }
     // process &buf[..n]
 }
 ```
+
+Both forms are compiled and run as documentation tests on
+[`xibalba_client`](xibalba-client/src/lib.rs); see the crate docs for the
+complete runnable versions.
 
 ## Benchmarks
 

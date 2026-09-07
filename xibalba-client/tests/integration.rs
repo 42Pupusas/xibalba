@@ -7,50 +7,11 @@ use xibalba_client::async_client::{AsyncClient, Chunk};
 use xibalba_client::client::{Client, Config};
 
 const SMALL_HEAD_SIZE: usize = 256;
-use xibalba_client::connector::{Connector, SetReadTimeout};
-use xibalba_client::dial::TcpDialer;
+use xibalba_client::PlainConnector;
 use xibalba_client::proto::error::{ConnectionError, Error};
 use xibalba_client::proto::method::Method;
-use xibalba_client::proto::url::Url;
 
 // ── Plain TCP connector ───────────────────────────────────────────────────────
-
-struct PlainConnector;
-struct PlainStream(TcpStream);
-
-impl SetReadTimeout for PlainStream {
-    fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
-        self.0.set_read_timeout(dur)
-    }
-
-    fn set_write_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
-        self.0.set_write_timeout(dur)
-    }
-}
-
-impl Read for PlainStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl Write for PlainStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-impl Connector for PlainConnector {
-    type Stream = PlainStream;
-    type TlsConfig = ();
-
-    fn connect(url: &Url<'_>, _tls_config: &()) -> Result<PlainStream, Error> {
-        TcpDialer::default().dial_plaintext(url).map(PlainStream)
-    }
-}
 
 // ── Test server helpers ───────────────────────────────────────────────────────
 

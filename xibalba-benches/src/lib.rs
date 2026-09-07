@@ -1,7 +1,6 @@
-pub mod plain_connector;
 pub mod server;
-pub use plain_connector::{PlainConnector, PlainStream};
 pub use server::EchoServer;
+pub use xibalba_client::{PlainConnector, PlainStream};
 
 // ── Response head fixtures ─────────────────────────────────────────────────
 

@@ -11,7 +11,7 @@
 //! to the code being measured.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
@@ -19,13 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use xibalba_client::DEFAULT_MAX_OUTSTANDING;
+use xibalba_client::PlainConnector;
 use xibalba_client::async_client::{AsyncClient, Chunk};
 use xibalba_client::client::Config;
-use xibalba_client::connector::{Connector, SetReadTimeout};
-use xibalba_client::dial::TcpDialer;
 use xibalba_client::proto::error::{ConnectionError, Error};
 use xibalba_client::proto::method::Method;
-use xibalba_client::proto::url::Url;
 
 /// Mirrors `async_client::CHUNK_RING_CAP`, which is private. If the reader's
 /// ring grows, this must grow with it or these tests stop proving saturation.
@@ -60,43 +58,6 @@ impl Watchdog {
                 panic!("{what} panicked before producing a value")
             }
         }
-    }
-}
-
-struct PlainConnector;
-struct PlainStream(TcpStream);
-
-impl SetReadTimeout for PlainStream {
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.0.set_read_timeout(dur)
-    }
-
-    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.0.set_write_timeout(dur)
-    }
-}
-
-impl Read for PlainStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl Write for PlainStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-impl Connector for PlainConnector {
-    type Stream = PlainStream;
-    type TlsConfig = ();
-
-    fn connect(url: &Url<'_>, _tls: &()) -> Result<PlainStream, Error> {
-        TcpDialer::default().dial_plaintext(url).map(PlainStream)
     }
 }
 
