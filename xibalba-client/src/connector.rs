@@ -38,6 +38,10 @@ pub trait SetReadTimeout {
     /// calls, so without this bound there is no point at which a cancel or a
     /// shutdown can be observed: `AsyncClient::drop` waits for the peer.
     ///
+    /// Like `read_timeout`, this is a per-call ceiling and not a failure
+    /// threshold: an expiry is absorbed as a tick and retried against the
+    /// head-silence budget, which is what decides that a write has stalled.
+    ///
     /// The default does nothing, which keeps existing connectors compiling.
     /// A connector that leaves it unimplemented is declaring that its writes
     /// cannot block indefinitely; a TCP-backed one should forward this to the
@@ -106,8 +110,10 @@ pub trait Connector {
     ///   restarting the clock.
     /// - **The TLS handshake**, if the implementation performs it eagerly. A
     ///   lazily negotiated session (see the `tcp-rustls` example) instead
-    ///   completes inside the first read or write, where the client's read and
-    ///   write timeouts already bound it.
+    ///   completes inside the client's first read or write, where the silence
+    ///   budgets bound it. Note which budget: the handshake blocks waiting for
+    ///   the peer's records even when it is a *write* that drives it, so it is
+    ///   the head-silence budget that covers it, not `write_timeout` alone.
     ///
     /// [`Deadline::never`] asks for no bound, and the client only sends it
     /// when the caller configured `connect_timeout: None`.

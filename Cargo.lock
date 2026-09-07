@@ -1603,6 +1603,7 @@ dependencies = [
 name = "tcp-rustls"
 version = "0.1.0"
 dependencies = [
+ "rcgen",
  "rustls",
  "webpki-roots",
  "xibalba-client",

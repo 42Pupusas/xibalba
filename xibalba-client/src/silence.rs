@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use xibalba_proto::error::Error;
 
+use crate::tick::Tick;
+
 /// Marks an [`std::io::Error`] as *the request deadline passed*, as opposed
 /// to the peer going silent (a silence budget) or the caller cancelling.
 ///
@@ -103,20 +105,6 @@ pub(crate) struct SilenceBudget {
 }
 
 impl SilenceBudget {
-    /// Whether `error` is a per-read timeout tick rather than a failure.
-    ///
-    /// Linux returns `EAGAIN`/`WouldBlock` from a `SO_RCVTIMEO` socket, but
-    /// that is a platform detail, not a guarantee: Windows sockets and several
-    /// TLS wrappers report the same condition as `TimedOut`. Absorbing only
-    /// `WouldBlock` ended the request on the first tick everywhere else,
-    /// collapsing the whole silence budget to a single `read_timeout`.
-    fn is_tick(error: &std::io::Error) -> bool {
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        )
-    }
-
     pub(crate) fn new(limit: Duration) -> Self {
         Self::with_deadline(limit, RequestDeadline::NONE)
     }
@@ -166,29 +154,16 @@ impl SilenceBudget {
                     self.last_progress = Instant::now();
                     return Ok(n);
                 }
-                Err(e) if Self::is_tick(&e) => {
+                Err(e) if Tick::marks(&e) => {
                     if self.last_progress.elapsed() >= self.limit {
                         return Err(self.expired());
                     }
-                    if let Some(pause) = Self::MIN_TICK.checked_sub(tick_start.elapsed()) {
-                        std::thread::sleep(pause);
-                    }
+                    Tick::pace(tick_start);
                 }
                 Err(e) => return Err(e),
             }
         }
     }
-
-    /// Shortest gap between two consecutive timeout ticks before the budget
-    /// assumes it is spinning rather than waiting.
-    ///
-    /// A blocking socket with `SO_RCVTIMEO` parks for the whole read timeout
-    /// before ticking, so this never fires for one. A connector left in
-    /// non-blocking mode returns `WouldBlock` immediately and the retry loop
-    /// becomes a busy loop that burns a core for the entire silence budget;
-    /// the pause keeps it a wait. It bounds cancellation latency too, so it
-    /// stays far below any useful read timeout.
-    const MIN_TICK: Duration = Duration::from_millis(1);
 
     /// Like [`std::io::Read::read_exact`] but through the silence budget.
     pub(crate) fn read_exact(

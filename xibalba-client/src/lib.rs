@@ -102,6 +102,8 @@ mod reader;
 mod redirect;
 mod reuse;
 mod silence;
+mod tick;
+mod write_budget;
 
 pub use xibalba_proto as proto;
 

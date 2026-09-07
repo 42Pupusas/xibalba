@@ -50,20 +50,29 @@ impl StreamPlan {
         }
     }
 
-    /// Accept `budget` request bytes, then fail. `TimedOut` is deliberate:
-    /// it is outside the stale-keep-alive set, so no automatic retry runs
-    /// and the test observes poisoning alone.
+    /// The kind these plans fail with, chosen to sit outside two sets at
+    /// once. It must not be in the stale-keep-alive set (`BrokenPipe`,
+    /// `ConnectionReset`, `UnexpectedEof`, `ConnectionAborted`) or the client
+    /// reconnects and retries, and the test would count that reconnect
+    /// instead of the poisoning it means to observe. It must also not be a
+    /// timeout tick (`WouldBlock`, `TimedOut`), which the write budget
+    /// absorbs and retries until the budget expires — these plans fail every
+    /// write, so a tick would make each test wait out the whole head-silence
+    /// budget before failing.
+    const FAILURE: ErrorKind = ErrorKind::NotConnected;
+
+    /// Accept `budget` request bytes, then fail permanently.
     fn fails_write_after(budget: usize) -> Self {
         Self {
             write_budget: budget,
-            write_error: Some(ErrorKind::TimedOut),
+            write_error: Some(Self::FAILURE),
             ..Self::healthy()
         }
     }
 
     fn fails_flush() -> Self {
         Self {
-            flush_error: Some(ErrorKind::TimedOut),
+            flush_error: Some(Self::FAILURE),
             ..Self::healthy()
         }
     }

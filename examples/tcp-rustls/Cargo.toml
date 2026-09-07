@@ -2,6 +2,11 @@
 name = "tcp-rustls"
 version = "0.1.0"
 edition = "2024"
+publish = false
+
+[lib]
+name = "tcp_rustls"
+path = "src/lib.rs"
 
 [[bin]]
 name = "tcp-rustls"
@@ -12,6 +17,9 @@ xibalba-client = { workspace = true }
 xibalba-proto = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "1"
+
+[dev-dependencies]
+rcgen = "0.14"
 
 [lints]
 workspace = true

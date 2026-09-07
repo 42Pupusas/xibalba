@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
@@ -17,6 +15,7 @@ use crate::params::RequestParams;
 use crate::redirect::{Hop, RedirectState};
 use crate::response::HeadData;
 use crate::silence::RequestDeadline;
+use crate::write_budget::WriteBudget;
 
 pub use crate::config::{Config, DEFAULT_MAX_HEAD_SIZE};
 pub use crate::params::RequestBuilder;
@@ -322,20 +321,27 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         // Both the write and the head read run through the interrupt, so a
         // peer that stops reading mid-upload, or never answers, cannot pin the
         // caller until the silence budget expires.
+        //
+        // The write goes through a budget for the same reason the head read
+        // does: `write_timeout` is a per-call ceiling for cancel latency, not
+        // a failure threshold. A lazily negotiated TLS session also completes
+        // its handshake inside this write, where it blocks on the peer's
+        // records and expires on the socket's *receive* timeout.
         let inline = params.body.is_some_and(|d| self.inline_body_fits(d.len()));
+        let mut budget = WriteBudget::new(self.config.head_silence);
         let mut wire = InterruptibleStream::new(&mut self.stream, interrupt);
         match params.body {
             Some(data) if inline => {
                 self.write_buf.extend_from_slice(data);
-                wire.write_all(&self.write_buf)?;
+                budget.write_all(&mut wire, &self.write_buf)?;
             }
             Some(data) => {
-                wire.write_all(&self.write_buf)?;
-                wire.write_all(data)?;
+                budget.write_all(&mut wire, &self.write_buf)?;
+                budget.write_all(&mut wire, data)?;
             }
-            None => wire.write_all(&self.write_buf)?,
+            None => budget.write_all(&mut wire, &self.write_buf)?,
         }
-        wire.flush()?;
+        budget.flush(&mut wire)?;
 
         // A rejected head (notably HeadTooLarge) may already have consumed a
         // prefix of the response, so the poison above stands on every error

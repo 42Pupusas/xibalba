@@ -28,7 +28,9 @@ pub struct Config {
     /// Per-socket-write ceiling (`SO_SNDTIMEO`), the write-side twin of
     /// `read_timeout`. A peer that stops reading fills the socket buffers and
     /// a single write blocks; this is the granularity at which a cancel or
-    /// shutdown is observed during a request upload.
+    /// shutdown is observed during a request upload. Like `read_timeout` it is
+    /// a granularity and not a failure threshold: an expiry is retried against
+    /// `head_silence`, which is what decides the write has stalled.
     ///
     /// Only effective when the connector implements
     /// [`SetWriteTimeout`](crate::connector::SetReadTimeout::set_write_timeout);
@@ -50,8 +52,14 @@ pub struct Config {
     pub connect_timeout: Option<Duration>,
     pub max_response_body: usize,
     pub max_redirects: u8,
-    /// Total wall-clock silence tolerated while waiting for a response
-    /// head (between flushing the request and the first response byte).
+    /// Total wall-clock silence tolerated across dispatching a request and
+    /// waiting for its response head.
+    ///
+    /// This covers the write as well as the wait. A lazily negotiated TLS
+    /// session completes its handshake inside the client's first write, which
+    /// blocks on the peer's records and expires on the socket's *receive*
+    /// timeout; a server merely slow to begin its handshake would otherwise
+    /// fail after one `read_timeout`.
     ///
     /// Inference providers legitimately spend a long time queueing,
     /// doing prompt-cache lookup, and initial reasoning before they
