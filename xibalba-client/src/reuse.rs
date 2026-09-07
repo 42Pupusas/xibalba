@@ -4,14 +4,72 @@ use xibalba_proto::bytes::ByteSliceExt;
 use xibalba_proto::status::StatusCode;
 use xibalba_proto::version::Version;
 
+/// Which headers in the response head declared where the body ends.
+///
+/// Kept apart from the connection tokens because the two answer different
+/// questions: these decide whether the *message* boundary is agreed, the
+/// tokens whether the peer intends to stay.
+#[derive(Debug, Default, Clone, Copy)]
+struct FramingHeaders {
+    transfer_encoding: bool,
+    content_length: bool,
+}
+
+impl FramingHeaders {
+    /// Whether the sender described where this message ends in two ways that
+    /// a recipient could read differently.
+    ///
+    /// Both cases come from RFC 9112. Transfer-Encoding beside Content-Length
+    /// (§6.3) is resolved in favour of the coding for *this* client, but an
+    /// intermediary that chose the length has left the remainder of the body
+    /// on the wire, where the next response would be read from. An HTTP/1.0
+    /// message carrying any transfer coding (§6.1) is faulty framing outright,
+    /// Content-Length or not, since the sender may hold buffered bytes that
+    /// further use of the connection would misread.
+    const fn is_ambiguous(self, version: Version) -> bool {
+        let both_framings = self.transfer_encoding && self.content_length;
+        let coding_on_http10 = self.transfer_encoding && matches!(version, Version::Http10);
+        both_framings || coding_on_http10
+    }
+}
+
+/// What the response head said about the connection and its framing.
+///
+/// One pass over the headers, because the iterator yields borrowed slices and
+/// walking it twice would mean either collecting or re-parsing.
+#[derive(Debug, Default, Clone, Copy)]
+struct HeadSurvey {
+    announced_close: bool,
+    announced_keep_alive: bool,
+    framing: FramingHeaders,
+}
+
+impl HeadSurvey {
+    fn of<'a>(headers: impl Iterator<Item = (&'a [u8], &'a [u8])>) -> Self {
+        let mut survey = Self::default();
+        for (name, value) in headers {
+            if name.ascii_eq_ignore_case(b"Connection") {
+                survey.announced_close |= value.contains_token_ignore_case(b"close");
+                survey.announced_keep_alive |= value.contains_token_ignore_case(b"keep-alive");
+            } else if name.ascii_eq_ignore_case(b"Transfer-Encoding") {
+                survey.framing.transfer_encoding = true;
+            } else if name.ascii_eq_ignore_case(b"Content-Length") {
+                survey.framing.content_length = true;
+            }
+        }
+        survey
+    }
+}
+
 /// Whether the connection may carry another request once the current
 /// response has been fully consumed.
 ///
 /// Draining a body is necessary for reuse but not sufficient: the peer can
-/// announce a close, HTTP/1.0 defaults to closing, and a protocol switch
-/// takes the socket out of HTTP entirely. Every client path derives this
-/// from the response head so the three rules live in one place instead of
-/// being re-decided per call site.
+/// announce a close, HTTP/1.0 defaults to closing, a protocol switch takes the
+/// socket out of HTTP entirely, and framing the message two ways leaves no
+/// agreed byte for the next one to start at. Every client path derives this
+/// from the response head so the rules live in one place instead of being
+/// re-decided per call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionReuse {
     /// Reusable once the body has been fully read.
@@ -32,23 +90,16 @@ impl ConnectionReuse {
             return Self::Close;
         }
 
-        let mut announced_close = false;
-        let mut announced_keep_alive = false;
-        for (name, value) in headers {
-            if name.ascii_eq_ignore_case(b"Connection") {
-                announced_close |= value.contains_token_ignore_case(b"close");
-                announced_keep_alive |= value.contains_token_ignore_case(b"keep-alive");
-            }
-        }
+        let survey = HeadSurvey::of(headers);
 
-        if announced_close {
+        if survey.announced_close || survey.framing.is_ambiguous(version) {
             return Self::Close;
         }
 
         match version {
             Version::Http11 => Self::Keep,
             Version::Http10 => {
-                if announced_keep_alive {
+                if survey.announced_keep_alive {
                     Self::Keep
                 } else {
                     Self::Close
@@ -129,6 +180,80 @@ mod tests {
                 Version::Http10,
                 StatusCode::OK,
                 &[(b"Connection", b"Keep-Alive")]
+            ),
+            ConnectionReuse::Keep
+        );
+    }
+
+    /// RFC 9112 §6.3: the coding wins the framing, but the disagreement is
+    /// what ends the connection — an intermediary that read the length instead
+    /// left the rest of the body where the next response would begin.
+    #[test]
+    fn framing_a_response_two_ways_ends_the_connection() {
+        assert_eq!(
+            evaluate(
+                Version::Http11,
+                StatusCode::OK,
+                &[
+                    (b"Transfer-Encoding", b"chunked"),
+                    (b"Content-Length", b"3")
+                ]
+            ),
+            ConnectionReuse::Close
+        );
+    }
+
+    /// Order is not part of the rule, and neither is casing.
+    #[test]
+    fn the_two_framings_are_recognised_in_either_order() {
+        assert_eq!(
+            evaluate(
+                Version::Http11,
+                StatusCode::OK,
+                &[
+                    (b"content-length", b"3"),
+                    (b"transfer-encoding", b"chunked")
+                ]
+            ),
+            ConnectionReuse::Close
+        );
+    }
+
+    /// RFC 9112 §6.1: an HTTP/1.0 message carrying a transfer coding is faulty
+    /// framing on its own, with no Content-Length needed to make it ambiguous,
+    /// and keep-alive does not redeem it.
+    #[test]
+    fn a_transfer_coding_on_http10_ends_the_connection_despite_keep_alive() {
+        assert_eq!(
+            evaluate(
+                Version::Http10,
+                StatusCode::OK,
+                &[
+                    (b"Transfer-Encoding", b"chunked"),
+                    (b"Connection", b"keep-alive")
+                ]
+            ),
+            ConnectionReuse::Close
+        );
+    }
+
+    /// The boundary the rule turns on: each framing alone is unambiguous, so
+    /// neither may cost the connection on its own.
+    #[test]
+    fn either_framing_alone_keeps_the_connection() {
+        assert_eq!(
+            evaluate(
+                Version::Http11,
+                StatusCode::OK,
+                &[(b"Transfer-Encoding", b"chunked")]
+            ),
+            ConnectionReuse::Keep
+        );
+        assert_eq!(
+            evaluate(
+                Version::Http11,
+                StatusCode::OK,
+                &[(b"Content-Length", b"3")]
             ),
             ConnectionReuse::Keep
         );
