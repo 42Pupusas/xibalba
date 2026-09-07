@@ -190,7 +190,7 @@ The library's own parser supplies consistent counts, so this is not a demonstrat
 
 **Note:** `xibalba-iouring::driver::HeadData` still exposes the same public buffer/ranges/count triple. It is unpublished and outside the audited scope, so it was left alone; if it is ever published it needs the same treatment.
 
-### A19 — P3: module ownership and graph structure need incremental cleanup
+### A19 — P3: module ownership and graph structure need incremental cleanup — **done**
 
 **Evidence:** `async_client.rs`, proto `response.rs`, client `response.rs`, `params.rs`, `redirect.rs`, graph reports above.
 
@@ -245,7 +245,13 @@ Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, a
 
 ### Phase 4 — Structure and maintenance
 
-15. **A19:** extract one module owner at a time, retaining regression behavior and checking graph changes after each step.
+15. ~~**A19:** extract one module owner at a time, retaining regression behavior and checking graph changes after each step.~~ Done (`0a52933`, `476a728`, this commit), in three steps, each verified against the full suite and the graph before the next.
+
+    `ControlQueue` and `ReaderWorker` took the async module's channel protocol and request lifecycle out of `async_client.rs` (783 → 370 lines), replacing the free `run_reader`/`poll_control`/`process_request` and the four parameters they threaded between them. `Hop` and `Origin` turned redirect resolution into a decision the client acts on, rather than a loop that reconnects the client from underneath it — which also made the downgrade refusal and cross-origin credential stripping unit-testable without a socket. `RequestBuilder::send` was deleted rather than suppressed: it duplicated `Client::send`, had no in-tree caller, and was the sole cause of its back-edge.
+
+    **Back-edges 3 → 1**, and the survivor is judged rather than hidden: `Admission → Permit` is the shape of an RAII guard, since a guard that releases itself must reach what it borrowed from. Breaking it would mean releasing slots by hand on every exit path, including the ones easiest to forget (cancel, dropped consumer, request discarded while queued). It is documented as such on `Permit`.
+
+    Skip edges stay high (135) and are *not* treated as a defect: nearly all target `Error`, `Header`, `HeaderName` and `StatusCode` — shared protocol foundations that everything legitimately depends on, exactly the case the finding says to record rather than force away. The tool still reports 0 SCC cycles while dropping the one back-edge; that is a dropped edge, not a clean graph.
 16. **A20:** compile README examples, reconcile orphan tests, modularize test fixtures, review public visibility, add CI/MSRV/advisory/fuzz checks.
 
 Acceptance: no unexplained graph back-edges, no new free business functions, no newly scattered feature cfg branches, and no misleading documentation examples. Common-foundation skip edges may remain with an explicit rationale.

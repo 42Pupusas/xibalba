@@ -67,6 +67,13 @@ impl Admission {
 ///
 /// Held by the request itself, so every path that finishes, cancels, aborts,
 /// or discards a request releases the slot without a matching manual call.
+///
+/// This and [`Admission`] refer to each other, which a structural graph
+/// reports as a back-edge. It is the shape of an RAII guard rather than a
+/// layering mistake: a guard that releases itself must reach what it borrowed
+/// from. Breaking it would mean releasing the slot by hand at every exit, and
+/// the paths that would have to remember include the ones that are easy to
+/// forget — a cancel, a dropped consumer, a request discarded while queued.
 #[derive(Debug)]
 pub struct Permit(Arc<Admission>);
 

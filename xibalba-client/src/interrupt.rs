@@ -102,10 +102,10 @@ impl Interrupt for NeverCancelled {
 
 /// Wraps a stream so every read *and* write consults an [`Interrupt`] first.
 ///
-/// Cancellation previously covered body reads alone. A response head that
-/// never arrives, or a request body write to a peer that stopped reading,
-/// left the reader blocked with no path back to the control channel: the
-/// cancel was only observed once the head-silence budget expired.
+/// Writes are covered as well as reads because both can block indefinitely:
+/// a peer that stops reading blocks a request body write exactly as a peer
+/// that never answers blocks a head read. Covering only reads would leave a
+/// cancel unobserved until the silence budget expired.
 pub struct InterruptibleStream<'a, S, I: Interrupt> {
     inner: &'a mut S,
     interrupt: I,

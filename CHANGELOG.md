@@ -141,6 +141,13 @@ These compile without error and return different results. Check them first.
   and rustls' `ServerName` both reject `[::1]`, so a connector using
   `Url::host` fails on every IPv6 URL.
 - New variant `ConnectionError::PlaintextConnectorForHttps`.
+- **`RequestBuilder::send(&mut client)` is removed.** It only called
+  `client.send(builder)`, which remains and is the one way to dispatch a
+  built request. The convenience was what made the builder depend on the
+  client that constructs it.
+- New `Origin` type (scheme + host + port) with `covers`, `downgrades_to`,
+  `host_header_value` and `root_url`. `Client` holds one instead of three
+  separate fields.
 - **`BodyFraming::from_response` no longer takes a `header_count`.** It sliced
   `headers[..header_count]` and panicked on an oversized count despite
   returning `Result`. The slice carries its own length; callers holding a

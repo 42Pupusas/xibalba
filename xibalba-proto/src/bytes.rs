@@ -1,9 +1,7 @@
 //! Extension trait for byte-slice operations used across the crate.
 //!
-//! Groups what were previously free functions (`ascii_eq_ignore_case`,
-//! `trim_ows`, `parse_u64_from_bytes`, `contains_token_ignore_case`,
-//! `find_subsequence`, `find_crlf`) into a single trait with a blanket
-//! impl on `[u8]`.  One canonical path to every operation.
+//! One trait with a blanket impl on `[u8]`, so every caller reaches these
+//! through the same path.
 
 /// ASCII and parsing helpers for byte slices.
 pub trait ByteSliceExt: private::Sealed {

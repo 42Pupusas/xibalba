@@ -1,10 +1,6 @@
 use xibalba_proto::error::{Error, SerializeError};
 use xibalba_proto::method::Method;
 
-use crate::client::Client;
-use crate::connector::Connector;
-use crate::response::Response;
-
 /// Wire-level request data: what `Client` serializes for one dispatch.
 #[derive(Debug)]
 pub(crate) struct RequestParams<'a> {
@@ -136,19 +132,6 @@ impl<'a> RequestBuilder<'a> {
     pub const fn query(mut self, q: &'a [u8]) -> Self {
         self.query = Some(q);
         self
-    }
-
-    /// Execute this request on `client` and return the full response.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error` on serialization, duplicate-header, or connection
-    /// failure.
-    pub fn send<C: Connector, const MAX_HEAD_SIZE: usize>(
-        self,
-        client: &mut Client<C, MAX_HEAD_SIZE>,
-    ) -> Result<Response, Error> {
-        client.send(self)
     }
 
     /// Materialize the collected parameters into [`RequestParams`].
