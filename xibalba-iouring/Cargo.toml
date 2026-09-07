@@ -1,7 +1,8 @@
 [package]
 name = "xibalba-iouring"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 description = "io_uring-backed HTTP/1.1 connection pool for xibalba"
 publish = false
 

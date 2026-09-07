@@ -1,0 +1,65 @@
+# Dependency policy, enforced by `cargo deny check all` in CI.
+#
+# The allowed licences below are the ones this workspace's tree actually
+# carries, read from `cargo metadata` rather than copied from a template: a
+# permissive list wide enough to admit anything proves nothing when a new
+# dependency arrives. Adding a licence here is a deliberate act.
+
+[graph]
+all-features = true
+
+[advisories]
+# An unmaintained or unsound crate is a finding to act on, not a warning to
+# scroll past, so nothing here is downgraded. `yanked = "deny"` matters because
+# the lockfile is committed: a yanked version would otherwise stay pinned
+# indefinitely and reproduce perfectly while being exactly the thing to avoid.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# The unpublished members (`publish = false`) carry no `license` field and need
+# none: they are the benches, the examples and the io_uring experiment, which
+# are never distributed. Requiring a licence expression from them would be
+# bookkeeping, not policy.
+private = { ignore = true }
+# Every entry below is present in the current tree; cargo-deny warns on an
+# allowance nothing matches, which keeps the list honest as dependencies move.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# `ring` ships its own combined licence file rather than an SPDX expression
+# cargo-deny can resolve on its own; the terms are Apache-2.0 AND ISC, which
+# are both allowed above. The clarification states that rather than widening
+# the allow-list or lowering the confidence threshold for every crate.
+[[licenses.clarify]]
+crate = "ring"
+expression = "Apache-2.0 AND ISC"
+license-files = [{ path = "LICENSE", hash = 0xbd0e_ed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The published crates take exactly two runtime dependencies between them, and
+# the point of `xibalba-proto` is that it takes none. A dependency arriving
+# without anyone noticing is the failure this section exists to make loud;
+# `cargo deny` cannot express "proto has no runtime deps", so that specific
+# promise is asserted by xibalba-proto's own manifest test instead.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,8 +1,8 @@
 [package]
 name = "xibalba-proto"
 version = "0.3.0"
-edition = "2024"
-rust-version = "1.91"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT"
 description = "HTTP/1.1 protocol primitives: zero-copy parser, chunked decoder, request serializer"
 repository = "https://github.com/42pupusas/xibalba"

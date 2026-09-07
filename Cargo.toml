@@ -4,15 +4,37 @@ members = [
     "xibalba-client",
     "xibalba-iouring",
     "examples/tcp-rustls",
-    "examples/tls-providers",
     "xibalba-benches",
 ]
+# `examples/tls-providers` compares three rustls crypto providers, and the
+# rustcrypto one is an alpha that pins an old `rustls-webpki` and pulls in
+# unmaintained `paste` and the timing-vulnerable `rsa`. None of it is reachable
+# from the published crates — `xibalba-proto` has no dependencies and
+# `xibalba-client` has two — but as a workspace member it sat in the dependency
+# graph `cargo deny` audits, so the advisory gate could never be green.
+#
+# It is excluded rather than deleted: comparing providers is the point of that
+# bench, and a provider is not disqualified from a benchmark by being immature.
+# It keeps its own lockfile and is built and tested by its own CI job, so the
+# coverage is not lost — only the audit scope narrows to what we ship.
+exclude = ["examples/tls-providers"]
 default-members = [
     "xibalba-proto",
     "xibalba-client",
     "xibalba-iouring",
 ]
 resolver = "3"
+
+# The supported floor, inherited by every member so the number exists once.
+# Measured, not guessed: `xibalba-client` cannot go below this, because
+# `Duration::from_mins` stabilised in 1.91. `xibalba-proto` compiles on 1.88
+# (its own floor is let-chains in `request.rs`) and is held here anyway, so
+# the workspace states one number rather than a per-crate matrix. Lowering
+# proto later is compatible; raising either is a breaking change for
+# consumers, so `msrv.rs` fails when a manifest drifts from this.
+[workspace.package]
+rust-version = "1.91"
+edition = "2024"
 
 [workspace.dependencies]
 xibalba-proto = { path = "xibalba-proto", version = "0.3.0" }

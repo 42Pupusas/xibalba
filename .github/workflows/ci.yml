@@ -1,0 +1,125 @@
+name: CI
+
+# The gate this repository has been run by hand until now: fmt, clippy under
+# -D warnings, and the full suite in debug and release. The jobs below are that
+# gate, plus the three checks a human cannot perform by rebuilding: that the
+# declared MSRV compiles, that no dependency carries a known advisory, and that
+# the parser survives inputs nobody wrote by hand.
+
+on:
+  push:
+    branches: [mera, main]
+  pull_request:
+  schedule:
+    # Advisories appear against code that has not changed, so the audit job
+    # must run on a clock rather than only on a push.
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  # The workspace floor, stated once in [workspace.package] and inherited by
+  # every member. `xibalba-proto`'s msrv.rs test asserts this line matches the
+  # manifest, so the two cannot drift apart.
+  MSRV: "1.91"
+
+jobs:
+  gate:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Debug and release both run: several bounds in this client are asserted
+      # against wall-clock time, and optimisation changes what a test observes.
+      - name: tests (debug)
+        run: cargo test --workspace
+      - name: tests (release)
+        run: cargo test --workspace --release
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins a newer compiler for day-to-day work, and it
+      # would silently win here: without an override this job would rebuild the
+      # gate's toolchain and prove nothing about the floor.
+      - name: install the MSRV toolchain
+        run: |
+          rustup toolchain install "$MSRV" --profile minimal
+          rustup override set "$MSRV"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: the declared floor compiles
+        run: cargo check --workspace --all-targets --all-features
+
+  # `examples/tls-providers` is excluded from the workspace (its rustcrypto
+  # provider is an alpha carrying advisories), so the gate above never sees it.
+  # Excluding it from the audit is the point; excluding it from the build is
+  # not, and this job keeps its 18 adversarial TLS tests running.
+  tls-providers:
+    name: excluded bench still builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt, clippy, tests
+        working-directory: examples/tls-providers
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+  deny:
+    name: advisories, licences, sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [response_head, chunked_body, url]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # A short run per push; the point is that a target still builds and that
+      # an obvious regression is caught. Deep campaigns are run by hand from a
+      # corpus, not squeezed into a CI minute budget.
+      - name: fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -timeout=10
+
+      - name: keep whatever crashed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts

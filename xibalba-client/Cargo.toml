@@ -1,8 +1,8 @@
 [package]
 name = "xibalba-client"
 version = "0.4.0"
-edition = "2024"
-rust-version = "1.91"
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT"
 description = "Minimal HTTP/1.1 client with redirects, timeouts, streaming bodies, and a caller-supplied TLS connector"
 repository = "https://github.com/42pupusas/xibalba"
