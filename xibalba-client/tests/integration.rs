@@ -6,6 +6,9 @@ use std::time::Duration;
 use xibalba_client::async_client::{AsyncClient, Chunk};
 use xibalba_client::client::{Client, Config};
 
+mod support;
+use support::park::StopSignal;
+
 const SMALL_HEAD_SIZE: usize = 256;
 use xibalba_client::PlainConnector;
 use xibalba_client::proto::error::{ConnectionError, Error};
@@ -1496,11 +1499,13 @@ fn host_header_with_default_port() {
 fn timeout_fires_on_stalled_server() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (stop, park) = StopSignal::new();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
-        // Never send a response — just sleep
-        thread::sleep(Duration::from_secs(10));
+        // Never send a response; hold the socket open so the client waits on
+        // its silence budget rather than seeing EOF.
+        park.wait();
         drop(stream);
     });
 
@@ -1527,7 +1532,8 @@ fn timeout_fires_on_stalled_server() {
         msg.contains("silence budget"),
         "expected the silence-budget error, got: {msg}"
     );
-    drop(server);
+    drop(stop);
+    server.join().unwrap();
 }
 
 // ── Request body tests ───────────────────────────────────────────────────────
@@ -2666,6 +2672,7 @@ fn async_client_drop_interrupts_in_flight_stream_quickly() {
     // unwind, so drop returns within a couple of read-timeout windows.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (stop, park) = StopSignal::new();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         read_request(&mut stream);
@@ -2673,10 +2680,10 @@ fn async_client_drop_interrupts_in_flight_stream_quickly() {
             .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
             .unwrap();
         stream.flush().unwrap();
-        // Stall without closing; the reader parks on the socket. The
-        // stream is intentionally never terminated. Held open just long
-        // enough to cover the client-side assertions.
-        thread::sleep(Duration::from_secs(2));
+        // Stall without closing; the reader parks on the socket. The stream is
+        // intentionally never terminated, and the park holds it open for
+        // exactly as long as the client-side assertions need.
+        park.wait();
     });
 
     let url = format!("http://127.0.0.1:{port}/");
@@ -2708,5 +2715,6 @@ fn async_client_drop_interrupts_in_flight_stream_quickly() {
         "drop took {elapsed:?}; the shutdown flag did not interrupt the stalled read"
     );
 
+    drop(stop);
     server.join().unwrap();
 }

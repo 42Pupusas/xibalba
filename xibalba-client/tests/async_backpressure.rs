@@ -9,6 +9,15 @@
 //! side thread if the operation under test does not return. A test that merely
 //! deadlocks proves nothing and would hang the suite, so the bound is external
 //! to the code being measured.
+//!
+//! Servers hold their sockets open with [`StopSignal`] rather than a fixed
+//! sleep. Emptying `StopPark::wait` fails exactly one test here,
+//! `cancel_interrupts_a_silent_response_head` — the only one whose server
+//! reaches the park while the client is still waiting on it. `FloodServer`
+//! blocks writing into a socket the client has stopped draining and never
+//! reaches the park at all, so what pins those tests is backpressure; their
+//! former sleeps were holding nothing and cost the suite 20 seconds of pure
+//! teardown.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -17,6 +26,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod support;
+use support::park::StopSignal;
 
 use xibalba_client::DEFAULT_MAX_OUTSTANDING;
 use xibalba_client::PlainConnector;
@@ -67,6 +79,7 @@ struct FloodServer {
     port: u16,
     handle: thread::JoinHandle<usize>,
     written: Arc<AtomicUsize>,
+    stop: Option<StopSignal>,
 }
 
 impl FloodServer {
@@ -77,6 +90,7 @@ impl FloodServer {
         let port = listener.local_addr().expect("local addr").port();
         let written = Arc::new(AtomicUsize::new(0));
         let server_written = Arc::clone(&written);
+        let (stop, park) = StopSignal::new();
         let handle = thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return 0;
@@ -99,13 +113,14 @@ impl FloodServer {
             }
             let _ = stream.flush();
             // Hold the connection open; the test drives shutdown, not EOF.
-            thread::sleep(Duration::from_secs(10));
+            park.wait();
             sent
         });
         Self {
             port,
             handle,
             written,
+            stop: Some(stop),
         }
     }
 
@@ -135,7 +150,8 @@ impl FloodServer {
             .expect("connect to the local flood server")
     }
 
-    fn shutdown(self) {
+    fn shutdown(mut self) {
+        drop(self.stop.take());
         let _ = self.handle.join();
     }
 }
@@ -323,12 +339,14 @@ fn finished_requests_release_their_admission_slots() {
 struct SilentHeadServer {
     port: u16,
     handle: thread::JoinHandle<()>,
+    stop: Option<StopSignal>,
 }
 
 impl SilentHeadServer {
     fn spawn() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
+        let (stop, park) = StopSignal::new();
         let handle = thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
@@ -337,9 +355,13 @@ impl SilentHeadServer {
             let _ = stream.read(&mut buf);
             // Never answer. Hold the socket open so the client waits on the
             // head rather than seeing EOF.
-            thread::sleep(Duration::from_secs(20));
+            park.wait();
         });
-        Self { port, handle }
+        Self {
+            port,
+            handle,
+            stop: Some(stop),
+        }
     }
 
     /// `head_silence` is deliberately far longer than the test's patience:
@@ -357,7 +379,8 @@ impl SilentHeadServer {
             .expect("connect to the local silent server")
     }
 
-    fn shutdown(self) {
+    fn shutdown(mut self) {
+        drop(self.stop.take());
         let _ = self.handle.join();
     }
 }
@@ -445,13 +468,14 @@ fn drop_interrupts_a_blocked_request_upload() {
     // only, so the writing reader had no path back to the control channel.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
+    let (stop, park) = StopSignal::new();
     let server = thread::spawn(move || {
         let Ok((stream, _)) = listener.accept() else {
             return;
         };
         // Never read. Hold the connection so the client's write blocks once
         // the kernel buffers fill.
-        thread::sleep(Duration::from_secs(20));
+        park.wait();
         drop(stream);
     });
 
@@ -497,6 +521,7 @@ fn drop_interrupts_a_blocked_request_upload() {
     );
 
     drop(handle);
+    drop(stop);
     let _ = server.join();
 }
 
