@@ -11,6 +11,7 @@ pub mod body;
 pub mod client;
 pub mod config;
 pub mod connector;
+pub mod dial;
 pub mod interrupt;
 pub mod params;
 pub mod redirect;

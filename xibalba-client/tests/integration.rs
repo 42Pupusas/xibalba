@@ -8,6 +8,7 @@ use xibalba_client::client::{Client, Config};
 
 const SMALL_HEAD_SIZE: usize = 256;
 use xibalba_client::connector::{Connector, SetReadTimeout};
+use xibalba_client::dial::TcpDialer;
 use xibalba_client::proto::error::{ConnectionError, Error};
 use xibalba_client::proto::method::Method;
 use xibalba_client::proto::url::Url;
@@ -47,13 +48,7 @@ impl Connector for PlainConnector {
     type TlsConfig = ();
 
     fn connect(url: &Url<'_>, _tls_config: &()) -> Result<PlainStream, Error> {
-        let host = std::str::from_utf8(url.host).map_err(|_| {
-            Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
-        })?;
-        let addr = format!("{}:{}", host, url.effective_port());
-        TcpStream::connect(&addr)
-            .map_err(Error::from)
-            .map(PlainStream)
+        TcpDialer::default().dial_plaintext(url).map(PlainStream)
     }
 }
 

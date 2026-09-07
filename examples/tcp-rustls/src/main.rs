@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
+use xibalba_client::dial::TcpDialer;
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::scheme::Scheme;
 use xibalba_proto::url::Url;
@@ -71,28 +72,19 @@ impl Connector for TcpConnector {
     type Stream = Stream;
     type TlsConfig = Arc<ClientConfig>;
 
+    /// TLS is negotiated lazily: `ClientConnection::new` only prepares the
+    /// handshake, so a returned `Stream::Tls` is connected but not yet
+    /// verified. The handshake completes inside the first read or write,
+    /// which is where a certificate rejection surfaces, and where the read
+    /// and write timeouts the client sets are the bound on a stalled peer.
     fn connect(url: &Url<'_>, tls_config: &Arc<ClientConfig>) -> Result<Stream, Error> {
-        let host_str = std::str::from_utf8(url.host).map_err(|_| {
-            Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
-        })?;
-
-        let port = url.effective_port();
-        let addr = (host_str, port)
-            .to_socket_addrs()
-            .map_err(|e| {
-                Error::Connection(ConnectionError::Other(format!(
-                    "DNS resolution failed: {e}"
-                )))
-            })?
-            .next()
-            .ok_or_else(|| {
-                Error::Connection(ConnectionError::Other("DNS returned no addresses".into()))
-            })?;
-
-        let tcp = TcpStream::connect(addr)?;
+        let tcp = TcpDialer::default().dial(url)?;
 
         match url.scheme {
             Scheme::Https => {
+                let host_str = std::str::from_utf8(url.connection_host()).map_err(|_| {
+                    Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
+                })?;
                 let server_name = ServerName::try_from(host_str.to_owned()).map_err(|e| {
                     Error::Connection(ConnectionError::Other(format!("invalid server name: {e}")))
                 })?;

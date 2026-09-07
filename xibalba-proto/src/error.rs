@@ -46,6 +46,9 @@ pub enum ConnectionError {
     /// A per-read timeout is longer than a silence budget it subdivides, so
     /// the first blocked read overshoots the budget it is meant to enforce.
     TimeoutExceedsBudget,
+    /// A plaintext connector was given an HTTPS URL. Connecting anyway would
+    /// send the request, and any credentials it carries, in the clear.
+    PlaintextConnectorForHttps,
     /// The async client's background reader thread has exited.
     ReaderGone,
     /// A redirect from an HTTPS origin to a plaintext HTTP target. Following
@@ -162,6 +165,9 @@ impl fmt::Display for ConnectionError {
             Self::ZeroDuration => f.write_str("timeouts and silence budgets must be non-zero"),
             Self::TimeoutExceedsBudget => {
                 f.write_str("per-read timeout exceeds the silence budget it subdivides")
+            }
+            Self::PlaintextConnectorForHttps => {
+                f.write_str("plaintext connector refused an https url")
             }
             Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::TooManyRequests => f.write_str("too many requests are already in flight"),

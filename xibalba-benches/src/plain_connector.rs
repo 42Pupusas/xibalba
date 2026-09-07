@@ -3,10 +3,13 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use xibalba_client::connector::{Connector, SetReadTimeout};
-use xibalba_proto::error::{ConnectionError, Error};
+use xibalba_client::dial::TcpDialer;
+use xibalba_proto::error::Error;
 use xibalba_proto::url::Url;
 
 /// A bare-TCP [`Connector`] for benches and examples that never need TLS.
+///
+/// It refuses HTTPS rather than sending plaintext to a TLS port.
 pub struct PlainConnector;
 
 /// The [`PlainConnector`]'s stream: a thin `TcpStream` wrapper satisfying
@@ -44,10 +47,6 @@ impl Connector for PlainConnector {
     type TlsConfig = ();
 
     fn connect(url: &Url<'_>, (): &()) -> Result<Self::Stream, Error> {
-        let host = std::str::from_utf8(url.host).map_err(|_| {
-            Error::Connection(ConnectionError::Other("invalid UTF-8 in host".into()))
-        })?;
-        let stream = TcpStream::connect(format!("{}:{}", host, url.effective_port()))?;
-        Ok(PlainStream(stream))
+        Ok(PlainStream(TcpDialer::default().dial_plaintext(url)?))
     }
 }

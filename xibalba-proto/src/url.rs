@@ -62,6 +62,25 @@ impl<'a> Url<'a> {
         self.port.unwrap_or_else(|| self.scheme.default_port())
     }
 
+    /// The host to connect to, with the brackets of an IPv6 literal removed.
+    ///
+    /// [`Self::host`] keeps the authority as written, because that is what
+    /// belongs in the `Host` header (RFC 9110 §7.2 uses the authority form,
+    /// brackets and all). Name resolution and TLS server names take the
+    /// address itself: `ToSocketAddrs`, `IpAddr::from_str`, and rustls'
+    /// `ServerName` all reject `[::1]` and accept `::1`. A connector passing
+    /// [`Self::host`] to any of them fails on every IPv6 URL.
+    ///
+    /// A zone ID stays attached: it is part of the scoped address and the
+    /// resolver is the layer that decides what to do with it.
+    #[must_use]
+    pub fn connection_host(&self) -> &'a [u8] {
+        match (self.host.first(), self.host.last()) {
+            (Some(b'['), Some(b']')) => &self.host[1..self.host.len() - 1],
+            _ => self.host,
+        }
+    }
+
     /// The path to use in the request line. Returns `/` if path is empty.
     #[must_use]
     pub const fn request_path(&self) -> &[u8] {
@@ -350,6 +369,35 @@ mod tests {
         let url = Url::parse(b"http://[::1]/test").unwrap();
         assert_eq!(url.host, b"[::1]");
         assert_eq!(url.port, None);
+    }
+
+    /// The `Host` header carries the authority as written, but resolvers and
+    /// TLS server names take the bare address. Keeping only one of the two
+    /// forms breaks whichever consumer needs the other.
+    #[test]
+    fn connection_host_strips_ipv6_brackets_but_host_keeps_them() {
+        let url = Url::parse(b"http://[::1]:8080/test").unwrap();
+        assert_eq!(url.host, b"[::1]");
+        assert_eq!(url.connection_host(), b"::1");
+    }
+
+    #[test]
+    fn connection_host_leaves_a_reg_name_and_ipv4_untouched() {
+        for input in [
+            b"http://example.com/".as_slice(),
+            b"http://127.0.0.1:8080/".as_slice(),
+        ] {
+            let url = Url::parse(input).unwrap();
+            assert_eq!(url.connection_host(), url.host);
+        }
+    }
+
+    /// A zone ID scopes the address and belongs to the resolver, so it must
+    /// survive unbracketing rather than being silently dropped.
+    #[test]
+    fn connection_host_keeps_a_zone_id() {
+        let url = Url::parse(b"http://[fe80::1%25eth0]:80/").unwrap();
+        assert_eq!(url.connection_host(), b"fe80::1%25eth0");
     }
 
     #[test]

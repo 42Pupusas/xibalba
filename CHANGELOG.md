@@ -79,7 +79,8 @@ These compile without error and return different results. Check them first.
 - **`Url::host` keeps the brackets on IPv6 literals.**
   `Url::parse(b"http://[::1]/")` now yields host `[::1]`, previously `::1`.
   The bracketed form is what belongs in a `Host` header. Code passing
-  `url.host` straight to a resolver must strip the brackets itself.
+  `url.host` straight to a resolver must use `Url::connection_host` instead,
+  which returns the address without brackets.
 
 ### Breaking: API
 
@@ -128,6 +129,18 @@ These compile without error and return different results. Check them first.
 - `SetReadTimeout` documents the blocking and error contract an implementor
   must satisfy: blocking mode, a tick reported as `WouldBlock` or `TimedOut`,
   and `Interrupted` reserved for genuine signals.
+- New `xibalba_client::dial` module with `TcpDialer`, the TCP half of a
+  production connector: it resolves via `Url::connection_host`, tries every
+  resolved address rather than the first, bounds the connect with a timeout
+  (`TcpStream::connect` otherwise blocks for the OS SYN timeout, past any
+  client-level budget), and sets `TCP_NODELAY`. `dial_plaintext` additionally
+  refuses HTTPS instead of sending the request in the clear. It is std-only,
+  so the crate stays TLS-agnostic.
+- New `xibalba_proto::url::Url::connection_host`, the host with IPv6 brackets
+  removed. `Url::host` keeps them for the `Host` header, but `ToSocketAddrs`
+  and rustls' `ServerName` both reject `[::1]`, so a connector using
+  `Url::host` fails on every IPv6 URL.
+- New variant `ConnectionError::PlaintextConnectorForHttps`.
 
 ### Removed
 
