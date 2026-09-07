@@ -1179,6 +1179,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "xibalba-fuzz"
+version = "0.1.0"
+dependencies = [
+ "xibalba-proto",
+]
+
+[[package]]
 name = "xibalba-iouring"
 version = "0.1.0"
 dependencies = [
@@ -1192,6 +1199,7 @@ name = "xibalba-proto"
 version = "0.3.0"
 dependencies = [
  "httparse",
+ "xibalba-fuzz",
 ]
 
 [[package]]

@@ -14,6 +14,9 @@ categories = ["network-programming", "parser-implementations"]
 # and never reaches a consumer of the library.
 [dev-dependencies]
 httparse = "1.10"
+# The fuzz invariants, shared with the libFuzzer targets so both check the
+# same properties. Dev-only, like httparse: neither reaches a consumer.
+xibalba-fuzz.workspace = true
 
 [lints]
 workspace = true

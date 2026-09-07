@@ -358,6 +358,9 @@ enum ChunkedState {
     ReadingTrailer,
     ReadingTrailerLf,
     Done,
+    /// A verdict already reached, kept so it can be reported after the data
+    /// that preceded it in the same call.
+    Failed(ParseError),
 }
 
 /// What the chunked decoder wants the caller to do next.
@@ -404,13 +407,19 @@ impl ChunkedDecoder {
         let mut in_pos = 0;
         let mut out_pos = 0;
 
+        if let ChunkedState::Failed(e) = self.state {
+            return (DecodeResult::Error(e), 0);
+        }
+
         while in_pos < input.len() {
             match self.state {
                 ChunkedState::ReadingSize
                 | ChunkedState::ReadingExtension
                 | ChunkedState::ReadingSizeLf => match self.read_size_line(&input[in_pos..]) {
                     Step::Advance(n) => in_pos += n,
-                    Step::Yield((result, consumed)) => return (result, in_pos + consumed),
+                    Step::Yield((result, consumed)) => {
+                        return self.deliver(result, in_pos + consumed, out_pos);
+                    }
                     Step::EmitAndContinue(n) => {
                         in_pos += n;
                         if out_pos > 0 {
@@ -432,17 +441,22 @@ impl ChunkedDecoder {
                 ChunkedState::ReadingDataCr | ChunkedState::ReadingDataLf => {
                     match self.read_data_terminator(&input[in_pos..]) {
                         Step::Advance(n) => in_pos += n,
-                        Step::Yield((result, consumed)) => return (result, in_pos + consumed),
+                        Step::Yield((result, consumed)) => {
+                            return self.deliver(result, in_pos + consumed, out_pos);
+                        }
                         Step::EmitAndContinue(_) => unreachable!(),
                     }
                 }
                 ChunkedState::ReadingTrailer | ChunkedState::ReadingTrailerLf => {
                     match self.read_trailer(&input[in_pos..]) {
                         Step::Advance(n) => in_pos += n,
-                        Step::Yield((result, consumed)) => return (result, in_pos + consumed),
+                        Step::Yield((result, consumed)) => {
+                            return self.deliver(result, in_pos + consumed, out_pos);
+                        }
                         Step::EmitAndContinue(_) => unreachable!(),
                     }
                 }
+                ChunkedState::Failed(e) => return (DecodeResult::Error(e), in_pos),
                 ChunkedState::Done => break,
             }
         }
@@ -453,6 +467,30 @@ impl ChunkedDecoder {
             (DecodeResult::Done, in_pos)
         } else {
             (DecodeResult::NeedMore, in_pos)
+        }
+    }
+
+    /// Deliver body bytes decoded before a verdict was reached, holding the
+    /// verdict for the next call.
+    ///
+    /// Where a socket read happens to break is not something the peer chose,
+    /// so it must not change what the caller receives. Returning an error
+    /// while `output` holds decoded bytes discards them, which means a body
+    /// split one way delivers data a body split another way loses. The same
+    /// rule already governs `Done`, which `read_trailer` defers for exactly
+    /// this reason.
+    const fn deliver(
+        &mut self,
+        result: DecodeResult,
+        consumed: usize,
+        out_pos: usize,
+    ) -> (DecodeResult, usize) {
+        match result {
+            DecodeResult::Error(e) if out_pos > 0 => {
+                self.state = ChunkedState::Failed(e);
+                (DecodeResult::Data(out_pos), consumed)
+            }
+            other => (other, consumed),
         }
     }
 
@@ -981,6 +1019,53 @@ mod tests {
 
         assert_eq!(total, b"hello world");
         assert!(decoder.is_done());
+    }
+
+    #[test]
+    fn data_before_an_error_is_delivered_not_discarded() {
+        // Found by fuzzing: fed whole, this lost the "a" that a byte-at-a-time
+        // feed of the same bytes delivered. Where a socket read happens to
+        // break is not something the peer chose, so it must not change what
+        // the caller receives.
+        let input = b"1\r\na\r\nz\r\n";
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+
+        let (result, _) = decoder.decode(input, &mut output);
+        assert_eq!(result, DecodeResult::Data(1));
+        assert_eq!(&output[..1], b"a");
+
+        let (result, consumed) = decoder.decode(b"anything", &mut output);
+        assert_eq!(
+            result,
+            DecodeResult::Error(ParseError::InvalidChunkSize),
+            "the held verdict must arrive on the next call"
+        );
+        assert_eq!(consumed, 0, "a failed decoder consumes no further input");
+    }
+
+    #[test]
+    fn a_failed_decoder_reports_the_same_error_forever() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        decoder.decode(b"1\r\na\r\nz\r\n", &mut output);
+
+        for _ in 0..3 {
+            let (result, _) = decoder.decode(b"0\r\n\r\n", &mut output);
+            assert_eq!(result, DecodeResult::Error(ParseError::InvalidChunkSize));
+        }
+        assert!(
+            !decoder.is_done(),
+            "a stream that failed never completed"
+        );
+    }
+
+    #[test]
+    fn an_error_with_no_pending_data_is_reported_immediately() {
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, _) = decoder.decode(b"z\r\n", &mut output);
+        assert_eq!(result, DecodeResult::Error(ParseError::InvalidChunkSize));
     }
 
     #[test]

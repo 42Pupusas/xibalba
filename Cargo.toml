@@ -5,6 +5,7 @@ members = [
     "xibalba-iouring",
     "examples/tcp-rustls",
     "xibalba-benches",
+    "xibalba-fuzz",
 ]
 # `examples/tls-providers` compares three rustls crypto providers, and the
 # rustcrypto one is an alpha that pins an old `rustls-webpki` and pulls in
@@ -17,7 +18,12 @@ members = [
 # bench, and a provider is not disqualified from a benchmark by being immature.
 # It keeps its own lockfile and is built and tested by its own CI job, so the
 # coverage is not lost — only the audit scope narrows to what we ship.
-exclude = ["examples/tls-providers"]
+# `fuzz` is excluded by cargo-fuzz convention: its targets need nightly and
+# build with sanitizer flags the rest of the workspace must not inherit. The
+# invariants they drive live in `xibalba-fuzz`, which is a member and is built
+# and run by the ordinary gate, so a broken invariant fails `cargo test`
+# rather than waiting for a nightly campaign.
+exclude = ["examples/tls-providers", "fuzz"]
 default-members = [
     "xibalba-proto",
     "xibalba-client",
@@ -40,6 +46,7 @@ edition = "2024"
 xibalba-proto = { path = "xibalba-proto", version = "0.3.0" }
 xibalba-client = { path = "xibalba-client", version = "0.4.0" }
 xibalba-iouring = { path = "xibalba-iouring", version = "0.1.0" }
+xibalba-fuzz = { path = "xibalba-fuzz", version = "0.1.0" }
 quetzalcoatl = "0.14.0"
 ququmatz = "0.15.1"
 

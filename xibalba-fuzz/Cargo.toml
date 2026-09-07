@@ -1,0 +1,16 @@
+[package]
+name = "xibalba-fuzz"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The properties the parser is expected to hold, written once so that the
+# in-gate harness and the nightly libFuzzer targets check the same things.
+# Two sets of invariants that drift apart would mean the cheap gate proves
+# nothing about the expensive campaign.
+[dependencies]
+xibalba-proto.workspace = true
+
+[lints]
+workspace = true

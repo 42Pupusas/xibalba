@@ -41,6 +41,14 @@ These compile without error and return different results. Check them first.
 - **Truncated response heads report `ParseError::Incomplete`.** A partial
   header name previously returned `MissingColon`, and a head split inside its
   final CRLF returned `InvalidHeaderName`.
+- **`ChunkedDecoder` delivers decoded body bytes before reporting an error.**
+  When a malformed chunk followed valid data inside one `decode` call, the
+  error was returned and the already-decoded bytes in the output buffer were
+  dropped; feeding the same stream in smaller slices delivered them. The
+  decoder now returns the data, then reports the error on the next call and
+  on every call after it. Callers that treat `Data` as "body so far" and stop
+  at `Error` are unaffected; a caller that assumed `Error` meant no output was
+  written will now see bytes. Found by fuzzing.
 - **Chunk extensions and trailers are bounded and validated.** Metadata past
   `MAX_CHUNK_EXTENSION`/`MAX_TRAILER_SECTION`, or containing C0 controls or
   DEL, now fails with `ParseError::InvalidChunkMetadata`.

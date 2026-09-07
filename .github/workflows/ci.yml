@@ -113,9 +113,17 @@ jobs:
 
       # A short run per push; the point is that a target still builds and that
       # an obvious regression is caught. Deep campaigns are run by hand from a
-      # corpus, not squeezed into a CI minute budget.
+      # corpus, not squeezed into a CI minute budget. The invariants themselves
+      # are checked on every `cargo test` by the gate job, against a fixed
+      # corpus — this job explores, it does not define what is correct.
+      #
+      # The target is explicit: a sanitizer cannot be linked against a static
+      # libc, so a host defaulting to musl fails to build the target at all.
       - name: fuzz ${{ matrix.target }}
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -timeout=10
+        run: >
+          cargo fuzz run ${{ matrix.target }}
+          --target x86_64-unknown-linux-gnu
+          -- -max_total_time=60 -timeout=10
 
       - name: keep whatever crashed
         if: failure()

@@ -1,0 +1,10 @@
+# libFuzzer's working corpus: regenerable, machine-written, and large. Inputs
+# worth keeping are added to the seeds in `xibalba-proto/tests/fuzz.rs`, where
+# the ordinary gate replays them on every run.
+corpus/
+
+# Crashes. A reproducer belongs in the test suite as a named regression, not
+# as an opaque blob checked in beside the target.
+artifacts/
+
+target/

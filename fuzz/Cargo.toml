@@ -1,0 +1,37 @@
+[package]
+name = "xibalba-fuzz-targets"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Excluded from the workspace by cargo-fuzz convention: these targets need
+# nightly and build with sanitizer flags the rest of the workspace must not
+# inherit. The invariants they check live in `xibalba-fuzz`, which *is* a
+# workspace member and is compiled by the ordinary gate.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+xibalba-fuzz = { path = "../xibalba-fuzz" }
+
+[[bin]]
+name = "response_head"
+path = "fuzz_targets/response_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked_body"
+path = "fuzz_targets/chunked_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url"
+path = "fuzz_targets/url.rs"
+test = false
+doc = false
+bench = false

@@ -29,6 +29,7 @@ impl MemberManifest {
         "xibalba-client",
         "xibalba-iouring",
         "xibalba-benches",
+        "xibalba-fuzz",
         "examples/tcp-rustls",
     ];
 
