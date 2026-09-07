@@ -16,15 +16,20 @@
 //!
 //! # Topology
 //!
-//! - `mpsc::RingBuffer<Control>`: caller → reader. The only shared
-//!   state; carries new requests and cancel signals.
+//! - `mpsc::RingBuffer<Control>`: caller → reader. Carries new requests
+//!   and cancel signals; owned on the reader side by
+//!   [`ControlQueue`](crate::control::ControlQueue).
 //! - `spsc::RingBuffer<Chunk>`: per-request, reader → caller. The
 //!   reader pushes a single [`Chunk::Head`] first, then zero or more
 //!   [`Chunk::Body`] chunks, then exactly one terminator:
 //!   [`Chunk::Eof`] (clean end), [`Chunk::Error`] (read failure), or
 //!   [`Chunk::Aborted`] (caller cancelled).
 //!
-//! No `Mutex`, no `Arc<AtomicBool>` — only quetzalcoatl ring buffers.
+//! No `Mutex`: request and response data travel only on those rings.
+//! Shared flags are `Arc<AtomicBool>` — shutdown, consumer liveness, and
+//! whether a request has left the queue — because each is a one-way latch
+//! that must be readable while the reader is parked in a socket read, which
+//! is exactly when it cannot be servicing a ring.
 //!
 //! # Read timeout
 //!
@@ -43,25 +48,22 @@
 //! wrap the `AsyncClient` in `Arc<Mutex<_>>` at a higher layer —
 //! but the in-tree design keeps it single-owner.
 
-use std::collections::VecDeque;
-use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::{self, Consumer as MpscConsumer, Producer as MpscProducer};
+use quetzalcoatl::mpsc::{self, Producer as MpscProducer};
 use quetzalcoatl::spsc::{self, Consumer as SpscConsumer};
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::method::Method;
 
-use crate::admission::{Admission, DEFAULT_MAX_OUTSTANDING, Permit};
-use crate::body::{BodyCollector, StreamingBody};
+use crate::admission::{Admission, DEFAULT_MAX_OUTSTANDING};
 use crate::client::{Client, Config, DEFAULT_MAX_HEAD_SIZE};
-use crate::config::HEAD_BUF_SIZE;
-use crate::delivery::{ChunkSink, ChunkStream, ConsumerGuard};
-use crate::interrupt::{Cancelled, Interrupt, InterruptibleStream, Latch};
+use crate::control::{AsyncRequest, CANCEL_ANY, Control, ControlQueue};
+use crate::delivery::{ChunkStream, ConsumerGuard};
 use crate::params::RequestParams;
+use crate::reader::ReaderWorker;
 
 /// Default capacity for the per-request chunk ring: a few SSE
 /// events worth of buffering. The ring parks the caller on full
@@ -77,17 +79,6 @@ const CHUNK_RING_CAP: usize = 32;
 /// reader had merely not drained yet, and blocking instead would stall the
 /// caller for as long as the reader stayed busy.
 const CONTROL_RING_CAP: usize = DEFAULT_MAX_OUTSTANDING * 2;
-
-/// Ticket value meaning "cancel whatever request is in flight", used by
-/// [`AsyncClient::cancel`] where the caller has no specific handle.
-///
-/// Every other cancel names the exact request it belongs to. That
-/// distinction is load-bearing: the control ring is shared by every
-/// request, so an unscoped cancel that arrives *after* its intended
-/// request already finished would otherwise be applied to whichever
-/// request happens to be streaming next, aborting a perfectly healthy
-/// response. Tickets make a late cancel a no-op instead.
-const CANCEL_ANY: u64 = u64::MAX;
 
 /// One response chunk delivered from the reader thread to the
 /// caller.
@@ -120,60 +111,6 @@ pub enum Chunk {
     /// `Error` so the caller can branch user-cancel vs. genuine
     /// failure.
     Aborted,
-}
-
-/// Control message sent from the caller to the reader thread.
-/// All coordination goes through this single MPSC ring: new
-/// requests and cancel signals share the same channel.
-#[derive(Debug)]
-enum Control {
-    /// Start a new streaming request.
-    Request(AsyncRequest),
-    /// Cancel the request with this ticket, or any in-flight request
-    /// when the ticket is [`CANCEL_ANY`]. A cancel naming a request that
-    /// has already finished is discarded rather than applied to its
-    /// successor.
-    Cancel(u64),
-}
-
-/// One streaming request handed to the reader thread. The reader
-/// takes ownership of the request buffers and the chunk-ring
-/// producer.
-pub struct AsyncRequest {
-    method: Method,
-    path: Vec<u8>,
-    query: Option<Vec<u8>>,
-    body: Option<Vec<u8>>,
-    headers: Vec<(Vec<u8>, Vec<u8>)>,
-    chunk_tx: spsc::Producer<Chunk>,
-    /// Cleared when the caller drops its side of the chunk ring, so the
-    /// reader can stop producing instead of waiting for capacity that
-    /// nobody will free.
-    consumer_alive: Arc<AtomicBool>,
-    /// Identifies this request on the shared control ring so a cancel
-    /// can name it precisely.
-    ticket: u64,
-    /// Flipped by the reader when it takes this request off the queue.
-    /// Shared with the caller's [`StreamHandle`] so a response-head
-    /// deadline can measure time on the wire rather than time spent
-    /// queued behind an earlier request.
-    started: Arc<AtomicBool>,
-    /// Frees this request's admission slot when the request is dropped,
-    /// whether it completed, was cancelled, or was discarded in the queue.
-    _permit: Permit,
-}
-
-impl std::fmt::Debug for AsyncRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AsyncRequest")
-            .field("method", &self.method)
-            .field("path", &self.path)
-            .field("query", &self.query)
-            .field("body_len", &self.body.as_ref().map(Vec::len))
-            .field("headers_len", &self.headers.len())
-            .field("ticket", &self.ticket)
-            .finish_non_exhaustive()
-    }
 }
 
 /// The caller-facing side of one in-flight request: just the chunk
@@ -320,11 +257,11 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             mpsc::RingBuffer::<Control>::new(Capacity::at_least(CONTROL_RING_CAP)).split();
 
         let shutting_down = Arc::new(AtomicBool::new(false));
-        let reader_shutting_down = Arc::clone(&shutting_down);
+        let queue = ControlQueue::new(control_rx, Arc::clone(&shutting_down));
         let join = thread::Builder::new()
             .name("xibalba-reader".to_owned())
             .spawn(move || {
-                run_reader(client, control_rx, &reader_shutting_down);
+                ReaderWorker::new(client, queue).run();
             })
             .map_err(|e| {
                 Error::Connection(ConnectionError::Other(format!(
@@ -393,6 +330,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             started: Arc::clone(&started),
             _permit: permit,
         };
+
         let control_tx = self.control()?;
         // Non-blocking: `push_block` parks until the reader drains a slot,
         // which turns a busy reader into an unbounded stall inside submit and
@@ -456,328 +394,5 @@ impl<const MAX_HEAD_SIZE: usize> Drop for AsyncClient<MAX_HEAD_SIZE> {
 impl<const MAX_HEAD_SIZE: usize> std::fmt::Debug for AsyncClient<MAX_HEAD_SIZE> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncClient").finish_non_exhaustive()
-    }
-}
-
-/// The reader thread's main loop: pop a control message, process
-/// requests, honor cancels. Errors and aborts are delivered as
-/// terminator chunks.
-fn run_reader<C, const MAX_HEAD_SIZE: usize>(
-    mut client: Client<C, MAX_HEAD_SIZE>,
-    mut control_rx: MpscConsumer<Control>,
-    shutting_down: &AtomicBool,
-) where
-    C: crate::connector::Connector,
-{
-    // Requests popped off the control ring while polling for a cancel
-    // (during the start-of-request drain or mid-stream) are stashed here
-    // rather than dropped, then processed in submission order.
-    let mut pending: VecDeque<AsyncRequest> = VecDeque::new();
-    loop {
-        if shutting_down.load(Ordering::Acquire) {
-            break;
-        }
-        if let Some(request) = pending.pop_front() {
-            process_request(
-                &mut client,
-                request,
-                &mut control_rx,
-                &mut pending,
-                shutting_down,
-            );
-            continue;
-        }
-        match control_rx.pop_block() {
-            Some(Control::Request(request)) => {
-                process_request(
-                    &mut client,
-                    request,
-                    &mut control_rx,
-                    &mut pending,
-                    shutting_down,
-                );
-            }
-            Some(Control::Cancel(_)) => {
-                // No request in flight; cancel is a no-op.
-            }
-            None => break,
-        }
-    }
-}
-
-/// Poll the control channel without blocking, returning `true` if a
-/// `Cancel` addressed to `current` was observed.
-///
-/// The control ring multiplexes cancels and new requests, and the
-/// consumer has no non-destructive peek — checking for a cancel must
-/// `pop`. Any `Request` popped while hunting for a cancel is moved into
-/// `pending` (processed later in order) instead of being discarded; that
-/// is what stops a request submitted mid-stream from vanishing.
-///
-/// Cancels are matched against the in-flight request's ticket. A cancel
-/// naming some *other* request is dropped: its target already finished,
-/// and applying it to the current request would abort a healthy response
-/// because an unrelated one timed out. `CANCEL_ANY` (from
-/// [`AsyncClient::cancel`], which names no request) always matches, and
-/// `current == None` means nothing is in flight to cancel.
-fn poll_control(
-    control_rx: &mut MpscConsumer<Control>,
-    pending: &mut VecDeque<AsyncRequest>,
-    current: Option<u64>,
-    shutting_down: &AtomicBool,
-) -> bool {
-    let mut cancelled = false;
-    loop {
-        if shutting_down.load(Ordering::Acquire) {
-            return true;
-        }
-        match control_rx.pop() {
-            Some(Control::Cancel(ticket)) => {
-                if current.is_some_and(|c| ticket == CANCEL_ANY || ticket == c) {
-                    cancelled = true;
-                } else if ticket != CANCEL_ANY
-                    && let Some(index) = pending.iter().position(|request| request.ticket == ticket)
-                {
-                    let request = pending
-                        .remove(index)
-                        .expect("pending index came from the same queue");
-                    ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutting_down)
-                        .send_terminal(Chunk::Aborted);
-                }
-            }
-            Some(Control::Request(request)) => pending.push_back(request),
-            None => return cancelled,
-        }
-    }
-}
-
-// One linear pass over a request's lifecycle (clean → send → head → body
-// → terminator); splitting it would scatter the dirty-flag invariants that
-// the whole desync class of bugs hinges on.
-#[allow(clippy::too_many_lines)]
-fn process_request<C, const MAX_HEAD_SIZE: usize>(
-    client: &mut Client<C, MAX_HEAD_SIZE>,
-    request: AsyncRequest,
-    control_rx: &mut MpscConsumer<Control>,
-    pending: &mut VecDeque<AsyncRequest>,
-    shutting_down: &AtomicBool,
-) where
-    C: crate::connector::Connector,
-{
-    // A cancel can queue directly behind this request while it waits for
-    // an earlier response. Match it to this request before reconnecting or
-    // publishing started: a cancelled queued request must never reach the
-    // wire.
-    if poll_control(control_rx, pending, Some(request.ticket), shutting_down) {
-        ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutting_down)
-            .send_terminal(Chunk::Aborted);
-        return;
-    }
-
-    // If a previous streaming response was abandoned mid-body,
-    // reconnect before we send the next request. `send_head` does
-    // not call `ensure_clean()` itself, and the previous response's
-    // leftover bytes would otherwise be interpreted as this response's
-    // head, corrupting the stream.
-    //
-    // A failed reconnect is a HARD error for this request. Swallowing
-    // it (as an earlier version did with `let _ =`) proceeds on the
-    // still-dirty socket: the stale response bytes get parsed as this
-    // request's head, and from then on every request receives the
-    // previous request's response — a permanent, silent desync that
-    // survives until the process restarts. `dirty` stays set, so the
-    // next request simply retries the reconnect.
-    if client.dirty
-        && let Err(e) = client.ensure_clean()
-    {
-        ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutting_down)
-            .send_terminal(Chunk::Error(std::sync::Arc::new(e)));
-        return;
-    }
-
-    let AsyncRequest {
-        method,
-        path,
-        query,
-        body,
-        headers,
-        chunk_tx,
-        consumer_alive,
-        ticket,
-        started,
-        // Held until this function returns: the slot must stay claimed for
-        // as long as the request is on the wire, not just while queued.
-        _permit,
-    } = request;
-    let sink = ChunkSink::new(&chunk_tx, &consumer_alive, shutting_down);
-
-    // Publish "this request has left the queue" before the first byte is
-    // written. A caller's response-head deadline keys off this, so it
-    // times the peer rather than the time spent queued behind a slow
-    // predecessor.
-    started.store(true, Ordering::Release);
-
-    // Send the head. `send_head` handles the stale-keep-alive
-    // reconnect internally (the read failure was before any
-    // response byte reached the caller, so retry is safe).
-    let request_params = RequestParams {
-        method,
-        path: &path,
-        query: query.as_deref(),
-        body: body.as_deref(),
-        extra_headers: headers,
-        allow_replay: method.is_replay_eligible(),
-    };
-    // The latch, not the returned error, is what classifies a cancel: the
-    // `std::io::Error` payload marking one is dropped at the `proto::Error`
-    // boundary, which keeps only a kind and a message. Asking the interrupt
-    // whether it fired is authoritative.
-    let mut interrupt = Latch::new(ControlInterrupt {
-        control_rx,
-        pending,
-        ticket,
-        shutting_down,
-    });
-    let send_result = client.send_head_interruptible(&request_params, &mut interrupt);
-
-    let (head_data, framing, tail_offset) = match send_result {
-        Ok(parts) => parts,
-        // Report a cancel during the request write or head read as Aborted,
-        // matching the body path, so the caller can tell its own cancellation
-        // from a transport failure.
-        Err(_) if interrupt.fired() => {
-            sink.send_terminal(Chunk::Aborted);
-            return;
-        }
-        Err(e) => {
-            sink.send_terminal(Chunk::Error(std::sync::Arc::new(e)));
-            return;
-        }
-    };
-
-    let status = head_data.status().as_u16();
-    let reuse = head_data.connection_reuse();
-    let header_vec: Vec<(Vec<u8>, Vec<u8>)> = head_data
-        .headers()
-        .map(|(n, v)| (n.to_vec(), v.to_vec()))
-        .collect();
-
-    // From this point on the response body sits unread on the socket.
-    // Mark the connection dirty *before* anything can bail out early
-    // (caller dropped the handle, body-read failure, …); each success
-    // path below clears it once the body really is consumed. Leaving
-    // this flag unset on any early return is a session-corruption bug:
-    // the next request would reuse the socket and parse this response's
-    // leftover body bytes as its own head, silently returning response
-    // N's data to request N+1.
-    client.dirty = true;
-
-    if sink
-        .send(Chunk::Head {
-            status,
-            headers: header_vec,
-        })
-        .is_err()
-    {
-        // Caller dropped the handle; the unread body stays on the
-        // socket. `dirty` is already set, so the next request
-        // reconnects instead of desyncing.
-        return;
-    }
-
-    // Non-2xx: drain the body as a single chunk for the caller to inspect.
-    // It still runs through the interrupt: an error response can stall exactly
-    // like a success response, and client drop/cancel must interrupt both.
-    if !(200..300).contains(&status) {
-        let tail = client.head_buf[tail_offset..].to_vec();
-        let mut cancellable = InterruptibleStream::new(&mut client.stream, &mut interrupt);
-        let mut collector = BodyCollector::new(
-            client.config.max_response_body,
-            client.config.stream_silence,
-        );
-        let collected = collector.read(&mut cancellable, &framing, &tail);
-        match collected {
-            Ok(bytes) => {
-                client.dirty = !collector.is_reusable() || !reuse.is_keep();
-                if !bytes.is_empty() && sink.send(Chunk::Body(bytes)).is_err() {
-                    return;
-                }
-            }
-            Err(_) if interrupt.fired() => {
-                sink.send_terminal(Chunk::Aborted);
-                return;
-            }
-            Err(error) => {
-                sink.send_terminal(Chunk::Error(std::sync::Arc::new(error)));
-                return;
-            }
-        }
-        sink.send_terminal(Chunk::Eof);
-        return;
-    }
-
-    // 2xx: streaming body. The same interrupt covers it, checked at the start
-    // of every read, so a cancel is observed within one read timeout.
-    //
-    // `dirty` is already set above; `StreamingBody` clears it when the
-    // body is read to completion, so cancelling/abandoning the stream
-    // leaves the connection in a state the next request reconnects from.
-    let tail = client.head_buf[tail_offset..].to_vec();
-    let silence = client.config.stream_silence;
-    let mut cancellable = InterruptibleStream::new(&mut client.stream, &mut interrupt);
-    let mut body = StreamingBody::new(
-        &mut cancellable,
-        &mut client.dirty,
-        &framing,
-        tail,
-        silence,
-        reuse.is_keep(),
-    );
-    let mut buf = vec![0u8; HEAD_BUF_SIZE];
-    loop {
-        match body.read(&mut buf) {
-            Ok(0) => {
-                sink.send_terminal(Chunk::Eof);
-                return;
-            }
-            Ok(n) => {
-                if sink.send(Chunk::Body(buf[..n].to_vec())).is_err() {
-                    return;
-                }
-            }
-            Err(e) if Cancelled::marks(&e) => {
-                sink.send_terminal(Chunk::Aborted);
-                return;
-            }
-            Err(e) => {
-                sink.send_terminal(Chunk::Error(std::sync::Arc::new(Error::from(e))));
-                return;
-            }
-        }
-    }
-}
-
-/// Answers "should this request stop?" from the control channel, so the
-/// client can consult it during writes and head reads without knowing the
-/// channel exists.
-///
-/// It borrows the control channel and pending queue, which are disjoint from
-/// the `Client` that owns the stream — that is what lets a single request's
-/// write, head read, and stale-connection retry all be covered.
-struct ControlInterrupt<'a> {
-    control_rx: &'a mut MpscConsumer<Control>,
-    pending: &'a mut VecDeque<AsyncRequest>,
-    ticket: u64,
-    shutting_down: &'a AtomicBool,
-}
-
-impl Interrupt for ControlInterrupt<'_> {
-    fn is_cancelled(&mut self) -> bool {
-        poll_control(
-            self.control_rx,
-            self.pending,
-            Some(self.ticket),
-            self.shutting_down,
-        )
     }
 }
