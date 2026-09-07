@@ -261,12 +261,7 @@ impl ResponseParser {
         let (head, consumed) =
             ResponseHead::parse(&self.head_accum[..head_bytes_len], &mut hdr_buf)?;
 
-        let framing = BodyFraming::from_response(
-            head.status,
-            false,
-            &hdr_buf[..head.header_count],
-            head.header_count,
-        )?;
+        let framing = BodyFraming::from_response(head.status, false, head.headers(&hdr_buf)?)?;
         let ranges = HeaderRange::build_ranges(
             &hdr_buf[..head.header_count],
             &self.head_accum[..head_bytes_len],

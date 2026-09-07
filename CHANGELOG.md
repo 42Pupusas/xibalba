@@ -141,6 +141,19 @@ These compile without error and return different results. Check them first.
   and rustls' `ServerName` both reject `[::1]`, so a connector using
   `Url::host` fails on every IPv6 URL.
 - New variant `ConnectionError::PlaintextConnectorForHttps`.
+- **`BodyFraming::from_response` no longer takes a `header_count`.** It sliced
+  `headers[..header_count]` and panicked on an oversized count despite
+  returning `Result`. The slice carries its own length; callers holding a
+  larger buffer pass `&buf[..head.header_count]` or the new
+  `ResponseHead::headers`, which narrows a buffer by the count it parsed and
+  returns `TooManyHeaders` when the two disagree.
+- **`HeadData`'s fields are private, reached through accessors.** `version`,
+  `status`, `header_count` and `as_bytes` replace direct field access, and
+  `HeadData::new` returns `Result`. The buffer, the ranges into it, and the
+  live-range count are one invariant; public mutability let them disagree.
+  `headers()` no longer silently skips a range that falls outside the buffer,
+  which turned a corrupt head into a quietly missing header — `new` rejects it
+  instead.
 
 ### Removed
 

@@ -16,6 +16,23 @@ pub struct ResponseHead<'a> {
 }
 
 impl<'a> ResponseHead<'a> {
+    /// The headers this head parsed, taken from the buffer that was passed
+    /// to [`Self::parse`].
+    ///
+    /// Pairing the count with its own buffer is what makes an inconsistent
+    /// pair possible; this narrows the buffer once, at the point where the
+    /// count is known to describe it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::TooManyHeaders`] if `headers` is shorter than
+    /// the count, which means it is not the buffer that was parsed into.
+    pub fn headers<'h>(&self, headers: &'h [Header<'a>]) -> Result<&'h [Header<'a>], ParseError> {
+        headers
+            .get(..self.header_count)
+            .ok_or(ParseError::TooManyHeaders)
+    }
+
     /// Parse the response head from `buf`.
     ///
     /// `headers` is a caller-provided buffer that will be filled with parsed headers.
@@ -210,6 +227,12 @@ impl BodyFraming {
     /// vector. Multiple `Content-Length` headers are accepted only when
     /// every value parses to the same number.
     ///
+    /// `headers` must be exactly the parsed headers. The count is the
+    /// slice's own length rather than a separate argument: a redundant count
+    /// can disagree with the slice, and this function panicked on an
+    /// oversized one despite returning `Result`. Callers holding a larger
+    /// buffer pass `&buf[..head.header_count]`.
+    ///
     /// # Errors
     ///
     /// Returns [`ParseError::InvalidContentLength`] when any
@@ -219,7 +242,6 @@ impl BodyFraming {
         status: StatusCode,
         request_method_is_head: bool,
         headers: &[Header<'_>],
-        header_count: usize,
     ) -> Result<Self, ParseError> {
         if status.is_informational()
             || status == StatusCode::NO_CONTENT
@@ -229,9 +251,7 @@ impl BodyFraming {
             return Ok(Self::None);
         }
 
-        let hdrs = &headers[..header_count];
-
-        match TransferCodings::parse(hdrs)? {
+        match TransferCodings::parse(headers)? {
             TransferCoding::Chunked => return Ok(Self::Chunked),
             // A header applying no encoding still takes precedence over
             // Content-Length, and leaves the body delimited by the close.
@@ -240,7 +260,7 @@ impl BodyFraming {
         }
 
         let mut content_length: Option<u64> = None;
-        for h in hdrs {
+        for h in headers {
             if h.name == HeaderName::ContentLength {
                 let len = h
                     .value
@@ -806,7 +826,7 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
@@ -818,7 +838,7 @@ mod tests {
             value: b"chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -827,7 +847,7 @@ mod tests {
     fn body_framing_none_for_204() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers, 0).unwrap(),
+            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers).unwrap(),
             BodyFraming::None
         );
     }
@@ -839,7 +859,7 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, true, &headers, 1).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, true, &headers).unwrap(),
             BodyFraming::None
         );
     }
@@ -848,7 +868,7 @@ mod tests {
     fn body_framing_until_close() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 0).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -866,7 +886,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -1227,7 +1247,7 @@ mod tests {
             value: b"1000",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers, 1).unwrap(),
+            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers).unwrap(),
             BodyFraming::None
         );
     }
@@ -1236,7 +1256,7 @@ mod tests {
     fn body_framing_1xx_no_body() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers, 0).unwrap(),
+            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers).unwrap(),
             BodyFraming::None
         );
     }
@@ -1248,7 +1268,7 @@ mod tests {
             value: b"0",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::ContentLength(0)
         );
     }
@@ -1260,7 +1280,7 @@ mod tests {
             value: b" 42 ",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
@@ -1272,7 +1292,7 @@ mod tests {
             value: b"abc",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::InvalidContentLength
         );
     }
@@ -1290,7 +1310,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::InvalidContentLength
         );
     }
@@ -1308,7 +1328,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::ContentLength(5)
         );
     }
@@ -1387,7 +1407,7 @@ mod tests {
             value: b"gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1407,7 +1427,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
 
@@ -1424,7 +1444,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -1438,7 +1458,7 @@ mod tests {
             value: b"chunked, gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }
@@ -1458,7 +1478,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::Chunked
         );
 
@@ -1474,7 +1494,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1492,7 +1512,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -1535,7 +1555,7 @@ mod tests {
             value: b"gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1549,7 +1569,7 @@ mod tests {
             value: b"gzip, chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1563,7 +1583,7 @@ mod tests {
             value: b"chunked, chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }
@@ -1583,7 +1603,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }
@@ -1597,7 +1617,7 @@ mod tests {
             value: b"identity",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 1).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -1618,7 +1638,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers, 2).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }
@@ -1850,6 +1870,43 @@ mod tests {
             result,
             DecodeResult::Error(ParseError::InvalidChunkSize)
         ));
+    }
+
+    /// `from_response` returns `Result`, so a caller has every reason to
+    /// expect it not to panic. It sliced by a caller-supplied count and did.
+    #[test]
+    fn an_oversized_header_count_is_an_error_not_a_panic() {
+        let headers = [Header {
+            name: HeaderName::ContentLength,
+            value: b"5",
+        }];
+        let head = ResponseHead {
+            version: Version::Http11,
+            status: StatusCode::OK,
+            reason: b"OK",
+            header_count: headers.len() + 8,
+        };
+        assert_eq!(head.headers(&headers), Err(ParseError::TooManyHeaders));
+    }
+
+    #[test]
+    fn a_consistent_count_yields_exactly_the_parsed_headers() {
+        let headers = [
+            Header {
+                name: HeaderName::ContentLength,
+                value: b"5",
+            },
+            Header::empty(),
+        ];
+        let head = ResponseHead {
+            version: Version::Http11,
+            status: StatusCode::OK,
+            reason: b"OK",
+            header_count: 1,
+        };
+        let parsed = head.headers(&headers).expect("the count fits");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].value, b"5");
     }
 
     #[test]

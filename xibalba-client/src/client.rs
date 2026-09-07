@@ -431,8 +431,8 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         }
 
         Ok(Response {
-            version: head_data.version,
-            status: head_data.status,
+            version: head_data.version(),
+            status: head_data.status(),
             head: head_data,
             body: BodyReader::new(body_data),
         })
@@ -471,8 +471,8 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         );
 
         Ok(StreamingResponse {
-            version: head_data.version,
-            status: head_data.status,
+            version: head_data.version(),
+            status: head_data.status(),
             head: head_data,
             body,
         })

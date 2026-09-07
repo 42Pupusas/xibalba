@@ -655,7 +655,7 @@ fn process_request<C, const MAX_HEAD_SIZE: usize>(
         }
     };
 
-    let status = head_data.status.as_u16();
+    let status = head_data.status().as_u16();
     let reuse = head_data.connection_reuse();
     let header_vec: Vec<(Vec<u8>, Vec<u8>)> = head_data
         .headers()
