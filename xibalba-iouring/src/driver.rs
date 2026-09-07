@@ -261,7 +261,15 @@ impl ResponseParser {
         let (head, consumed) =
             ResponseHead::parse(&self.head_accum[..head_bytes_len], &mut hdr_buf)?;
 
-        let framing = BodyFraming::from_response(head.status, false, head.headers(&hdr_buf)?)?;
+        // This driver does not carry the request method to the response, so
+        // it frames every response as if the method were GET. That is exactly
+        // what it did before the method reached this signature (it passed
+        // `false` for "is HEAD"), so the behaviour is unchanged — but it means
+        // a HEAD or CONNECT response is still framed by its headers rather
+        // than by its method. Correcting it needs the method threaded through
+        // the in-flight request table, which is outside the audited surface.
+        let framing =
+            BodyFraming::from_response(head.status, Method::Get, head.headers(&hdr_buf)?)?;
         let ranges = HeaderRange::build_ranges(
             &hdr_buf[..head.header_count],
             &self.head_accum[..head_bytes_len],

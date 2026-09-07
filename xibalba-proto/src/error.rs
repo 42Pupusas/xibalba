@@ -68,6 +68,12 @@ pub enum ConnectionError {
     /// transport failure: the request was not sent, and submitting again
     /// once an earlier response finishes will succeed.
     TooManyRequests,
+    /// A CONNECT request, which this client has no way to complete. A 2xx
+    /// answer would put the peer into tunnel mode (RFC 9110 §9.3.6) and the
+    /// bytes that follow the head would belong to the tunnelled protocol,
+    /// not to HTTP. The request is refused before it is written, so the
+    /// connection is never left facing a tunnel this client cannot speak.
+    TunnelingNotSupported,
     Other(String),
 }
 
@@ -187,6 +193,9 @@ impl fmt::Display for ConnectionError {
             Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::TooManyRequests => f.write_str("too many requests are already in flight"),
             Self::InsecureRedirect => f.write_str("redirect downgrades https to http"),
+            Self::TunnelingNotSupported => {
+                f.write_str("CONNECT tunnelling is not supported by this client")
+            }
             Self::Other(msg) => f.write_str(msg),
         }
     }

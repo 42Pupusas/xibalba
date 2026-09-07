@@ -269,6 +269,13 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         // Before the first byte, not only between reads: a hop that spent
         // the total must not write its successor into a doomed exchange.
         deadline.check()?;
+        // A CONNECT this client cannot finish is refused before the peer sees
+        // it, so the proxy is never left in tunnel mode facing a client that
+        // only speaks HTTP. Refusing here, rather than on the response, also
+        // leaves the connection clean for the next request.
+        if params.method == Method::Connect {
+            return Err(ConnectionError::TunnelingNotSupported.into());
+        }
         self.head_buf.clear();
         let host_value = self.origin.host_header_value();
         let content_len_str;
@@ -339,7 +346,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             MAX_HEAD_SIZE,
             self.config.head_silence,
             deadline,
-            params.method == Method::Head,
+            params.method,
         )?;
         self.mark_reusable();
         Ok(parts)

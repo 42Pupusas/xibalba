@@ -2,6 +2,7 @@ use crate::bytes::ByteSliceExt;
 use crate::coding::{TransferCoding, TransferCodings};
 use crate::error::{ConnectionError, Error, ParseError};
 use crate::header::{Header, HeaderName, Tchar};
+use crate::method::Method;
 use crate::status::StatusCode;
 use crate::version::Version;
 
@@ -218,7 +219,15 @@ pub enum BodyFraming {
 }
 
 impl BodyFraming {
-    /// Determine body framing from the response status and headers.
+    /// Determine body framing from the request method, response status, and
+    /// headers.
+    ///
+    /// The method is part of framing, not merely context: RFC 9110 §6.4.2
+    /// makes a HEAD response bodiless whatever its headers say, and §9.3.6
+    /// does the same for a 2xx answer to CONNECT, where the bytes after the
+    /// head belong to the tunnel rather than to HTTP. Both cases carry
+    /// `Content-Length` or `Transfer-Encoding` values that describe a message
+    /// that was never sent, and §9.3.6 requires a client to ignore them.
     ///
     /// Any `Transfer-Encoding` overrides `Content-Length` (RFC 9112
     /// §6.3): when `chunked` is the final coding the body is chunked;
@@ -240,13 +249,13 @@ impl BodyFraming {
     /// disagree.
     pub fn from_response(
         status: StatusCode,
-        request_method_is_head: bool,
+        request_method: Method,
         headers: &[Header<'_>],
     ) -> Result<Self, ParseError> {
         if status.is_informational()
             || status == StatusCode::NO_CONTENT
             || status == StatusCode::NOT_MODIFIED
-            || request_method_is_head
+            || !request_method.response_can_have_content(status)
         {
             return Ok(Self::None);
         }
@@ -826,7 +835,7 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
@@ -838,7 +847,7 @@ mod tests {
             value: b"chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -847,7 +856,7 @@ mod tests {
     fn body_framing_none_for_204() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NO_CONTENT, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::NO_CONTENT, Method::Get, &headers).unwrap(),
             BodyFraming::None
         );
     }
@@ -859,8 +868,55 @@ mod tests {
             value: b"42",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, true, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Head, &headers).unwrap(),
             BodyFraming::None
+        );
+    }
+
+    /// RFC 9110 §9.3.6: a client "MUST ignore any Content-Length or
+    /// Transfer-Encoding header fields received in a successful response to
+    /// CONNECT". Framing them as a body would hand the caller the tunnel's
+    /// first bytes as content.
+    #[test]
+    fn body_framing_none_for_a_successful_connect() {
+        let headers = [Header {
+            name: HeaderName::ContentLength,
+            value: b"4096",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, Method::Connect, &headers).unwrap(),
+            BodyFraming::None
+        );
+    }
+
+    /// The transfer coding is ignored on a successful CONNECT for the same
+    /// reason as the length, and is worth pinning separately: chunked framing
+    /// takes precedence everywhere else in this function.
+    #[test]
+    fn a_transfer_coding_does_not_frame_a_successful_connect() {
+        let headers = [Header {
+            name: HeaderName::TransferEncoding,
+            value: b"chunked",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::OK, Method::Connect, &headers).unwrap(),
+            BodyFraming::None
+        );
+    }
+
+    /// The boundary of the rule. §9.3.6: "Any response other than a successful
+    /// response indicates that the tunnel has not yet been formed", so a
+    /// refusal is an ordinary response and its content is framed normally —
+    /// otherwise a proxy's error page would be unreadable.
+    #[test]
+    fn a_refused_connect_is_framed_like_any_other_response() {
+        let headers = [Header {
+            name: HeaderName::ContentLength,
+            value: b"6",
+        }];
+        assert_eq!(
+            BodyFraming::from_response(StatusCode::FORBIDDEN, Method::Connect, &headers).unwrap(),
+            BodyFraming::ContentLength(6)
         );
     }
 
@@ -868,7 +924,7 @@ mod tests {
     fn body_framing_until_close() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -886,7 +942,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::Chunked
         );
     }
@@ -1247,7 +1303,7 @@ mod tests {
             value: b"1000",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::NOT_MODIFIED, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::NOT_MODIFIED, Method::Get, &headers).unwrap(),
             BodyFraming::None
         );
     }
@@ -1256,7 +1312,7 @@ mod tests {
     fn body_framing_1xx_no_body() {
         let headers: [Header<'_>; 0] = [];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::CONTINUE, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::CONTINUE, Method::Get, &headers).unwrap(),
             BodyFraming::None
         );
     }
@@ -1268,7 +1324,7 @@ mod tests {
             value: b"0",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::ContentLength(0)
         );
     }
@@ -1280,7 +1336,7 @@ mod tests {
             value: b" 42 ",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::ContentLength(42)
         );
     }
@@ -1292,7 +1348,7 @@ mod tests {
             value: b"abc",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::InvalidContentLength
         );
     }
@@ -1310,7 +1366,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::InvalidContentLength
         );
     }
@@ -1328,7 +1384,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::ContentLength(5)
         );
     }
@@ -1407,7 +1463,7 @@ mod tests {
             value: b"gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1427,7 +1483,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
 
@@ -1444,7 +1500,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -1458,7 +1514,7 @@ mod tests {
             value: b"chunked, gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }
@@ -1478,7 +1534,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::Chunked
         );
 
@@ -1494,7 +1550,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1512,7 +1568,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -1555,7 +1611,7 @@ mod tests {
             value: b"gzip",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1569,7 +1625,7 @@ mod tests {
             value: b"gzip, chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::UnsupportedTransferCoding
         );
     }
@@ -1583,7 +1639,7 @@ mod tests {
             value: b"chunked, chunked",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }
@@ -1603,7 +1659,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }
@@ -1617,7 +1673,7 @@ mod tests {
             value: b"identity",
         }];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap(),
             BodyFraming::UntilClose
         );
     }
@@ -1638,7 +1694,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            BodyFraming::from_response(StatusCode::OK, false, &headers).unwrap_err(),
+            BodyFraming::from_response(StatusCode::OK, Method::Get, &headers).unwrap_err(),
             ParseError::InvalidTransferEncoding
         );
     }

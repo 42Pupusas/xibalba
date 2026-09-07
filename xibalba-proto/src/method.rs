@@ -1,6 +1,7 @@
 use core::fmt;
 
 use crate::error::{Error, ParseError};
+use crate::status::StatusCode;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Method {
@@ -53,6 +54,30 @@ impl Method {
             self,
             Self::Get | Self::Head | Self::Put | Self::Delete | Self::Options | Self::Trace
         )
+    }
+
+    /// Whether a response to this method, with this status, carries content
+    /// that the message framing describes.
+    ///
+    /// Two methods answer no regardless of the headers received, per RFC 9110
+    /// §6.4.1. A HEAD response never includes content: its fields state what
+    /// they would have been for a GET. A 2xx response to CONNECT switches the
+    /// connection to tunnel mode instead of having content, so everything
+    /// after the header section comes from the tunnel's far end. In both cases
+    /// a `Content-Length` or `Transfer-Encoding` describes a message body that
+    /// was never sent, and §9.3.6 requires a client to ignore those fields on
+    /// a successful CONNECT rather than read the tunnel as a body.
+    ///
+    /// A non-2xx CONNECT response is an ordinary response — §9.3.6: "Any
+    /// response other than a successful response indicates that the tunnel has
+    /// not yet been formed" — so it keeps its content and its framing.
+    #[must_use]
+    pub const fn response_can_have_content(self, status: StatusCode) -> bool {
+        match self {
+            Self::Head => false,
+            Self::Connect => !status.is_success(),
+            _ => true,
+        }
     }
 }
 
@@ -138,5 +163,59 @@ mod tests {
     fn rejects_unknown() {
         assert!(Method::try_from(b"FOOBAR" as &[u8]).is_err());
         assert!(Method::try_from(b"" as &[u8]).is_err());
+    }
+
+    /// HEAD is bodiless whatever the status, since its fields describe the
+    /// GET that was not performed.
+    #[test]
+    fn a_head_response_never_carries_content() {
+        for status in [StatusCode::OK, StatusCode::FORBIDDEN, StatusCode::CREATED] {
+            assert!(!Method::Head.response_can_have_content(status));
+        }
+    }
+
+    /// The whole 2xx class switches to tunnel mode, not just 200: RFC 9110
+    /// §9.3.6 says "any 2xx (Successful) response".
+    #[test]
+    fn every_successful_connect_response_is_a_tunnel_rather_than_content() {
+        for code in 200..300u16 {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(
+                !Method::Connect.response_can_have_content(status),
+                "{code} was treated as a CONNECT response with content"
+            );
+        }
+    }
+
+    /// A tunnel that was refused never formed, so the refusal is an ordinary
+    /// response and keeps its content.
+    #[test]
+    fn a_connect_that_failed_still_carries_its_content() {
+        for status in [
+            StatusCode::FORBIDDEN,
+            // 407, the refusal a proxy actually sends when it wants
+            // credentials before opening the tunnel.
+            StatusCode::from_u16(407).unwrap(),
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(Method::Connect.response_can_have_content(status));
+        }
+    }
+
+    /// Every other method is framed by its headers, which is what keeps the
+    /// rule narrow: only HEAD and CONNECT are special.
+    #[test]
+    fn ordinary_methods_are_framed_by_their_headers() {
+        for method in [
+            Method::Get,
+            Method::Post,
+            Method::Put,
+            Method::Delete,
+            Method::Options,
+            Method::Trace,
+            Method::Patch,
+        ] {
+            assert!(method.response_can_have_content(StatusCode::OK));
+        }
     }
 }

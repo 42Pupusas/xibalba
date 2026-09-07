@@ -2,6 +2,7 @@ use std::io::Read;
 
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::Header;
+use xibalba_proto::method::Method;
 use xibalba_proto::response::{BodyFraming, HeaderRange, MAX_HEADERS, ResponseHead};
 use xibalba_proto::status::StatusCode;
 use xibalba_proto::version::Version;
@@ -136,7 +137,7 @@ impl HeadData {
         max_head: usize,
         silence: std::time::Duration,
         deadline: RequestDeadline,
-        request_method_is_head: bool,
+        request_method: Method,
     ) -> Result<(Self, BodyFraming, usize), Error> {
         head_acc.clear();
         let mut raw = [0u8; HEAD_BUF_SIZE];
@@ -169,11 +170,8 @@ impl HeadData {
             // copy.
             let ranges =
                 HeaderRange::build_ranges(&hdr_buf[..head.header_count], &head_acc[..head_end])?;
-            let framing = BodyFraming::from_response(
-                head.status,
-                request_method_is_head,
-                head.headers(&hdr_buf)?,
-            )?;
+            let framing =
+                BodyFraming::from_response(head.status, request_method, head.headers(&hdr_buf)?)?;
             debug_assert_eq!(consumed, head_end);
             break (head, ranges, head_end, framing);
         };

@@ -11,6 +11,7 @@ mod adversarial;
 mod async_client;
 mod audit_regressions;
 mod builder;
+mod connect_tunnel;
 mod framing_reuse;
 mod host_header;
 mod redirects;
