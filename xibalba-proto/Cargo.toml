@@ -1,6 +1,6 @@
 [package]
 name = "xibalba-proto"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT"
@@ -16,7 +16,12 @@ categories = ["network-programming", "parser-implementations"]
 httparse = "1.10"
 # The fuzz invariants, shared with the libFuzzer targets so both check the
 # same properties. Dev-only, like httparse: neither reaches a consumer.
-xibalba-fuzz.workspace = true
+#
+# Deliberately a bare path, not the workspace dependency: `xibalba-fuzz` is
+# `publish = false`, and a dev-dependency carrying a version makes `cargo
+# package` look for it on crates.io and fail. Cargo strips a path-only
+# dev-dependency when packaging, which is what lets this crate publish.
+xibalba-fuzz = { path = "../xibalba-fuzz" }
 
 [lints]
 workspace = true

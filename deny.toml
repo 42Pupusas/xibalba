@@ -52,6 +52,13 @@ license-files = [{ path = "LICENSE", hash = 0xbd0e_ed23 }]
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# A versionless path dependency counts as a wildcard, and `xibalba-proto` needs
+# one: its `xibalba-fuzz` dev-dependency is `publish = false`, so carrying a
+# version would send `cargo package` looking for it on crates.io and fail the
+# publish. Cargo strips a path-only dev-dependency from the tarball, which is
+# what makes the crate publishable. This exempts path dependencies only; a
+# wildcard on anything from a registry is still denied.
+allow-wildcard-paths = true
 # The published crates take exactly two runtime dependencies between them, and
 # the point of `xibalba-proto` is that it takes none. A dependency arriving
 # without anyone noticing is the failure this section exists to make loud;

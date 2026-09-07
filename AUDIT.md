@@ -360,6 +360,22 @@ The flag is the whole test: `cargo test --test loom_shared_state` without `RUSTF
 
 Still manual before a release: a long fuzz campaign from a seeded corpus — `cargo run -p xibalba-fuzz --bin seed_corpus` then `cargo +nightly fuzz run <target> --target x86_64-unknown-linux-gnu -- -max_total_time=1800 -jobs=8`, since CI's 60s per target proves the target builds and catches an obvious regression but is not a campaign. Record actual results rather than marking planned checks complete.
 
+## Release gate for 0.4.0 / 0.5.0
+
+`xibalba-proto` 0.4.0 and `xibalba-client` 0.5.0 cover the audit work after the 0.3.0/0.4.0 tags. Both bumps are minor because both crates broke API again — `BodyFraming::from_response` lost its `header_count`, `HeaderRange` widened to `u32`, `ResponseHead::headers` arrived, and several `ConnectionError` variants were added.
+
+Run before tagging, in this order, and record what came back:
+
+- `cargo test --workspace` and `--workspace --release`. Several bounds here are asserted against wall-clock time, so optimisation changes what a test observes; debug alone is not the gate.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and again under `RUSTFLAGS="--cfg loom"` for `xibalba-client`. Clippy only sees the loom test file in the second configuration, and it demands `Admission::new` be `const` in the first.
+- `cargo deny check all`.
+- `cargo package -p xibalba-proto`. This is not covered by any other check and has broken twice: a `publish = false` dev-dependency carrying a version sends cargo looking for it on crates.io. `xibalba-proto` therefore depends on `xibalba-fuzz` by bare path, and `deny.toml` sets `allow-wildcard-paths` so the two rules do not contradict each other.
+- The seeded fuzz campaign above.
+
+`cargo package -p xibalba-client` cannot pass until proto is published, because verification builds the client against the registry's copy of proto rather than the workspace one. **Publish proto first, then the client.** A failure naming missing proto APIs is that ordering, not a defect.
+
+The 2026-09 campaign ran 4 workers × 600s per target from the seeded corpus: `response_head` 14.3M executions, `chunked_body` 15.5M, `url` 212M. No crashes, no new coverage after the seeds (`cov: 195`, `169`, `263` held flat), and `fuzz/artifacts/` stayed empty.
+
 ## Positive observations to preserve
 
 - Request serialization validates paths and header bytes before writing; managed Host/Content-Length/Transfer-Encoding headers cannot be supplied through the builder.

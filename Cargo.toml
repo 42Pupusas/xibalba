@@ -43,8 +43,8 @@ rust-version = "1.91"
 edition = "2024"
 
 [workspace.dependencies]
-xibalba-proto = { path = "xibalba-proto", version = "0.3.0" }
-xibalba-client = { path = "xibalba-client", version = "0.4.0" }
+xibalba-proto = { path = "xibalba-proto", version = "0.4.0" }
+xibalba-client = { path = "xibalba-client", version = "0.5.0" }
 xibalba-iouring = { path = "xibalba-iouring", version = "0.1.0" }
 xibalba-fuzz = { path = "xibalba-fuzz", version = "0.1.0" }
 quetzalcoatl = "0.14.0"
