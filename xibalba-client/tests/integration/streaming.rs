@@ -7,6 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::support::client::TestClient;
+use crate::support::registry::ScriptedServer;
+use crate::support::script::Script;
 use crate::support::server::RequestReader;
 use xibalba_client::async_client::Chunk;
 use xibalba_client::proto::method::Method;
@@ -18,28 +20,19 @@ fn streaming_chunked_need_more_is_not_eof() {
     // return `Ok(0)`. The async reader (and any `Read` consumer) interprets
     // a zero-byte read as EOF, cutting the stream short.
     //
-    // The server here sends the first chunk, pauses long enough for the
-    // client to read it and drain the chunk ring, then sends the second
-    // chunk. A buggy reader stops after "first"; the fixed reader yields
-    // both chunks.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        RequestReader::read_head(&mut stream);
-        stream.set_nodelay(true).unwrap();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
-            .unwrap();
-        stream.flush().unwrap();
-        // Pause longer than one socket read timeout window so the client
-        // definitely observes `NeedMore` before the second chunk lands.
-        thread::sleep(Duration::from_millis(250));
-        stream.write_all(b"6\r\nsecond\r\n0\r\n\r\n").unwrap();
-        stream.flush().unwrap();
-    });
+    // The gap between the two chunks is the whole test, and it used to be a
+    // 250ms sleep chosen to exceed a read-timeout window. The barrier states
+    // the same thing exactly: the second chunk is not sent until the client
+    // has read the first, so the decoder is guaranteed to hit `NeedMore`
+    // mid-body rather than probably hitting it.
+    let server = ScriptedServer::serving_one(
+        Script::new()
+            .expect_request()
+            .send_then_await(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
+            .send(b"6\r\nsecond\r\n0\r\n\r\n"),
+    );
 
-    let client = TestClient::connect_async(port);
+    let client = TestClient::scripted_async(&server);
     let mut handle = client
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
@@ -65,7 +58,11 @@ fn streaming_chunked_need_more_is_not_eof() {
         ]
     );
 
-    server.join().unwrap();
+    server.only().assert_script_completed();
+    // Without this the barrier is unfalsifiable: delete it, the two chunks
+    // arrive in one read, and every assertion above still passes while the
+    // decoder never reaches the `NeedMore` this test exists for.
+    server.only().assert_data_reads(2);
 }
 
 #[test]

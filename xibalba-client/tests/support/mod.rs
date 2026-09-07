@@ -7,4 +7,7 @@
 
 pub(crate) mod client;
 pub(crate) mod park;
+pub(crate) mod registry;
+pub(crate) mod script;
+pub(crate) mod scripted;
 pub(crate) mod server;

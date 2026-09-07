@@ -266,7 +266,13 @@ Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, a
 
     The move was performed by a throwaway Rust tool, not by hand, and checked by comparing the `#[test]` inventory of the new modules against the *committed* original read through `git show`: 78 before, 78 after, no names lost or gained. Worth noting that the mechanical rewrite was not correct first time — substituting `connect(` corrupted test names containing `reconnect(`, which the compiler caught. A hand-edit of 2,700 lines would have had the same class of error with no such check.
 
-    **Not done:** remaining timing dependencies are short per-test sleeps used to sequence a server against a client, which need a scripted connector rather than a file move. MSRV, advisory, fuzz and CI checks are unstarted.
+    **Scripted connector built** (this commit). `tests/support/{script,scripted,registry}.rs` add a `Connector` backed by an in-memory `Script` rather than a socket. `Step::AwaitRead` is a barrier: the next byte is not delivered until the client has read everything queued before it. That states the ordering a sleep was approximating, and takes as long as the client takes instead of a fixed guess.
+
+    Scope was decided before building, not after: the scripted connector serves the parsing, framing and redirect tests, where a real socket contributes only nondeterminism. The backpressure and blocked-upload tests keep real TCP, because kernel buffering and partial writes are their actual subject — converting those would delete the coverage rather than stabilise it.
+
+    One finding worth recording. The first converted test (`streaming_chunked_need_more_is_not_eof`) still passed with its barrier deleted: the response bytes were identical either way, so every assertion held while the decoder no longer hit the `NeedMore` the test exists for. A barrier is invisible to assertions about the result. `Progress::data_reads` now counts delivered reads and `assert_data_reads` makes the fragmentation itself checkable; with it, deleting the barrier fails the test with a message naming the cause. Tests whose subject is *how* bytes were split need that guard, or they quietly stop testing it.
+
+    **Not done:** the remaining ~19 sleeps are not yet converted. MSRV, advisory, fuzz and CI checks are unstarted.
 
 Acceptance: no unexplained graph back-edges, no new free business functions, no newly scattered feature cfg branches, and no misleading documentation examples. Common-foundation skip edges may remain with an explicit rationale.
 
