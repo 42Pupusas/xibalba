@@ -111,6 +111,12 @@ jobs:
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
+      # An unseeded fuzzer spends its first minutes rediscovering that a
+      # response head begins with "HTTP/1.1". The seeds are the same ones the
+      # gate job replays, written from `xibalba-fuzz` so the two cannot drift.
+      - name: seed the corpus
+        run: cargo run -p xibalba-fuzz --bin seed_corpus
+
       # A short run per push; the point is that a target still builds and that
       # an obvious regression is caught. Deep campaigns are run by hand from a
       # corpus, not squeezed into a CI minute budget. The invariants themselves

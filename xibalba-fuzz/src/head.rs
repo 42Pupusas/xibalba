@@ -153,7 +153,10 @@ impl<'a> HeadInvariants<'a> {
 
         match (first, second) {
             (Ok((a, a_used)), Ok((b, b_used))) => {
-                assert_eq!(a.status, b.status, "status differed between identical parses");
+                assert_eq!(
+                    a.status, b.status,
+                    "status differed between identical parses"
+                );
                 assert_eq!(a.version, b.version);
                 assert_eq!(a.reason, b.reason);
                 assert_eq!(a.header_count, b.header_count);

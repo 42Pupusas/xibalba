@@ -1054,10 +1054,7 @@ mod tests {
             let (result, _) = decoder.decode(b"0\r\n\r\n", &mut output);
             assert_eq!(result, DecodeResult::Error(ParseError::InvalidChunkSize));
         }
-        assert!(
-            !decoder.is_done(),
-            "a stream that failed never completed"
-        );
+        assert!(!decoder.is_done(), "a stream that failed never completed");
     }
 
     #[test]

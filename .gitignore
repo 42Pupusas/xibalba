@@ -1,4 +1,9 @@
 /target
+
+# libFuzzer writes one of these per worker into the working directory when
+# `cargo fuzz run` is given -jobs.
+fuzz-*.log
+
 dhat-heap.json
 *.dhat
 *.profdata

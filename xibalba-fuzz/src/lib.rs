@@ -15,10 +15,12 @@
 
 mod chunked;
 mod head;
+mod seeds;
 mod url;
 
 pub use chunked::ChunkedInvariants;
 pub use head::HeadInvariants;
+pub use seeds::Seeds;
 pub use url::UrlInvariants;
 
 /// The three parser surfaces reachable from untrusted bytes.
