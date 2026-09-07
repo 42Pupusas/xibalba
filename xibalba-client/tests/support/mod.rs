@@ -5,4 +5,6 @@
 
 #![allow(dead_code, reason = "each test binary uses a subset of these fixtures")]
 
+pub(crate) mod client;
 pub(crate) mod park;
+pub(crate) mod server;

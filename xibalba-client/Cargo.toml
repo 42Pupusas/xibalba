@@ -9,6 +9,10 @@ repository = "https://github.com/42pupusas/xibalba"
 keywords = ["http", "client", "http-client", "tls"]
 categories = ["network-programming", "web-programming::http-client"]
 
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
 [dependencies]
 xibalba-proto = { workspace = true }
 quetzalcoatl = { workspace = true }

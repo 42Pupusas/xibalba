@@ -262,7 +262,11 @@ Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, a
 
     Emptying `StopPark::wait` fails exactly one test, `cancel_interrupts_a_silent_response_head`, so the hold is only load-bearing there; `FloodServer` blocks writing into a socket the client has stopped draining and never reaches the park at all. Recording that rather than claiming the mutation caught everything: those tests are pinned by backpressure and their sleeps were pure teardown cost. Separately, `timeout_fires_on_stalled_server` ended in `drop(server)` rather than a join, leaking a 10 s thread past the test; it now joins.
 
-    **Not done:** the 2,712-line client integration file is still one module, though `tests/support/` now exists to split it into. Remaining timing dependencies are short per-test sleeps used to sequence a server against a client, which a scripted connector would remove properly. MSRV, advisory, fuzz and CI checks are unstarted.
+    **Integration file modularized** (this commit). `tests/integration.rs` became `tests/integration/` with eleven modules, split along the `// ── ──` banners the file already carried — the seams were documented, just not enforced. Twelve helpers moved to `tests/support/{server,client}.rs` as methods on `TestServer`, `RequestReader` and `TestClient` rather than the free functions they were. Failures now name their area (`redirects::redirect_chain`).
+
+    The move was performed by a throwaway Rust tool, not by hand, and checked by comparing the `#[test]` inventory of the new modules against the *committed* original read through `git show`: 78 before, 78 after, no names lost or gained. Worth noting that the mechanical rewrite was not correct first time — substituting `connect(` corrupted test names containing `reconnect(`, which the compiler caught. A hand-edit of 2,700 lines would have had the same class of error with no such check.
+
+    **Not done:** remaining timing dependencies are short per-test sleeps used to sequence a server against a client, which need a scripted connector rather than a file move. MSRV, advisory, fuzz and CI checks are unstarted.
 
 Acceptance: no unexplained graph back-edges, no new free business functions, no newly scattered feature cfg branches, and no misleading documentation examples. Common-foundation skip edges may remain with an explicit rationale.
 
