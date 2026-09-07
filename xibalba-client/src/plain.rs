@@ -8,6 +8,7 @@ use xibalba_proto::error::Error;
 use xibalba_proto::url::Url;
 
 use crate::connector::{Connector, SetReadTimeout};
+use crate::deadline::Deadline;
 use crate::dial::TcpDialer;
 
 /// A [`Connector`] that speaks TCP and never TLS.
@@ -64,8 +65,10 @@ impl Connector for PlainConnector {
     type Stream = PlainStream;
     type TlsConfig = ();
 
-    fn connect(url: &Url<'_>, _tls_config: &()) -> Result<PlainStream, Error> {
-        TcpDialer::default().dial_plaintext(url).map(PlainStream)
+    fn connect(url: &Url<'_>, _tls_config: &(), deadline: Deadline) -> Result<PlainStream, Error> {
+        TcpDialer::default()
+            .dial_plaintext(url, deadline)
+            .map(PlainStream)
     }
 }
 
@@ -77,7 +80,8 @@ mod tests {
     #[test]
     fn an_https_url_is_refused_rather_than_sent_in_the_clear() {
         let url = Url::parse(b"https://example.com/").expect("parse");
-        let err = PlainConnector::connect(&url, &()).expect_err("https must be refused");
+        let err = PlainConnector::connect(&url, &(), Deadline::never())
+            .expect_err("https must be refused");
         assert!(matches!(
             err,
             Error::Connection(ConnectionError::PlaintextConnectorForHttps)

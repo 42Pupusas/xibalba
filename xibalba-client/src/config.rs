@@ -35,6 +35,19 @@ pub struct Config {
     /// the default implementation ignores it, so such a connector is
     /// declaring its writes cannot block indefinitely.
     pub write_timeout: Option<Duration>,
+    /// Total wall-clock bound on establishing a connection: resolution, every
+    /// address attempted, and any eager TLS handshake together.
+    ///
+    /// This is the *only* bound on connecting. Every other blocking stage runs
+    /// on a stream the client owns and is interrupted between I/O calls;
+    /// `Connector::connect` has no stream yet and so no such point, which is
+    /// why a cancel or a drop cannot be observed until it returns.
+    ///
+    /// `None` means no bound, leaving connects to the OS — roughly two
+    /// minutes for a blackholed address on Linux, and unbounded for DNS.
+    /// Effective only insofar as the connector honours it; see
+    /// [`Connector::connect`](crate::connector::Connector::connect).
+    pub connect_timeout: Option<Duration>,
     pub max_response_body: usize,
     pub max_redirects: u8,
     /// Total wall-clock silence tolerated while waiting for a response
@@ -57,6 +70,17 @@ pub struct Config {
 }
 
 impl Config {
+    /// The deadline for one connect attempt, starting now.
+    ///
+    /// Built per attempt rather than stored, so a reconnect gets the full
+    /// budget instead of the remains of the original connect's.
+    pub(crate) fn connect_deadline(&self) -> crate::deadline::Deadline {
+        self.connect_timeout.map_or_else(
+            crate::deadline::Deadline::never,
+            crate::deadline::Deadline::after,
+        )
+    }
+
     /// # Errors
     ///
     /// - [`InfiniteReadTimeout`](xibalba_proto::error::ConnectionError::InfiniteReadTimeout)
@@ -64,8 +88,9 @@ impl Config {
     ///   after a socket read returns.
     /// - [`ZeroDuration`](xibalba_proto::error::ConnectionError::ZeroDuration)
     ///   when any timeout or budget is zero. A zero read timeout makes every
-    ///   read tick instantly and a zero budget is already spent when the
-    ///   first read starts, so every request fails immediately.
+    ///   read tick instantly, a zero budget is already spent when the first
+    ///   read starts, and a zero connect timeout expires before the first
+    ///   address is tried, so every request fails immediately.
     /// - [`TimeoutExceedsBudget`](xibalba_proto::error::ConnectionError::TimeoutExceedsBudget)
     ///   when a per-read timeout is longer than a budget it subdivides. The
     ///   budget is only consulted between reads, so one blocked read would
@@ -80,6 +105,7 @@ impl Config {
             || self.head_silence.is_zero()
             || self.stream_silence.is_zero()
             || matches!(self.write_timeout, Some(w) if w.is_zero())
+            || matches!(self.connect_timeout, Some(c) if c.is_zero())
         {
             return Err(Error::Connection(ConnectionError::ZeroDuration));
         }
@@ -97,6 +123,7 @@ impl Default for Config {
         Self {
             read_timeout: Some(Duration::from_secs(30)),
             write_timeout: Some(Duration::from_secs(30)),
+            connect_timeout: Some(Duration::from_secs(30)),
             max_response_body: 10 * 1024 * 1024,
             max_redirects: 10,
             head_silence: Duration::from_mins(2),

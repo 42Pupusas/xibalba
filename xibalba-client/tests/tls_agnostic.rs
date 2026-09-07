@@ -131,6 +131,7 @@ fn connector_tls_config_is_fully_caller_defined() {
         fn connect(
             _url: &xibalba_proto::url::Url<'_>,
             _tls_config: &(),
+            _deadline: xibalba_client::Deadline,
         ) -> Result<Self::Stream, xibalba_proto::error::Error> {
             unreachable!("compile-time proof only")
         }

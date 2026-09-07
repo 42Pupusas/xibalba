@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::time::Duration;
 
+use xibalba_client::Deadline;
 use xibalba_client::client::{Client, Config};
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_client::proto::error::{ConnectionError, Error};
@@ -140,7 +141,7 @@ impl Connector for RecordingConnector {
     type Stream = ScriptedStream;
     type TlsConfig = ();
 
-    fn connect(url: &Url<'_>, (): &()) -> Result<Self::Stream, Error> {
+    fn connect(url: &Url<'_>, (): &(), _deadline: Deadline) -> Result<Self::Stream, Error> {
         let host = std::str::from_utf8(url.host)
             .map_err(|_| Error::Connection(ConnectionError::Other("invalid host".into())))?;
         Script::record(format!("{host}:{}", url.effective_port()));

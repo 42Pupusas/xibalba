@@ -49,6 +49,10 @@ pub enum ConnectionError {
     /// A plaintext connector was given an HTTPS URL. Connecting anyway would
     /// send the request, and any credentials it carries, in the clear.
     PlaintextConnectorForHttps,
+    /// Establishing the connection ran past the deadline the client gave it.
+    /// Resolution, TCP connect, and any TLS handshake share one deadline, so
+    /// this covers all three; the connection was not established.
+    ConnectDeadlineExceeded,
     /// The async client's background reader thread has exited.
     ReaderGone,
     /// A redirect from an HTTPS origin to a plaintext HTTP target. Following
@@ -168,6 +172,9 @@ impl fmt::Display for ConnectionError {
             }
             Self::PlaintextConnectorForHttps => {
                 f.write_str("plaintext connector refused an https url")
+            }
+            Self::ConnectDeadlineExceeded => {
+                f.write_str("connect deadline exceeded before the connection was established")
             }
             Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::TooManyRequests => f.write_str("too many requests are already in flight"),

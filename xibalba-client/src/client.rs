@@ -51,7 +51,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     ) -> Result<Self, Error> {
         config.validate()?;
         let url = Url::parse(url_bytes)?;
-        let stream = C::connect(&url, &tls_config)?;
+        let stream = C::connect(&url, &tls_config, config.connect_deadline())?;
 
         let client = Self {
             tls_config,
@@ -161,7 +161,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     }
 
     pub(crate) fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
-        self.stream = C::connect(url, &self.tls_config)?;
+        self.stream = C::connect(url, &self.tls_config, self.config.connect_deadline())?;
         self.origin = Origin::from_url(url);
         self.apply_timeouts()?;
         self.dirty = false;

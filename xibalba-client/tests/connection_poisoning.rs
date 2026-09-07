@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 
+use xibalba_client::Deadline;
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_client::proto::error::Error;
@@ -200,7 +201,7 @@ impl Connector for ScriptedConnector {
     type Stream = ScriptedStream;
     type TlsConfig = ();
 
-    fn connect(_url: &Url<'_>, (): &()) -> Result<Self::Stream, Error> {
+    fn connect(_url: &Url<'_>, (): &(), _deadline: Deadline) -> Result<Self::Stream, Error> {
         let (plan, index) = Script::next_plan();
         Ok(ScriptedStream {
             plan,

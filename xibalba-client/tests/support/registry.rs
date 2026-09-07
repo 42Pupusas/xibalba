@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use xibalba_client::Deadline;
 use xibalba_client::connector::Connector;
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::url::Url;
@@ -238,7 +239,11 @@ impl Connector for ScriptedConnector {
     type Stream = ScriptedStream;
     type TlsConfig = ();
 
-    fn connect(url: &Url<'_>, _tls_config: &()) -> Result<ScriptedStream, Error> {
+    fn connect(
+        url: &Url<'_>,
+        _tls_config: &(),
+        _deadline: Deadline,
+    ) -> Result<ScriptedStream, Error> {
         let port = url.effective_port();
         let endpoint = Registry::get().take(port).ok_or_else(|| {
             Error::Connection(ConnectionError::Other(format!(
@@ -266,8 +271,12 @@ mod tests {
     fn a_connection_plays_the_script_registered_for_its_port() {
         let server = ScriptedServer::serving_one(Script::new().send(b"hello".to_vec()));
         let url = url_for(server.port());
-        let mut stream = ScriptedConnector::connect(&Url::parse(url.as_bytes()).unwrap(), &())
-            .expect("registered port must connect");
+        let mut stream = ScriptedConnector::connect(
+            &Url::parse(url.as_bytes()).unwrap(),
+            &(),
+            Deadline::never(),
+        )
+        .expect("registered port must connect");
 
         let mut buf = [0u8; 16];
         let n = stream.read(&mut buf).unwrap();
@@ -284,11 +293,11 @@ mod tests {
         let parsed = Url::parse(url.as_bytes()).unwrap();
 
         let mut buf = [0u8; 16];
-        let mut one = ScriptedConnector::connect(&parsed, &()).unwrap();
+        let mut one = ScriptedConnector::connect(&parsed, &(), Deadline::never()).unwrap();
         let n = one.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"first");
 
-        let mut two = ScriptedConnector::connect(&parsed, &()).unwrap();
+        let mut two = ScriptedConnector::connect(&parsed, &(), Deadline::never()).unwrap();
         let n = two.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"second");
     }
@@ -299,8 +308,8 @@ mod tests {
         let url = url_for(server.port());
         let parsed = Url::parse(url.as_bytes()).unwrap();
 
-        assert!(ScriptedConnector::connect(&parsed, &()).is_ok());
-        let Err(err) = ScriptedConnector::connect(&parsed, &()) else {
+        assert!(ScriptedConnector::connect(&parsed, &(), Deadline::never()).is_ok());
+        let Err(err) = ScriptedConnector::connect(&parsed, &(), Deadline::never()) else {
             panic!("a second connection has no script and must be refused");
         };
         assert!(
@@ -312,7 +321,11 @@ mod tests {
     #[test]
     fn an_unregistered_port_refuses_the_connection() {
         let url = url_for(1);
-        let Err(err) = ScriptedConnector::connect(&Url::parse(url.as_bytes()).unwrap(), &()) else {
+        let Err(err) = ScriptedConnector::connect(
+            &Url::parse(url.as_bytes()).unwrap(),
+            &(),
+            Deadline::never(),
+        ) else {
             panic!("an unregistered port must refuse");
         };
         assert!(matches!(err, Error::Connection(ConnectionError::Other(_))));
@@ -354,8 +367,12 @@ mod tests {
     fn the_test_observes_what_the_client_wrote() {
         let server = ScriptedServer::serving_one(Script::new().expect_request());
         let url = url_for(server.port());
-        let mut stream =
-            ScriptedConnector::connect(&Url::parse(url.as_bytes()).unwrap(), &()).unwrap();
+        let mut stream = ScriptedConnector::connect(
+            &Url::parse(url.as_bytes()).unwrap(),
+            &(),
+            Deadline::never(),
+        )
+        .unwrap();
 
         stream.write_all(b"GET /x HTTP/1.1\r\n\r\n").unwrap();
 

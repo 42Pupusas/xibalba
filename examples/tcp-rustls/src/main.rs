@@ -7,6 +7,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
+use xibalba_client::Deadline;
 use xibalba_client::client::Client;
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_client::dial::TcpDialer;
@@ -77,8 +78,18 @@ impl Connector for TcpConnector {
     /// verified. The handshake completes inside the first read or write,
     /// which is where a certificate rejection surfaces, and where the read
     /// and write timeouts the client sets are the bound on a stalled peer.
-    fn connect(url: &Url<'_>, tls_config: &Arc<ClientConfig>) -> Result<Stream, Error> {
-        let tcp = TcpDialer::default().dial(url)?;
+    ///
+    /// That laziness is what satisfies the deadline contract here: the only
+    /// blocking work this method does is the dial, which takes the deadline
+    /// directly. A connector completing the handshake eagerly would have to
+    /// bound it too, by setting the socket's read and write timeouts from
+    /// [`Deadline::clamp`] before driving the handshake.
+    fn connect(
+        url: &Url<'_>,
+        tls_config: &Arc<ClientConfig>,
+        deadline: Deadline,
+    ) -> Result<Stream, Error> {
+        let tcp = TcpDialer::default().dial(url, deadline)?;
 
         match url.scheme {
             Scheme::Https => {

@@ -146,12 +146,19 @@ impl StreamHandle {
     /// | Request write | one `write_timeout` tick |
     /// | Response head | one `read_timeout` tick |
     /// | Response body | one `read_timeout` tick |
-    /// | Connect / TLS handshake | **not bounded** |
+    /// | Connect / TLS handshake | the remaining `connect_timeout` |
     ///
     /// The write bound holds only for connectors implementing
     /// [`set_write_timeout`](crate::connector::SetReadTimeout::set_write_timeout).
-    /// A connect or handshake in progress is inside `Connector::connect` and
-    /// cannot be interrupted by this call.
+    ///
+    /// Connecting is the one stage a cancel does not shorten. It runs inside
+    /// `Connector::connect`, where there is no stream yet and so no point
+    /// between I/O calls at which the reader could notice anything; the cancel
+    /// is seen when the connect returns. What bounds it is
+    /// [`Config::connect_timeout`](crate::config::Config::connect_timeout),
+    /// and only for a connector that honours the deadline it is given — see
+    /// [`Connector::connect`](crate::connector::Connector::connect) for that
+    /// contract. A reconnect between requests is the usual way to be here.
     ///
     /// Idempotent: sending a second cancel is a no-op.
     ///

@@ -4,6 +4,8 @@ use std::time::Duration;
 use xibalba_proto::error::Error;
 use xibalba_proto::url::Url;
 
+use crate::deadline::Deadline;
+
 /// Abstraction over anything that can set a read timeout.
 /// Mirrors `TcpStream::set_read_timeout`.
 ///
@@ -80,8 +82,44 @@ pub trait Connector {
     /// bodies require separate head/body writes and otherwise remain
     /// exposed to delayed-ACK latency.
     ///
+    /// # The deadline contract
+    ///
+    /// **An implementor must return by `deadline`, with a stream or with an
+    /// error.** This is the only bound that exists on connecting. Everything
+    /// else the client can interrupt happens between I/O calls on a stream it
+    /// already owns; during `connect` there is no stream and no such point, so
+    /// a cancel or a drop cannot be observed until this returns. An
+    /// implementation that overruns is what makes `AsyncClient::drop` wait for
+    /// a peer that never answers.
+    ///
+    /// Each step must be bounded, not just the last:
+    ///
+    /// - **Resolution.** `ToSocketAddrs` calls `getaddrinfo`, which takes no
+    ///   timeout and can hang for the resolver's own retry schedule.
+    ///   [`TcpDialer`](crate::dial::TcpDialer) checks the deadline either side
+    ///   of it, which bounds *when the result is used* rather than the call
+    ///   itself — the honest limit of a blocking resolver.
+    /// - **Each connect attempt.** A host resolving to several addresses is
+    ///   tried in turn. Giving every attempt the full budget multiplies it by
+    ///   the address count, which is why this is an instant and not a
+    ///   duration: [`Deadline::clamp`] shortens the last attempts rather than
+    ///   restarting the clock.
+    /// - **The TLS handshake**, if the implementation performs it eagerly. A
+    ///   lazily negotiated session (see the `tcp-rustls` example) instead
+    ///   completes inside the first read or write, where the client's read and
+    ///   write timeouts already bound it.
+    ///
+    /// [`Deadline::never`] asks for no bound, and the client only sends it
+    /// when the caller configured `connect_timeout: None`.
+    ///
     /// # Errors
     /// Returns `Error` on DNS failure, TCP connect failure, or TLS handshake
-    /// failure.
-    fn connect(url: &Url<'_>, tls_config: &Self::TlsConfig) -> Result<Self::Stream, Error>;
+    /// failure, and
+    /// [`ConnectDeadlineExceeded`](xibalba_proto::error::ConnectionError::ConnectDeadlineExceeded)
+    /// if `deadline` passes first.
+    fn connect(
+        url: &Url<'_>,
+        tls_config: &Self::TlsConfig,
+        deadline: Deadline,
+    ) -> Result<Self::Stream, Error>;
 }

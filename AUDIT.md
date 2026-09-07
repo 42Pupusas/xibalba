@@ -282,6 +282,20 @@ Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, a
 
     **Not done:** MSRV, advisory, fuzz and CI checks are unstarted.
 
+### A06 residue — the connect deadline (done)
+
+`Connector::connect` now takes a `Deadline` and the trait requires an implementor to return by it. This closes the last row of `StreamHandle::cancel`'s latency table, which read "not bounded".
+
+The gap was not an oversight in the client but a missing parameter: the trait passed a URL and a TLS config, so an implementor had nothing to bound itself *against*. No amount of client-side care could fix that from outside. Connecting is also the one stage cancellation cannot reach — every other blocking step runs on a stream the client owns and is checked between I/O calls, whereas `connect` holds no stream and offers no such point. The deadline is therefore the only bound that can exist here, which is why it belongs in the signature rather than in a connector's own configuration.
+
+`Deadline` is an instant, not a duration, because connecting is several operations in sequence: resolution, then one attempt per resolved address, then possibly a handshake. A duration handed to each multiplies the bound by the number of steps, which is exactly the bug `TcpDialer` had — a 10s `connect_timeout` against a name resolving to eight blackholed addresses was an 80s stall. `TimeLeft` keeps `Unbounded`, `Remaining` and `Expired` apart, and `Remaining` is never zero: `SO_RCVTIMEO` and `TcpStream::connect_timeout` both read a zero duration as *no timeout*, so a naive "remaining time" of zero would produce an unbounded wait at the very moment the deadline was supposed to stop one.
+
+Resolution is bounded honestly rather than hopefully. `getaddrinfo` takes no timeout and cannot be cut short, so the dialler checks the deadline either side of it; that bounds when a resolved address is *used*, and the docs say so instead of implying the lookup itself is interruptible.
+
+**A vacuous test caught by mutation.** The first version of the multiple-address test asserted wall-clock: eight refusing addresses must finish in under two seconds. It passed against the *unfixed* code, because a closed loopback port refuses instantly — the timing never had a chance to bite. Reaching a genuinely blackholed address means depending on the host's routing. The replacement counts how many addresses the dialler pulls from the iterator, which is the same property with neither problem, and it does fail when the clamp is removed. Deleting the deadline check now fails five tests across `dial.rs` and `connect_deadline.rs`, each naming its own cause.
+
+`Config::connect_timeout` defaults to 30s and is validated with the other durations; zero is rejected, since a zero connect deadline expires before the first address is tried. The deadline is built per attempt rather than stored, so a reconnect gets a whole budget instead of the remains of the original connect's — stored, it would shrink to nothing over a long-lived client's life and eventually make reconnection impossible. That is its own test, and it fails if the deadline is hoisted into a field.
+
 Acceptance: no unexplained graph back-edges, no new free business functions, no newly scattered feature cfg branches, and no misleading documentation examples. Common-foundation skip edges may remain with an explicit rationale.
 
 ## Verification required for each fix/extraction
