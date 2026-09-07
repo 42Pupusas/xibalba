@@ -4,7 +4,6 @@ use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
 use xibalba_proto::method::Method;
 use xibalba_proto::request::Request;
-use xibalba_proto::scheme::Scheme;
 
 use crate::interrupt::{Interrupt, InterruptibleStream, NeverCancelled};
 use xibalba_proto::url::Url;
@@ -13,8 +12,9 @@ use xibalba_proto::version::Version;
 use crate::body::{BodyCollector, BodyReader, StreamingBody};
 use crate::config::HEAD_BUF_SIZE;
 use crate::connector::{Connector, SetReadTimeout};
+use crate::origin::Origin;
 use crate::params::RequestParams;
-use crate::redirect::RedirectState;
+use crate::redirect::{Hop, RedirectState};
 use crate::response::HeadData;
 
 pub use crate::config::{Config, DEFAULT_MAX_HEAD_SIZE};
@@ -31,9 +31,7 @@ pub struct Client<C: Connector, const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SI
     tls_config: C::TlsConfig,
     pub(crate) stream: C::Stream,
     pub(crate) config: Config,
-    host: Vec<u8>,
-    port: u16,
-    scheme: xibalba_proto::scheme::Scheme,
+    origin: Origin,
     write_buf: Vec<u8>,
     pub(crate) head_buf: Vec<u8>,
     /// Set while a streaming response is in flight; stays set if the
@@ -54,17 +52,12 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         config.validate()?;
         let url = Url::parse(url_bytes)?;
         let stream = C::connect(&url, &tls_config)?;
-        let host = url.host.to_vec();
-        let port = url.effective_port();
-        let scheme = url.scheme;
 
         let client = Self {
             tls_config,
             stream,
             config,
-            host,
-            port,
-            scheme,
+            origin: Origin::from_url(&url),
             write_buf: Vec::with_capacity(512),
             head_buf: Vec::with_capacity(HEAD_BUF_SIZE),
             dirty: false,
@@ -169,9 +162,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
 
     pub(crate) fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
         self.stream = C::connect(url, &self.tls_config)?;
-        self.host = url.host.to_vec();
-        self.port = url.effective_port();
-        self.scheme = url.scheme;
+        self.origin = Origin::from_url(url);
         self.apply_timeouts()?;
         self.dirty = false;
         Ok(())
@@ -180,16 +171,8 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// Reconnect to the current host (used to recover a stale
     /// keep-alive connection without re-parsing a URL).
     fn reconnect_same_host(&mut self) -> Result<(), Error> {
-        let host = self.host.clone();
-        let url = Url {
-            scheme: self.scheme,
-            host: &host,
-            port: Some(self.port),
-            path: b"/",
-            query: None,
-            fragment: None,
-        };
-        self.reconnect(&url)
+        let origin = self.origin.clone();
+        self.reconnect(&origin.root_url())
     }
 
     /// Mark the live connection unusable after a response head could not be
@@ -222,34 +205,6 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
                     | ErrorKind::BrokenPipe
             ),
             _ => false,
-        }
-    }
-
-    /// Whether `url` points at the origin this client is connected to.
-    pub(crate) fn is_same_origin(&self, url: &Url<'_>) -> bool {
-        use xibalba_proto::bytes::ByteSliceExt;
-        url.host.ascii_eq_ignore_case(&self.host)
-            && url.effective_port() == self.port
-            && url.scheme == self.scheme
-    }
-
-    pub(crate) const fn scheme_bytes(&self) -> &'static [u8] {
-        self.scheme.as_bytes()
-    }
-
-    pub(crate) const fn scheme(&self) -> Scheme {
-        self.scheme
-    }
-
-    fn host_header_value(&self) -> Vec<u8> {
-        let default_port = self.scheme.default_port();
-        if self.port == default_port {
-            self.host.clone()
-        } else {
-            let mut val = self.host.clone();
-            val.push(b':');
-            val.extend_from_slice(self.port.to_string().as_bytes());
-            val
         }
     }
 
@@ -314,7 +269,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         interrupt: &mut I,
     ) -> Result<(HeadData, xibalba_proto::response::BodyFraming, usize), Error> {
         self.head_buf.clear();
-        let host_value = self.host_header_value();
+        let host_value = self.origin.host_header_value();
         let content_len_str;
         let mut headers = Vec::with_capacity(2 + params.extra_headers.len());
 
@@ -478,8 +433,36 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         })
     }
 
+    /// Execute a request, following redirects up to `max_redirects`.
+    ///
+    /// The loop lives here because only the client may open a connection.
+    /// [`RedirectState`] decides *what* the next hop is and reports whether
+    /// it needs a different origin; acting on that is this method's job.
     fn execute(&mut self, params: &RequestParams<'_>) -> Result<Response, Error> {
-        RedirectState::follow(self, params)
+        let mut state = RedirectState::new(params);
+        let mut hops_left = self.config.max_redirects;
+
+        loop {
+            let response = self.send_one(&state.params())?;
+            let Some(location) = RedirectState::location_to_follow(&response) else {
+                return Ok(response);
+            };
+
+            // Check the budget before applying the Location. Applying it first
+            // opens a connection to the next hop -- possibly cross-origin --
+            // only to discard it, which with max_redirects = 0 contacts a host
+            // the caller never agreed to reach.
+            if hops_left == 0 {
+                return Err(ConnectionError::TooManyRedirects.into());
+            }
+            hops_left -= 1;
+
+            if let Hop::Reconnect(target) =
+                state.advance(&self.origin, response.status, &location)?
+            {
+                self.reconnect(&Url::parse(&target)?)?;
+            }
+        }
     }
 }
 

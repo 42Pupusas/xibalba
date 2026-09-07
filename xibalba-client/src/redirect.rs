@@ -4,12 +4,20 @@ use xibalba_proto::method::Method;
 use xibalba_proto::status::StatusCode;
 use xibalba_proto::url::Url;
 
-use crate::client::Client;
-use crate::connector::Connector;
+use crate::origin::Origin;
 use crate::params::RequestParams;
 use crate::reference::UriReference;
 use crate::response::Response;
-use xibalba_proto::scheme::Scheme;
+
+/// What following one `Location` requires of the connection.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Hop {
+    /// Same origin: reuse the connection as it stands.
+    SameOrigin,
+    /// A different origin, which the caller must connect to before
+    /// dispatching. Credentials have already been stripped from the request.
+    Reconnect(Vec<u8>),
+}
 
 /// Per-request state carried across redirect hops.
 #[derive(Debug)]
@@ -57,44 +65,40 @@ impl RedirectState {
         });
     }
 
-    /// Execute a fully-buffered request, following redirects up to the
-    /// configured `max_redirects` value.
-    pub(crate) fn follow<C: Connector, const MAX_HEAD_SIZE: usize>(
-        client: &mut Client<C, MAX_HEAD_SIZE>,
-        params: &RequestParams<'_>,
-    ) -> Result<Response, Error> {
-        let mut current = Self::new(params);
-        let mut hops_left = client.config.max_redirects;
+    /// The parameters for the next dispatch.
+    pub(crate) fn params(&self) -> RequestParams<'_> {
+        self.to_params()
+    }
 
-        loop {
-            let resp = client.send_one(&current.to_params())?;
-
-            if !Self::is_followed_status(resp.status) {
-                return Ok(resp);
-            }
-
-            let location = resp
-                .headers()
-                .find(|(name, _)| name.ascii_eq_ignore_case(b"Location"))
-                .map(|(_, v)| v);
-
-            let location = match location {
-                Some(loc) => loc.to_vec(),
-                None => return Ok(resp),
-            };
-
-            // Check the budget before applying the Location. Applying it first
-            // opens a connection to the next hop -- possibly cross-origin --
-            // only to discard it, which with max_redirects = 0 contacts a host
-            // the caller never agreed to reach.
-            if hops_left == 0 {
-                return Err(ConnectionError::TooManyRedirects.into());
-            }
-            hops_left -= 1;
-
-            current.apply_method_redirect(resp.status);
-            current.apply_location(client, &location)?;
+    /// The `Location` of a response worth following, if there is one.
+    ///
+    /// `None` means this response is the answer: either its status does not
+    /// redirect, or it redirects without saying where.
+    pub(crate) fn location_to_follow(response: &Response) -> Option<Vec<u8>> {
+        if !Self::is_followed_status(response.status) {
+            return None;
         }
+        response
+            .headers()
+            .find(|(name, _)| name.ascii_eq_ignore_case(b"Location"))
+            .map(|(_, value)| value.to_vec())
+    }
+
+    /// Apply one `Location` to this request, reporting what the connection
+    /// must do to serve the result.
+    ///
+    /// Nothing here touches a connection: a cross-origin hop is *reported*,
+    /// so the decision to dial is the caller's and is made after this
+    /// returns. That is what lets a refused downgrade be refused before
+    /// anything is dialled.
+    pub(crate) fn advance(
+        &mut self,
+        from: &Origin,
+        status: StatusCode,
+        location: &[u8],
+    ) -> Result<Hop, Error> {
+        self.apply_method_redirect(status);
+        self.apply_location(from, location)
     }
 
     const fn is_followed_status(status: StatusCode) -> bool {
@@ -134,24 +138,20 @@ impl RedirectState {
         });
     }
 
-    fn apply_location<C: Connector, const MAX_HEAD_SIZE: usize>(
-        &mut self,
-        client: &mut Client<C, MAX_HEAD_SIZE>,
-        location: &[u8],
-    ) -> Result<(), Error> {
+    fn apply_location(&mut self, from: &Origin, location: &[u8]) -> Result<Hop, Error> {
         let without_fragment = location
             .iter()
             .position(|&b| b == b'#')
             .map_or(location, |pos| &location[..pos]);
 
         if Self::has_absolute_scheme(without_fragment) {
-            return self.apply_absolute_location(client, without_fragment);
+            return self.apply_absolute_location(from, without_fragment);
         }
         if without_fragment.starts_with(b"//") {
-            let mut absolute = client.scheme_bytes().to_vec();
+            let mut absolute = from.scheme_bytes().to_vec();
             absolute.push(b':');
             absolute.extend_from_slice(without_fragment);
-            return self.apply_absolute_location(client, &absolute);
+            return self.apply_absolute_location(from, &absolute);
         }
 
         let (path_part, query) = without_fragment.iter().position(|&b| b == b'?').map_or(
@@ -168,7 +168,7 @@ impl RedirectState {
             if query.is_some() {
                 self.query = query;
             }
-            return Ok(());
+            return Ok(Hop::SameOrigin);
         }
 
         self.path = if path_part.starts_with(b"/") {
@@ -177,31 +177,29 @@ impl RedirectState {
             self.resolve_relative_path(path_part)
         };
         self.query = query;
-        Ok(())
+        Ok(Hop::SameOrigin)
     }
 
-    fn apply_absolute_location<C: Connector, const MAX_HEAD_SIZE: usize>(
-        &mut self,
-        client: &mut Client<C, MAX_HEAD_SIZE>,
-        location: &[u8],
-    ) -> Result<(), Error> {
+    fn apply_absolute_location(&mut self, from: &Origin, location: &[u8]) -> Result<Hop, Error> {
         let url = Url::parse(location)?;
-        // Refuse before reconnecting: a downgrade must not be detected by
+        // Refuse before reporting a hop: a downgrade must not be detected by
         // observing that we already opened a plaintext connection.
-        if client.scheme() == Scheme::Https && url.scheme == Scheme::Http {
+        if from.downgrades_to(url.scheme) {
             return Err(ConnectionError::InsecureRedirect.into());
         }
-        if !client.is_same_origin(&url) {
-            client.reconnect(&url)?;
+        let hop = if from.covers(&url) {
+            Hop::SameOrigin
+        } else {
             self.strip_cross_origin_headers();
-        }
+            Hop::Reconnect(location.to_vec())
+        };
         self.path = if url.path.is_empty() {
             b"/".to_vec()
         } else {
             UriReference::remove_dot_segments(url.path)
         };
         self.query = url.query.map(<[u8]>::to_vec);
-        Ok(())
+        Ok(hop)
     }
 
     /// Whether `location` begins with an absolute HTTP(S) scheme.
@@ -278,6 +276,114 @@ mod tests {
         let p = state.to_params();
         assert_eq!(header(&p, "Authorization"), Some(&b"Bearer s3cret"[..]));
         assert_eq!(header(&p, "Cookie"), Some(&b"session=abc"[..]));
+    }
+
+    fn origin(text: &[u8]) -> Origin {
+        Origin::from_url(&Url::parse(text).expect("test urls parse"))
+    }
+
+    /// The point of returning a decision: a refused downgrade is refused
+    /// while deciding, so nothing has been dialled by the time it is known.
+    #[test]
+    fn a_downgrade_is_refused_rather_than_reported_as_a_hop() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        let error = state
+            .advance(
+                &origin(b"https://secure.example/"),
+                StatusCode::FOUND,
+                b"http://secure.example/",
+            )
+            .expect_err("https must not silently become http");
+        assert_eq!(error, Error::Connection(ConnectionError::InsecureRedirect));
+    }
+
+    #[test]
+    fn an_upgrade_to_https_is_a_reconnect() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        let hop = state
+            .advance(
+                &origin(b"http://plain.example/"),
+                StatusCode::FOUND,
+                b"https://plain.example/",
+            )
+            .expect("an upgrade is allowed");
+        assert_eq!(hop, Hop::Reconnect(b"https://plain.example/".to_vec()));
+    }
+
+    #[test]
+    fn an_absolute_location_on_the_same_origin_reuses_the_connection() {
+        let mut state = RedirectState::new(&params_with(&[("Authorization", "Bearer s3cret")]));
+        let hop = state
+            .advance(
+                &origin(b"https://api.example/"),
+                StatusCode::FOUND,
+                b"https://api.example/v2/thing",
+            )
+            .expect("same origin");
+        assert_eq!(hop, Hop::SameOrigin);
+        assert_eq!(state.path, b"/v2/thing");
+        assert_eq!(
+            header(&state.to_params(), "Authorization"),
+            Some(&b"Bearer s3cret"[..])
+        );
+    }
+
+    #[test]
+    fn a_cross_origin_hop_strips_credentials_before_it_is_reported() {
+        let mut state = RedirectState::new(&params_with(&[
+            ("Authorization", "Bearer s3cret"),
+            ("X-Custom", "kept"),
+        ]));
+        let hop = state
+            .advance(
+                &origin(b"https://api.example/"),
+                StatusCode::FOUND,
+                b"https://evil.example/steal",
+            )
+            .expect("cross origin is allowed, just not with credentials");
+        assert_eq!(hop, Hop::Reconnect(b"https://evil.example/steal".to_vec()));
+        let params = state.to_params();
+        assert_eq!(header(&params, "Authorization"), None);
+        assert_eq!(header(&params, "X-Custom"), Some(&b"kept"[..]));
+    }
+
+    #[test]
+    fn a_relative_location_never_needs_a_reconnect() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        let hop = state
+            .advance(
+                &origin(b"https://api.example/"),
+                StatusCode::FOUND,
+                b"/elsewhere?q=1",
+            )
+            .expect("relative");
+        assert_eq!(hop, Hop::SameOrigin);
+        assert_eq!(state.path, b"/elsewhere");
+        assert_eq!(state.query.as_deref(), Some(&b"q=1"[..]));
+    }
+
+    /// A protocol-relative location inherits the current scheme, so from
+    /// HTTPS it must not resolve to a plaintext hop.
+    #[test]
+    fn a_protocol_relative_location_inherits_the_current_scheme() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        let hop = state
+            .advance(
+                &origin(b"https://api.example/"),
+                StatusCode::FOUND,
+                b"//other.example/path",
+            )
+            .expect("protocol-relative");
+        assert_eq!(hop, Hop::Reconnect(b"https://other.example/path".to_vec()));
+    }
+
+    #[test]
+    fn a_non_redirect_status_has_no_location_to_follow() {
+        assert!(
+            !RedirectState::is_followed_status(StatusCode::OK),
+            "200 is the answer, not a hop"
+        );
+        assert!(RedirectState::is_followed_status(StatusCode::FOUND));
     }
 
     #[test]
