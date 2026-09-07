@@ -13,6 +13,8 @@
 
 use std::time::Duration;
 
+use super::gate::Gate;
+
 /// One action in a scripted exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -34,6 +36,28 @@ pub(crate) enum Step {
     /// The client's read timeout must fire during this, so it drives the
     /// silence-budget paths that a merely slow server would not reach.
     Stall(Duration),
+    /// Report no data for the next `.0` read attempts.
+    ///
+    /// Where the subject is how many times the client retries rather than how
+    /// long it waits — a head path that used to give up after a fixed retry
+    /// count — this states the retries directly. A wall-clock stall would
+    /// stand in for them, at the cost of the test taking that long and of
+    /// leaving the count it cares about implicit.
+    StallReads(usize),
+    /// Report no data until the test opens `.0`.
+    ///
+    /// For waits whose condition only the test can see — a second request
+    /// submitted, a cancel pushed — where [`Step::AwaitRead`] has nothing to
+    /// observe. The peer stays silent, as in [`Step::Stall`], but for exactly
+    /// as long as the condition takes rather than a duration guessed up front.
+    AwaitGate(Gate),
+    /// Go silent permanently, as a dropped peer that never closes does.
+    ///
+    /// The client's silence budget is what must end this. A [`Step::Stall`]
+    /// long enough to outlast that budget would do the same, but states a
+    /// duration the test then has to keep in step with the configuration;
+    /// this states the intent, so the budget alone decides.
+    Hang,
     /// Close the connection.
     Close,
 }
@@ -91,6 +115,27 @@ impl Script {
         self
     }
 
+    /// Go silent for the client's next `reads` attempts.
+    #[must_use]
+    pub(crate) fn stall_reads(mut self, reads: usize) -> Self {
+        self.steps.push(Step::StallReads(reads));
+        self
+    }
+
+    /// Go silent until the test opens `gate`.
+    #[must_use]
+    pub(crate) fn await_gate(mut self, gate: &Gate) -> Self {
+        self.steps.push(Step::AwaitGate(gate.clone()));
+        self
+    }
+
+    /// Go silent for good, leaving the client's silence budget to end it.
+    #[must_use]
+    pub(crate) fn hang(mut self) -> Self {
+        self.steps.push(Step::Hang);
+        self
+    }
+
     /// Close the connection.
     #[must_use]
     pub(crate) fn close(mut self) -> Self {
@@ -129,6 +174,13 @@ mod tests {
             script.steps(),
             &[Step::Send(b"abc".to_vec()), Step::AwaitRead]
         );
+    }
+
+    #[test]
+    fn a_gate_step_carries_the_test_s_own_handle() {
+        let gate = Gate::shut();
+        let script = Script::new().await_gate(&gate);
+        assert_eq!(script.steps(), &[Step::AwaitGate(gate)]);
     }
 
     #[test]

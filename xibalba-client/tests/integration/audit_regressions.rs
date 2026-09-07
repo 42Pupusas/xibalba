@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use crate::support::client::TestClient;
 use crate::support::park::StopSignal;
+use crate::support::registry::ScriptedServer;
+use crate::support::script::Script;
 use crate::support::server::RequestReader;
 use crate::support::server::TestServer;
 use xibalba_client::PlainConnector;
@@ -24,28 +26,29 @@ fn head_request_gets_empty_body_without_waiting_for_one() {
     // RFC 9110 the content-length describes the GET body). The framing
     // must be None; before the fix the client waited for five body bytes
     // that never come and hit the silence budget.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let req = RequestReader::read_head(&mut stream);
-        assert!(req.starts_with(b"HEAD "));
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
-            .unwrap();
-        // Deliberately hold the connection open instead of closing: a
-        // client that tries to read a body blocks until the silence
-        // budget expires.
-        thread::sleep(Duration::from_millis(300));
-    });
+    //
+    // The connection hangs rather than closing. A close would end the wait
+    // for the wrong reason — EOF, not correct framing — and the test would
+    // pass even if the client had gone looking for a body. With a hang, only
+    // treating the response as bodiless can complete it.
+    let server = ScriptedServer::serving_one(
+        Script::new()
+            .expect_request()
+            .send(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".to_vec())
+            .hang(),
+    );
 
-    let mut client = TestClient::connect(port);
+    let mut client = TestClient::scripted(&server);
     let resp = client
         .request(Method::Head, b"/resource", None, None)
         .unwrap();
     assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
     assert_eq!(resp.text().unwrap(), "");
-    server.join().unwrap();
+    assert!(
+        server.only().written().starts_with("HEAD "),
+        "the framing rule under test only applies to HEAD:\n{}",
+        server.only().written()
+    );
 }
 
 #[test]
@@ -193,25 +196,25 @@ fn interim_100_response_is_skipped() {
     // A 100 Continue interim head precedes the real response on the same
     // connection. Treating it as the final response desyncs every later
     // request; it must be skipped and the real head parsed.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        RequestReader::read_head(&mut stream);
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
-        stream.flush().unwrap();
-        thread::sleep(Duration::from_millis(100));
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal")
-            .unwrap();
-        stream.flush().unwrap();
-    });
+    //
+    // The barrier is what makes this the *split* case: the interim head must
+    // be parsed on its own, before the final one exists. Its coalesced twin
+    // is covered separately by
+    // `interim_and_final_response_in_one_read_are_both_processed`.
+    let server = ScriptedServer::serving_one(
+        Script::new()
+            .expect_request()
+            .send_then_await(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec())
+            .send(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nreal".to_vec()),
+    );
 
-    let mut client = TestClient::connect(port);
+    let mut client = TestClient::scripted(&server);
     let resp = client.get(b"/expected-100").unwrap();
     assert_eq!(resp.status, xibalba_client::proto::status::StatusCode::OK);
     assert_eq!(resp.text().unwrap(), "real");
-    server.join().unwrap();
+
+    server.only().assert_data_reads(2);
+    server.only().assert_script_completed();
 }
 
 #[test]

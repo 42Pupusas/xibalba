@@ -8,7 +8,8 @@ use xibalba_client::connector::Connector;
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::url::Url;
 
-use super::script::Script;
+use super::gate::Gate;
+use super::script::{Script, Step};
 use super::scripted::{Progress, ScriptedStream, Written};
 
 /// The scripts waiting to be served, keyed by port.
@@ -81,6 +82,7 @@ pub(crate) struct ScriptedConnection {
     written: Written,
     progress: Progress,
     expected_steps: usize,
+    script: Script,
 }
 
 impl ScriptedConnection {
@@ -117,6 +119,28 @@ impl ScriptedConnection {
             "response arrived in {} reads, not {expected}: the script's \
              fragmentation is not reaching the client",
             self.progress.data_reads()
+        );
+    }
+
+    /// Assert the script really waits on `gate`.
+    ///
+    /// A gate is unfalsifiable from the outside: delete the step that waits on
+    /// it and the bytes are identical, every assertion still holds, and the
+    /// ordering the test was written to force silently reverts to whatever the
+    /// scheduler happens to do.
+    ///
+    /// This checks the script rather than watching the reader thread. Whether
+    /// the reader was *parked* at the gate when the test opened it depends on
+    /// thread timing and is not the guarantee being relied on; that the script
+    /// cannot proceed without the test is.
+    pub(crate) fn assert_gated_on(&self, gate: &Gate) {
+        assert!(
+            self.script
+                .steps()
+                .iter()
+                .any(|step| matches!(step, Step::AwaitGate(g) if g == gate)),
+            "no step waits on this gate: the ordering it exists to force is \
+             left to timing"
         );
     }
 
@@ -162,6 +186,7 @@ impl ScriptedServer {
                 written: written.clone(),
                 progress: progress.clone(),
                 expected_steps,
+                script: script.clone(),
             });
             endpoints.push(Endpoint {
                 script,
@@ -299,6 +324,30 @@ mod tests {
         let b = ScriptedServer::serving_one(Script::new());
         assert_ne!(a.port(), b.port());
         assert!(a.port() >= Registry::FIRST_PORT);
+    }
+
+    #[test]
+    fn a_gated_script_is_recognised_as_gated_on_that_gate() {
+        let gate = Gate::shut();
+        let server = ScriptedServer::serving_one(Script::new().await_gate(&gate).send(b"x"));
+        server.only().assert_gated_on(&gate);
+    }
+
+    #[test]
+    #[should_panic(expected = "no step waits on this gate")]
+    fn a_script_missing_its_gate_is_reported() {
+        let gate = Gate::shut();
+        let server = ScriptedServer::serving_one(Script::new().send(b"x"));
+        server.only().assert_gated_on(&gate);
+    }
+
+    /// Waiting on *a* gate is not the same as waiting on *this* gate.
+    #[test]
+    #[should_panic(expected = "no step waits on this gate")]
+    fn a_script_gated_on_a_different_gate_does_not_count() {
+        let checked = Gate::shut();
+        let server = ScriptedServer::serving_one(Script::new().await_gate(&Gate::shut()));
+        server.only().assert_gated_on(&checked);
     }
 
     #[test]

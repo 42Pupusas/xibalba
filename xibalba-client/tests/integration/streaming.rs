@@ -1,15 +1,14 @@
 //! Chunked streaming where the chunk boundaries fall awkwardly against the
 //! reads that deliver them.
-
-use std::io::Write;
-use std::net::TcpListener;
-use std::thread;
-use std::time::Duration;
+//!
+//! These run scripted: the subject is which bytes share a read, and a socket
+//! decides that by kernel buffering and scheduling rather than by anything the
+//! test states. Where a test depends on a particular split, it asserts the
+//! read count, because otherwise a collapsed split still passes.
 
 use crate::support::client::TestClient;
 use crate::support::registry::ScriptedServer;
 use crate::support::script::Script;
-use crate::support::server::RequestReader;
 use xibalba_client::async_client::Chunk;
 use xibalba_client::proto::method::Method;
 
@@ -67,38 +66,32 @@ fn streaming_chunked_need_more_is_not_eof() {
 
 #[test]
 fn streaming_chunked_many_short_chunks_with_gaps() {
-    // Adversarial: many tiny chunks delivered with small gaps. Each gap is
-    // an opportunity for the decoder to return `NeedMore` -> `Ok(0)` -> EOF.
-    // The stream must survive all of them and the connection stays clean.
-    let chunks: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d", b"e"];
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        RequestReader::read_head(&mut stream);
-        stream.set_nodelay(true).unwrap();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
-            .unwrap();
-        for data in &chunks {
-            let hex = format!("{:x}\r\n", data.len());
-            stream.write_all(hex.as_bytes()).unwrap();
-            stream.write_all(data).unwrap();
-            stream.write_all(b"\r\n").unwrap();
-            stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(30));
-        }
-        stream.write_all(b"0\r\n\r\n").unwrap();
-        stream.flush().unwrap();
+    // Adversarial: many tiny chunks, each separated from the next. Every gap
+    // is an opportunity for the decoder to return `NeedMore` -> `Ok(0)` ->
+    // EOF. The stream must survive all of them and the connection stays
+    // clean.
+    //
+    // The gaps were 30ms sleeps, which only made separate reads likely; a
+    // barrier after each chunk makes every gap real, and the read count below
+    // holds the script to it.
+    const CHUNKS: [&[u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
+    let mut script = Script::new()
+        .expect_request()
+        .send_then_await(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec());
+    for data in CHUNKS {
+        let mut chunk = format!("{:x}\r\n", data.len()).into_bytes();
+        chunk.extend_from_slice(data);
+        chunk.extend_from_slice(b"\r\n");
+        script = script.send_then_await(chunk);
+    }
+    let server = ScriptedServer::serving_one(
+        script
+            .send(b"0\r\n\r\n".to_vec())
+            .expect_request()
+            .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()),
+    );
 
-        // Prove the connection is still reusable.
-        RequestReader::read_head(&mut stream);
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .unwrap();
-    });
-
-    let client = TestClient::connect_async(port);
+    let client = TestClient::scripted_async(&server);
     let mut handle = client
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
@@ -128,7 +121,11 @@ fn streaming_chunked_many_short_chunks_with_gaps() {
     assert_eq!(handle2.next_block(), Some(Chunk::Body(b"ok".to_vec())));
     assert_eq!(handle2.next_block(), Some(Chunk::Eof));
 
-    server.join().unwrap();
+    // Head, one read per chunk, the terminator, and the second response. If
+    // any gap collapsed, the decoder never faced the `NeedMore` at that
+    // boundary and this test would be quietly weaker than it reads.
+    server.only().assert_data_reads(CHUNKS.len() + 3);
+    server.only().assert_script_completed();
 }
 
 #[test]
@@ -136,27 +133,27 @@ fn streaming_chunked_single_byte_chunks() {
     // Adversarial: one byte per chunk. The decoder crosses `ReadingDataCr`,
     // `ReadingDataLf`, and `ReadingSize` repeatedly; it must not confuse
     // the chunk boundary parsing with EOF.
-    let body = b"hello";
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        RequestReader::read_head(&mut stream);
-        stream.set_nodelay(true).unwrap();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
-            .unwrap();
-        for &b in body {
-            stream.write_all(b"1\r\n").unwrap();
-            stream.write_all(&[b]).unwrap();
-            stream.write_all(b"\r\n").unwrap();
-            stream.flush().unwrap();
-        }
-        stream.write_all(b"0\r\n\r\n").unwrap();
-        stream.flush().unwrap();
-    });
+    //
+    // Unlike its neighbours this test does not care how the bytes are split —
+    // only that the decoder handles minimal chunks — so the script sends them
+    // without barriers and asserts no read count.
+    const BODY: &[u8] = b"hello";
+    let mut chunks = Vec::new();
+    for &b in BODY {
+        chunks.extend_from_slice(b"1\r\n");
+        chunks.push(b);
+        chunks.extend_from_slice(b"\r\n");
+    }
+    chunks.extend_from_slice(b"0\r\n\r\n");
 
-    let client = TestClient::connect_async(port);
+    let server = ScriptedServer::serving_one(
+        Script::new()
+            .expect_request()
+            .send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec())
+            .send(chunks),
+    );
+
+    let client = TestClient::scripted_async(&server);
     let mut handle = client
         .submit(Method::Get, b"/".to_vec(), None, None, vec![])
         .unwrap();
@@ -173,7 +170,7 @@ fn streaming_chunked_single_byte_chunks() {
             other => panic!("unexpected chunk: {other:?}"),
         }
     }
-    assert_eq!(got, body);
+    assert_eq!(got, BODY);
 
-    server.join().unwrap();
+    server.only().assert_script_completed();
 }

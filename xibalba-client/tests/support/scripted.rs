@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use xibalba_client::connector::SetReadTimeout;
 
+use super::gate::Gate;
 use super::script::{Script, Step};
 
 /// The bytes a client wrote to a scripted connection.
@@ -104,6 +105,7 @@ pub(crate) struct ScriptedStream {
     step: usize,
     pending: Vec<u8>,
     consumed_request: usize,
+    stall_reads_left: Option<usize>,
     stall_until: Option<Instant>,
     closed: bool,
     written: Written,
@@ -118,6 +120,7 @@ impl ScriptedStream {
             step: 0,
             pending: Vec::new(),
             consumed_request: 0,
+            stall_reads_left: None,
             stall_until: None,
             closed: false,
             written: Written::default(),
@@ -176,6 +179,23 @@ impl ScriptedStream {
                 Step::Send(bytes) => self.pending.extend_from_slice(&bytes),
                 Step::AwaitRead => {}
                 Step::Close => self.closed = true,
+                Step::Hang => {
+                    self.progress.record(self.step + 1);
+                    return false;
+                }
+                Step::AwaitGate(ref gate) => {
+                    if !gate.is_open() {
+                        return false;
+                    }
+                }
+                Step::StallReads(reads) => {
+                    let left = self.stall_reads_left.get_or_insert(reads);
+                    if *left > 0 {
+                        *left -= 1;
+                        return false;
+                    }
+                    self.stall_reads_left = None;
+                }
                 Step::Stall(dur) => {
                     let deadline = *self.stall_until.get_or_insert_with(|| Instant::now() + dur);
                     if Instant::now() < deadline {
@@ -365,6 +385,74 @@ mod tests {
         let progress = stream.progress();
         while !read_once(&mut stream).unwrap().is_empty() {}
         assert_eq!(progress.data_reads(), 1);
+    }
+
+    #[test]
+    fn a_gate_holds_the_script_until_the_test_opens_it() {
+        let gate = Gate::shut();
+        let script = Script::new()
+            .send_then_await(b"before".to_vec())
+            .await_gate(&gate)
+            .send(b"after".to_vec());
+        let mut stream = ScriptedStream::new(script);
+
+        assert_eq!(read_once(&mut stream).unwrap(), b"before");
+        let err = read_once(&mut stream).expect_err("a shut gate holds");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        gate.open();
+        assert_eq!(read_once(&mut stream).unwrap(), b"after");
+    }
+
+    /// A gate reports silence, not end-of-stream: a client must keep waiting
+    /// rather than conclude the peer is done.
+    #[test]
+    fn a_shut_gate_is_silence_and_not_eof() {
+        let mut stream = ScriptedStream::new(Script::new().await_gate(&Gate::shut()));
+
+        for _ in 0..3 {
+            let err = read_once(&mut stream).expect_err("a shut gate never ends");
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn a_read_stall_ticks_exactly_the_stated_number_of_times() {
+        let script = Script::new().stall_reads(3).send(b"late".to_vec());
+        let mut stream = ScriptedStream::new(script);
+
+        for _ in 0..3 {
+            let err = read_once(&mut stream).expect_err("the stall owes another tick");
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(read_once(&mut stream).unwrap(), b"late");
+    }
+
+    /// A hang never ends on its own, and never reports EOF — only the client's
+    /// silence budget can end it.
+    #[test]
+    fn a_hang_ticks_forever_without_reaching_eof() {
+        let script = Script::new().send(b"head".to_vec()).hang();
+        let mut stream = ScriptedStream::new(script);
+
+        assert_eq!(read_once(&mut stream).unwrap(), b"head");
+        for _ in 0..5 {
+            let err = read_once(&mut stream).expect_err("a hang must not close");
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        }
+    }
+
+    /// Reaching the hang is the event the test cares about, so it counts as
+    /// progress even though the script can never move past it.
+    #[test]
+    fn reaching_a_hang_counts_as_completing_it() {
+        let script = Script::new().send(b"head".to_vec()).hang();
+        let mut stream = ScriptedStream::new(script);
+        let progress = stream.progress();
+
+        read_once(&mut stream).unwrap();
+        let _ = read_once(&mut stream);
+        assert_eq!(progress.completed(), 2);
     }
 
     /// Buffered bytes reach the client before a stall begins; a stall cannot

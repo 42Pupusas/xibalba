@@ -8,6 +8,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::support::client::TestClient;
+use crate::support::gate::Gate;
+use crate::support::registry::ScriptedServer;
+use crate::support::script::Script;
 use crate::support::server::RequestReader;
 use crate::support::server::TestServer;
 use xibalba_client::PlainConnector;
@@ -52,53 +55,41 @@ fn server_sends_empty_chunked_body() {
 
 #[test]
 fn streaming_chunked_delivers_incrementally() {
-    // Server sends one chunk, pauses, then sends the rest. A streaming
-    // reader must surface the first chunk before the pause ends —
-    // proving bytes flow through without waiting for the terminator.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        RequestReader::read_head(&mut stream);
-        stream.set_nodelay(true).unwrap();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n")
-            .unwrap();
-        stream.flush().unwrap();
-        thread::sleep(Duration::from_millis(400));
-        stream.write_all(b"6\r\nsecond\r\n0\r\n\r\n").unwrap();
-        stream.flush().unwrap();
-        // Serve a follow-up request to prove the connection stays
-        // reusable after a fully-drained stream.
-        let mut acc = Vec::new();
-        let mut buf = [0u8; 1024];
-        loop {
-            let n = stream.read(&mut buf).unwrap();
-            assert!(n > 0, "client closed instead of reusing connection");
-            acc.extend_from_slice(&buf[..n]);
-            if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .unwrap();
-    });
+    // A streaming reader must surface the first chunk without waiting for the
+    // terminator. The old shape sent a chunk, slept 400ms, then sent the rest,
+    // and asserted the first chunk arrived inside 300ms of it — measuring the
+    // machine as much as the client, and only ever showing the chunk arrived
+    // *early*, not that it could arrive at all before the rest existed.
+    //
+    // The gate states the stronger claim: the remaining chunks do not exist
+    // until the test has already received the first one. Reading "first"
+    // cannot have depended on bytes that were never sent.
+    let first_delivered = Gate::shut();
+    let server = ScriptedServer::serving_one(
+        Script::new()
+            .expect_request()
+            .send_then_await(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n".to_vec(),
+            )
+            .await_gate(&first_delivered)
+            .send(b"6\r\nsecond\r\n0\r\n\r\n".to_vec())
+            .expect_request()
+            .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()),
+    );
 
-    let mut client = TestClient::connect(port);
-    let start = std::time::Instant::now();
+    let mut client = TestClient::scripted(&server);
     let mut resp = client
         .send_streaming(client.build(Method::Get, b"/"))
         .expect("streaming request failed");
 
     let mut buf = [0u8; 64];
     let n = resp.body.read(&mut buf).unwrap();
-    let first_elapsed = start.elapsed();
-    assert_eq!(&buf[..n], b"first");
-    assert!(
-        first_elapsed < Duration::from_millis(300),
-        "first chunk should arrive before the server's pause ends, took {first_elapsed:?}"
+    assert_eq!(
+        &buf[..n],
+        b"first",
+        "the first chunk must surface while the rest is still unsent"
     );
+    first_delivered.open();
 
     let mut remainder = Vec::new();
     resp.body.read_to_end(&mut remainder).unwrap();
@@ -106,10 +97,13 @@ fn streaming_chunked_delivers_incrementally() {
     assert!(resp.body.is_done());
     drop(resp);
 
-    // Connection must be reusable without reconnecting.
+    // Connection must be reusable without reconnecting: one script serves
+    // both requests, so a reconnect would find nothing to connect to.
     let resp2 = client.request(Method::Get, b"/", None, None).unwrap();
     assert_eq!(resp2.text().unwrap(), "ok");
-    server.join().unwrap();
+
+    server.only().assert_gated_on(&first_delivered);
+    server.only().assert_script_completed();
 }
 
 #[test]
@@ -273,33 +267,30 @@ fn chunked_data_and_terminator_in_same_read() {
     // server gives up — observed live against CloudFront, where TLS
     // record boundaries decide whether the terminator shares a read
     // with the data.
-    let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-    let body = b"5\r\nhello\r\n0\r\n\r\n";
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        RequestReader::read_head(&mut stream);
-        stream.set_nodelay(true).unwrap();
-        // Two writes with a pause so the head arrives alone and the
-        // entire chunked body (data + terminator) lands in one read.
-        stream.write_all(head).unwrap();
-        stream.flush().unwrap();
-        thread::sleep(Duration::from_millis(100));
-        stream.write_all(body).unwrap();
-        stream.flush().unwrap();
-        // Hold the connection open: a buggy client blocks here.
-        thread::sleep(Duration::from_millis(500));
-    });
+    // The head must arrive alone and the whole body land in one read. On a
+    // socket that was two writes with a pause between, which only tends to
+    // produce that split; the barrier makes it the actual framing. The
+    // trailing hang stands in for holding the connection open — a buggy
+    // client blocks there, and the read timeout is what ends it.
+    let server = ScriptedServer::serving_one(
+        Script::new()
+            .expect_request()
+            .send_then_await(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec())
+            .send(b"5\r\nhello\r\n0\r\n\r\n".to_vec())
+            .hang(),
+    );
 
     let config = Config {
         read_timeout: Some(Duration::from_secs(2)),
         ..Config::default()
     };
-    let mut client = TestClient::with_config(port, config);
+    let mut client = TestClient::scripted_with_config(&server, config);
     let resp = client.request(Method::Get, b"/", None, None).unwrap();
     assert_eq!(resp.text().unwrap(), "hello");
-    server.join().unwrap();
+
+    // Data and terminator must have shared a read; if they arrived separately
+    // the decoder never reaches the Done-while-reporting-Data case.
+    server.only().assert_data_reads(2);
 }
 
 #[test]

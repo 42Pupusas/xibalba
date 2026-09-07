@@ -18,6 +18,18 @@
 //! reaches the park at all, so what pins those tests is backpressure; their
 //! former sleeps were holding nothing and cost the suite 20 seconds of pure
 //! teardown.
+//!
+//! These tests keep a real socket while the rest of the suite moved to a
+//! scripted connector, because kernel buffering is their subject rather than
+//! their nuisance: an in-memory stream has no fixed-size buffer to fill, so
+//! there is no backpressure to observe and no write that can genuinely block.
+//! Scripting them would delete what they test.
+//!
+//! Waiting is still stated rather than guessed. [`Milestone`] carries the
+//! other direction from [`StopSignal`] — the server reporting that a request
+//! arrived, so a test proceeds on that fact instead of on a sleep long enough
+//! to assume it. Where a loop polls, it polls a condition and fails on a
+//! deadline, which is a bounded wait for an event and not a fixed delay.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -28,6 +40,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod support;
+use support::milestone::{Milestone, Reached};
 use support::park::StopSignal;
 
 use xibalba_client::DEFAULT_MAX_OUTSTANDING;
@@ -340,6 +353,7 @@ struct SilentHeadServer {
     port: u16,
     handle: thread::JoinHandle<()>,
     stop: Option<StopSignal>,
+    got_request: Reached,
 }
 
 impl SilentHeadServer {
@@ -347,12 +361,17 @@ impl SilentHeadServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         let (stop, park) = StopSignal::new();
+        let (milestone, got_request) = Milestone::new();
         let handle = thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
+            // The request is on the wire, so the reader has nothing left to do
+            // but wait for a head. Saying so lets the test proceed on that
+            // fact rather than on a sleep long enough to assume it.
+            milestone.reached();
             // Never answer. Hold the socket open so the client waits on the
             // head rather than seeing EOF.
             park.wait();
@@ -361,7 +380,13 @@ impl SilentHeadServer {
             port,
             handle,
             stop: Some(stop),
+            got_request,
         }
+    }
+
+    /// Block until the client's request has actually arrived.
+    fn await_request(&self) {
+        self.got_request.wait("the client's request");
     }
 
     /// `head_silence` is deliberately far longer than the test's patience:
@@ -398,13 +423,11 @@ fn cancel_interrupts_a_silent_response_head() {
         .expect("submit succeeds");
 
     // Wait until the request is actually on the wire, so the cancel lands
-    // during the head read rather than while it is still queued.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !handle.has_started() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
+    // during the head read rather than while it is still queued. The server
+    // confirms receipt, which is the event itself rather than a delay chosen
+    // to be longer than it.
+    server.await_request();
     assert!(handle.has_started(), "the request never reached the wire");
-    thread::sleep(Duration::from_millis(100));
 
     handle.cancel().expect("cancel reaches the reader");
 
@@ -436,12 +459,8 @@ fn drop_interrupts_a_silent_response_head() {
     let handle = client
         .submit(Method::Get, b"/silent".to_vec(), None, None, vec![])
         .expect("submit succeeds");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !handle.has_started() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
+    server.await_request();
     assert!(handle.has_started(), "the request never reached the wire");
-    thread::sleep(Duration::from_millis(100));
 
     let elapsed = Watchdog::run(
         Duration::from_secs(10),
@@ -469,10 +488,12 @@ fn drop_interrupts_a_blocked_request_upload() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
     let (stop, park) = StopSignal::new();
+    let (accepted, connection_made) = Milestone::new();
     let server = thread::spawn(move || {
         let Ok((stream, _)) = listener.accept() else {
             return;
         };
+        accepted.reached();
         // Never read. Hold the connection so the client's write blocks once
         // the kernel buffers fill.
         park.wait();
@@ -500,11 +521,19 @@ fn drop_interrupts_a_blocked_request_upload() {
         .submit(Method::Post, b"/upload".to_vec(), None, Some(body), vec![])
         .expect("submit succeeds");
 
+    connection_made.wait("the client's connection");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !handle.has_started() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    thread::sleep(Duration::from_millis(200));
+    assert!(handle.has_started(), "the upload never began");
+
+    // The write blocking is what this test needs, and neither side can
+    // observe it directly: the server never reads, so it sees nothing, and
+    // the client is inside the blocked call. What makes the wait unnecessary
+    // is that blocking is not a race — the body is far larger than any socket
+    // buffer, so once the upload has started the write must block, and drop
+    // has to cope whether it has happened yet or not.
 
     let elapsed = Watchdog::run(
         Duration::from_secs(15),

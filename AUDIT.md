@@ -272,7 +272,15 @@ Acceptance status: RFC 3986 §5.4 cases run table-driven against the resolver, a
 
     One finding worth recording. The first converted test (`streaming_chunked_need_more_is_not_eof`) still passed with its barrier deleted: the response bytes were identical either way, so every assertion held while the decoder no longer hit the `NeedMore` the test exists for. A barrier is invisible to assertions about the result. `Progress::data_reads` now counts delivered reads and `assert_data_reads` makes the fragmentation itself checkable; with it, deleting the barrier fails the test with a message naming the cause. Tests whose subject is *how* bytes were split need that guard, or they quietly stop testing it.
 
-    **Not done:** the remaining ~19 sleeps are not yet converted. MSRV, advisory, fuzz and CI checks are unstarted.
+    **All sequencing sleeps removed** (second commit). Every remaining `thread::sleep` used to order a server against a client is gone; what is left in the suite is bounded polling — loops whose condition is the event, with a deadline that fails the test rather than a duration that defines it.
+
+    Three fixtures cover the cases a barrier could not. `Step::AwaitGate` holds a script until the test opens it, for waits whose condition only the test can see (a second request submitted, a cancel pushed). `Step::Hang` goes silent for good, so a client-side silence budget is what ends the wait — a `Close` would end it via EOF, which is the wrong reason and passes even when the framing is wrong. `Step::StallReads(n)` states a number of retries where the subject is a retry count rather than a duration. `Milestone` is the reverse of `StopSignal`: the server reporting it has reached a point, used by the real-socket tests that stay on TCP.
+
+    A second unfalsifiability finding, in the same shape as the first. Gates are invisible to assertions about the result, so deleting one leaves a passing test. The first guard written for this was wrong: it recorded whether the reader was *parked* at the gate when the test opened it, which is a thread-timing coincidence, and it failed all five gated tests on a fast reader. The guarantee actually relied on is that the script *cannot* proceed without the test — a property of the script, not of any thread. `assert_gated_on` checks that instead, deterministically. Verified by deleting a gate: it fails, naming the cause.
+
+    `async_backpressure.rs` keeps real TCP by design and now runs in 0.06s rather than ~1.5s.
+
+    **Not done:** MSRV, advisory, fuzz and CI checks are unstarted.
 
 Acceptance: no unexplained graph back-edges, no new free business functions, no newly scattered feature cfg branches, and no misleading documentation examples. Common-foundation skip edges may remain with an explicit rationale.
 
