@@ -1955,6 +1955,9 @@ dependencies = [
 [[package]]
 name = "xibalba-proto"
 version = "0.3.0"
+dependencies = [
+ "httparse",
+]
 
 [[package]]
 name = "yasna"

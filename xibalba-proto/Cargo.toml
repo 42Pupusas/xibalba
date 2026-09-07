@@ -9,5 +9,11 @@ repository = "https://github.com/42pupusas/xibalba"
 keywords = ["http", "parser", "protocol", "no-alloc"]
 categories = ["network-programming", "parser-implementations"]
 
+# Test-only. The crate itself has no dependencies and must keep none; this
+# exists so the parser can be cross-checked against a widely deployed one,
+# and never reaches a consumer of the library.
+[dev-dependencies]
+httparse = "1.10"
+
 [lints]
 workspace = true
