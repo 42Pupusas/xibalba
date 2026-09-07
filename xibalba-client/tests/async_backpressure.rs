@@ -480,6 +480,10 @@ fn drop_interrupts_a_silent_response_head() {
     server.shutdown();
 }
 
+/// The per-write ceiling for the blocked-upload test, and so the granularity
+/// at which its drop can be observed.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(50);
+
 #[test]
 fn drop_interrupts_a_blocked_request_upload() {
     // A peer that accepts the connection and then stops reading fills the
@@ -506,7 +510,7 @@ fn drop_interrupts_a_blocked_request_upload() {
         // The write-side granularity at which shutdown becomes observable.
         // Without a bound here the write blocks inside one syscall and no
         // cancellation check is ever reached.
-        write_timeout: Some(Duration::from_millis(50)),
+        write_timeout: Some(WRITE_TIMEOUT),
         head_silence: Duration::from_mins(5),
         stream_silence: Duration::from_mins(5),
         ..Config::default()
@@ -544,9 +548,15 @@ fn drop_interrupts_a_blocked_request_upload() {
             started.elapsed()
         },
     );
+    // A few write ticks, not ten seconds. The write budget retries a timeout
+    // tick instead of failing on it, so the loose bound this once carried
+    // could not tell a prompt shutdown from one that waited out the whole
+    // five-minute head-silence budget. The interrupt is consulted before
+    // every write, and the retry is paced, so a drop costs about one tick.
     assert!(
-        elapsed < Duration::from_secs(10),
-        "drop took {elapsed:?} while the request write was blocked"
+        elapsed < WRITE_TIMEOUT * 8,
+        "drop took {elapsed:?} while the request write was blocked; \
+         a cancel must be seen within about one write tick ({WRITE_TIMEOUT:?})"
     );
 
     drop(handle);
