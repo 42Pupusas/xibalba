@@ -2,9 +2,10 @@ name: CI
 
 # The gate this repository has been run by hand until now: fmt, clippy under
 # -D warnings, and the full suite in debug and release. The jobs below are that
-# gate, plus the three checks a human cannot perform by rebuilding: that the
-# declared MSRV compiles, that no dependency carries a known advisory, and that
-# the parser survives inputs nobody wrote by hand.
+# gate, plus the four checks a human cannot perform by rebuilding: that the
+# declared MSRV compiles, that no dependency carries a known advisory, that the
+# parser survives inputs nobody wrote by hand, and that the shared state holds
+# under thread interleavings a single run will not produce.
 
 on:
   push:
@@ -85,6 +86,30 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --all-targets -- -D warnings
           cargo test
+
+  # The rest of the suite runs each concurrent test on whichever interleaving
+  # the scheduler happened to pick. This one enumerates them. It is a separate
+  # job because loom must replace `std`'s atomics for the whole build, so it
+  # cannot share a compilation with the gate.
+  loom:
+    name: model-checked interleavings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Without the cfg this test file compiles to nothing and reports a
+      # cheerful "0 passed", so the flag is the whole job.
+      - name: model-check the shared state
+        run: cargo test -p xibalba-client --test loom_shared_state
+        env:
+          RUSTFLAGS: "--cfg loom"
+
+      - name: clippy under the model checker
+        run: cargo clippy -p xibalba-client --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: "--cfg loom"
 
   deny:
     name: advisories, licences, sources

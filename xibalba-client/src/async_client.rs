@@ -48,8 +48,9 @@
 //! wrap the `AsyncClient` in `Arc<Mutex<_>>` at a higher layer —
 //! but the in-tree design keeps it single-owner.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+// The reader runs on a real OS thread. Loom models only the flags and
+// counters it shares with the caller, never `AsyncClient` itself, which owns a
+// socket the model checker cannot re-run.
 use std::thread::{self, JoinHandle};
 
 use quetzalcoatl::capacity::Capacity;
@@ -64,6 +65,7 @@ use crate::control::{AsyncRequest, CANCEL_ANY, Control, ControlQueue};
 use crate::delivery::{ChunkStream, ConsumerGuard};
 use crate::params::RequestParams;
 use crate::reader::ReaderWorker;
+use crate::sync::{Arc, AtomicBool, AtomicU64, Ordering};
 
 /// Default capacity for the per-request chunk ring: a few SSE
 /// events worth of buffering. The ring parks the caller on full
@@ -316,9 +318,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
         headers: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<StreamHandle, Error> {
         RequestParams::validate_extra_headers(&headers)?;
-        let permit = self
-            .admission
-            .try_admit()
+        let permit = Admission::try_admit(&self.admission)
             .ok_or(Error::Connection(ConnectionError::TooManyRequests))?;
         let (chunk_tx, chunk_rx) =
             spsc::RingBuffer::<Chunk>::new(Capacity::at_least(CHUNK_RING_CAP)).split();

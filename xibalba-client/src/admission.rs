@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::{Arc, AtomicUsize, Ordering};
 
 /// How many requests may be outstanding at once by default: submitted but not
 /// yet finished, wherever they currently sit.
@@ -22,7 +21,20 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
+    /// `const` in an ordinary build; not under `--cfg loom`, whose
+    /// `AtomicUsize::new` records state at runtime and cannot be a `const fn`.
+    /// Gated here rather than by relaxing the lint, so the shipped build keeps
+    /// the stricter signature.
+    #[cfg(not(loom))]
     pub(crate) const fn new(max: usize) -> Self {
+        Self {
+            outstanding: AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    #[cfg(loom)]
+    pub(crate) fn new(max: usize) -> Self {
         Self {
             outstanding: AtomicUsize::new(0),
             max,
@@ -31,19 +43,24 @@ impl Admission {
 
     /// Take a permit, or return `None` when the client is already at its
     /// limit. The permit releases itself when dropped.
-    pub(crate) fn try_admit(self: &Arc<Self>) -> Option<Permit> {
-        let mut current = self.outstanding.load(Ordering::Acquire);
+    ///
+    /// Takes `&Arc<Self>` as an ordinary parameter rather than as a `self`
+    /// receiver: an arbitrary `self` type is only permitted for types the
+    /// compiler knows are receivers, which `std::sync::Arc` is and loom's
+    /// stand-in is not.
+    pub(crate) fn try_admit(this: &Arc<Self>) -> Option<Permit> {
+        let mut current = this.outstanding.load(Ordering::Acquire);
         loop {
-            if current >= self.max {
+            if current >= this.max {
                 return None;
             }
-            match self.outstanding.compare_exchange_weak(
+            match this.outstanding.compare_exchange_weak(
                 current,
                 current + 1,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Permit(Arc::clone(self))),
+                Ok(_) => return Some(Permit(Arc::clone(this))),
                 Err(actual) => current = actual,
             }
         }
@@ -82,9 +99,12 @@ mod tests {
     #[test]
     fn permits_are_refused_at_the_limit() {
         let admission = Arc::new(Admission::new(2));
-        let first = admission.try_admit().expect("first fits");
-        let second = admission.try_admit().expect("second fits");
-        assert!(admission.try_admit().is_none(), "third exceeds the limit");
+        let first = Admission::try_admit(&admission).expect("first fits");
+        let second = Admission::try_admit(&admission).expect("second fits");
+        assert!(
+            Admission::try_admit(&admission).is_none(),
+            "third exceeds the limit"
+        );
         assert_eq!(admission.outstanding(), 2);
         drop(first);
         drop(second);
@@ -93,12 +113,12 @@ mod tests {
     #[test]
     fn dropping_a_permit_frees_a_slot() {
         let admission = Arc::new(Admission::new(1));
-        let permit = admission.try_admit().expect("first fits");
-        assert!(admission.try_admit().is_none());
+        let permit = Admission::try_admit(&admission).expect("first fits");
+        assert!(Admission::try_admit(&admission).is_none());
         drop(permit);
         assert_eq!(admission.outstanding(), 0);
         assert!(
-            admission.try_admit().is_some(),
+            Admission::try_admit(&admission).is_some(),
             "the freed slot must be reusable"
         );
     }
@@ -110,7 +130,7 @@ mod tests {
         for _ in 0..8 {
             let admission = Arc::clone(&admission);
             handles.push(std::thread::spawn(move || {
-                admission.try_admit().map(|permit| {
+                Admission::try_admit(&admission).map(|permit| {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                     drop(permit);
                 })

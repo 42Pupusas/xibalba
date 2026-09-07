@@ -102,6 +102,7 @@ mod reader;
 mod redirect;
 mod reuse;
 mod silence;
+mod sync;
 mod tick;
 mod write_budget;
 

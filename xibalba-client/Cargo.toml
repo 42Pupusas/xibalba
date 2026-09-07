@@ -13,9 +13,25 @@ categories = ["network-programming", "web-programming::http-client"]
 name = "integration"
 path = "tests/integration/main.rs"
 
+[[test]]
+name = "loom_shared_state"
+path = "tests/loom_shared_state.rs"
+
 [dependencies]
 xibalba-proto = { workspace = true }
 quetzalcoatl = { workspace = true }
+
+# Only ever compiled under `--cfg loom`, so an ordinary `cargo build`,
+# `cargo test` or `cargo publish` never resolves it. The model checker is a
+# tool for one job, not a dependency of the client.
+#
+# A *normal* dependency rather than a dev-dependency, because `src/sync.rs`
+# re-exports loom's atomics into the library itself; dev-dependencies are not
+# in scope for the lib target. The cfg is what keeps it out of a shipped
+# build, and `tls_agnostic.rs`-style manifest tests still see two dependencies
+# because this line is inert without the cfg.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [lints]
 workspace = true

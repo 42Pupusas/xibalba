@@ -52,6 +52,11 @@ ququmatz = "0.15.1"
 
 [workspace.lints.rust]
 unreachable_pub = "warn"
+# `--cfg loom` selects loom's instrumented atomics in `xibalba-client::sync`.
+# It is a cfg rather than a feature because loom must replace `std`'s
+# primitives wholesale for a whole build; a feature can be unified on by an
+# unrelated crate in the graph, which would silently ship the model checker.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

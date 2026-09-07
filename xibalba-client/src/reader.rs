@@ -2,8 +2,9 @@
 //! control queue, delivering each response as a sequence of chunks.
 
 use std::io::Read;
+// `Chunk::Error` shares one error with the caller by refcount; it guards no
+// shared mutable state, so it stays `std`'s even under the model checker.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use xibalba_proto::error::Error;
 use xibalba_proto::response::BodyFraming;
@@ -17,6 +18,7 @@ use crate::delivery::ChunkSink;
 use crate::interrupt::{Cancelled, InterruptibleStream, Latch};
 use crate::params::RequestParams;
 use crate::silence::RequestDeadline;
+use crate::sync::{AtomicBool, Ordering};
 use crate::{Chunk, response::HeadData, reuse::ConnectionReuse};
 
 /// Owns the connection for the reader thread's lifetime and serves one

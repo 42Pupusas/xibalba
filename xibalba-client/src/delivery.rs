@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use crate::sync::{Arc, AtomicBool, Ordering};
 
 use quetzalcoatl::spsc::{Consumer, Producer};
 
@@ -105,6 +105,29 @@ impl<'a> ChunkSink<'a> {
         }
     }
 
+    /// Why this sink must stop waiting for ring capacity, or `None` while it
+    /// may keep trying.
+    ///
+    /// This is the whole exit condition of [`send`](Self::send)'s wait loop,
+    /// named so it can be checked on its own. Both loads are `Acquire` and
+    /// pair with the `Release` in [`ConsumerGuard::drop`] and in
+    /// `AsyncClient::begin_shutdown`: without that pairing a reader could
+    /// keep waiting on a ring whose consumer is provably gone.
+    ///
+    /// Shutdown is checked first. A client shutting down is stopping every
+    /// request, so reporting a dropped consumer instead would be true but
+    /// less useful, and the two race by nature — `Drop` sets the flag and
+    /// drops handles.
+    pub(crate) fn blocked_reason(&self) -> Option<Undelivered> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Some(Undelivered::ShuttingDown);
+        }
+        if !self.consumer_alive.load(Ordering::Acquire) {
+            return Some(Undelivered::ConsumerGone);
+        }
+        None
+    }
+
     /// Deliver `chunk`, waiting for ring capacity while the client is live.
     ///
     /// # Errors
@@ -115,11 +138,8 @@ impl<'a> ChunkSink<'a> {
         let mut pending = chunk;
         let mut spins = 0u32;
         loop {
-            if self.shutting_down.load(Ordering::Acquire) {
-                return Err(Undelivered::ShuttingDown);
-            }
-            if !self.consumer_alive.load(Ordering::Acquire) {
-                return Err(Undelivered::ConsumerGone);
+            if let Some(reason) = self.blocked_reason() {
+                return Err(reason);
             }
             match self.tx.push(pending) {
                 Ok(()) => return Ok(()),

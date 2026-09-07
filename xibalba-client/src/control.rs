@@ -6,12 +6,12 @@
 //! from it — is the invariant this module owns.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use quetzalcoatl::mpsc::Consumer as MpscConsumer;
 use quetzalcoatl::spsc;
 use xibalba_proto::method::Method;
+
+use crate::sync::{Arc, AtomicBool, Ordering};
 
 use crate::admission::Permit;
 use crate::async_client::Chunk;
