@@ -261,7 +261,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -694,9 +694,12 @@ dependencies = [
 
 [[package]]
 name = "quetzalcoatl"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "decf02d6619a225a6c5374a383b902ed01cfad94b1767c1f3bf70e9e981542ac"
+checksum = "ddadd6b202431213574e0187c18f1e5c45c9fd0498603689905c7c49c2afb9c1"
+dependencies = [
+ "loom",
+]
 
 [[package]]
 name = "quote"
@@ -804,7 +807,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
