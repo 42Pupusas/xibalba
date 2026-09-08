@@ -23,13 +23,23 @@ use crate::tick::Tick;
 pub(crate) struct WriteBudget {
     limit: Duration,
     last_progress: Instant,
+    deadline: crate::silence::RequestDeadline,
 }
 
 impl WriteBudget {
+    #[cfg(test)]
     pub(crate) fn new(limit: Duration) -> Self {
+        Self::with_deadline(limit, crate::silence::RequestDeadline::NONE)
+    }
+
+    pub(crate) fn with_deadline(
+        limit: Duration,
+        deadline: crate::silence::RequestDeadline,
+    ) -> Self {
         Self {
             limit,
             last_progress: Instant::now(),
+            deadline,
         }
     }
 
@@ -51,9 +61,28 @@ impl WriteBudget {
     /// This is `write_all` with the retry the budget needs, rather than a call
     /// to it: `write_all` treats a tick as fatal, and a partial write followed
     /// by a tick must resume at the offset already accepted, not restart.
+    #[cfg(test)]
     pub(crate) fn write_all(&mut self, stream: &mut impl Write, buf: &[u8]) -> std::io::Result<()> {
+        self.write_all_raw(stream, buf)
+    }
+
+    /// [`Self::write_all`], typed as [`Self::write_all_proto`] is: a deadline
+    /// expiry re-typed as the protocol error, for call sites whose `?` would
+    /// otherwise flatten it to a kind and a message at the `io::Error`
+    /// boundary.
+    pub(crate) fn write_all_proto(
+        &mut self,
+        stream: &mut impl Write,
+        buf: &[u8],
+    ) -> Result<(), xibalba_proto::error::Error> {
+        self.write_all_raw(stream, buf)
+            .map_err(crate::silence::RequestDeadline::classify)
+    }
+
+    fn write_all_raw(&mut self, stream: &mut impl Write, buf: &[u8]) -> std::io::Result<()> {
         let mut off = 0;
         while off < buf.len() {
+            self.deadline.check_io()?;
             let tick_start = Instant::now();
             match stream.write(&buf[off..]) {
                 Ok(0) => {
@@ -82,6 +111,7 @@ impl WriteBudget {
     /// handshake records here as well as in `write`.
     pub(crate) fn flush(&self, stream: &mut impl Write) -> std::io::Result<()> {
         loop {
+            self.deadline.check_io()?;
             let tick_start = Instant::now();
             match stream.flush() {
                 Ok(()) => return Ok(()),
@@ -94,6 +124,15 @@ impl WriteBudget {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// [`Self::flush`], typed as [`Self::write_all_proto`] is.
+    pub(crate) fn flush_proto(
+        &self,
+        stream: &mut impl Write,
+    ) -> Result<(), xibalba_proto::error::Error> {
+        self.flush(stream)
+            .map_err(crate::silence::RequestDeadline::classify)
     }
 }
 

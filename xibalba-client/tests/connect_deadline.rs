@@ -148,9 +148,17 @@ impl Connector for RecordingConnector {
 
 impl RecordingConnector {
     fn client(connect_timeout: Option<Duration>) -> (ClaimedLog, Client<Self>) {
+        Self::client_with(connect_timeout, None)
+    }
+
+    fn client_with(
+        connect_timeout: Option<Duration>,
+        request_deadline: Option<Duration>,
+    ) -> (ClaimedLog, Client<Self>) {
         let log = DeadlineLog::claim();
         let config = Config {
             connect_timeout,
+            request_deadline,
             ..Config::default()
         };
         let client =
@@ -234,6 +242,58 @@ fn a_reconnect_gets_a_fresh_deadline_rather_than_the_remains_of_the_first() {
         TimeLeft::Remaining(left) => assert!(
             left > Duration::from_secs(6),
             "the reconnect should get the whole budget, got {left:?}"
+        ),
+        other => panic!("expected a bounded deadline, got {other:?}"),
+    }
+}
+
+/// A reconnect while a total request deadline is running must not get a
+/// fresh `connect_timeout` regardless of how little of the total remains: a
+/// caller who set a 5s total do not expect one hop's reconnect to spend a
+/// full fresh `connect_timeout` on top of what the total has already burned.
+#[test]
+fn a_reconnect_is_bounded_by_the_remaining_total_when_it_is_the_shorter_bound() {
+    let (log, mut client) = RecordingConnector::client_with(
+        Some(Duration::from_secs(30)),
+        Some(Duration::from_millis(200)),
+    );
+
+    client.get(b"/first").expect("first request");
+    client.get(b"/second").expect("second request reconnects");
+
+    let observed = log.observed();
+    assert_eq!(observed.len(), 2, "the second request must reconnect");
+    match observed[1].time_left {
+        TimeLeft::Remaining(left) => assert!(
+            left < Duration::from_secs(1),
+            "the reconnect must be bounded by what the total has left, not \
+             a fresh connect_timeout; saw {left:?}"
+        ),
+        other => panic!("expected a bounded deadline, got {other:?}"),
+    }
+}
+
+/// The converse: a short `connect_timeout` must still cap a reconnect even
+/// when the total request deadline has plenty left, or a caller relying on
+/// `connect_timeout` to bound one connect attempt would find a reconnect
+/// silently exempt from it.
+#[test]
+fn a_reconnect_is_bounded_by_connect_timeout_when_it_is_the_shorter_bound() {
+    let (log, mut client) = RecordingConnector::client_with(
+        Some(Duration::from_millis(200)),
+        Some(Duration::from_secs(30)),
+    );
+
+    client.get(b"/first").expect("first request");
+    client.get(b"/second").expect("second request reconnects");
+
+    let observed = log.observed();
+    assert_eq!(observed.len(), 2, "the second request must reconnect");
+    match observed[1].time_left {
+        TimeLeft::Remaining(left) => assert!(
+            left < Duration::from_secs(1),
+            "the reconnect must still respect connect_timeout even with a \
+             generous total left; saw {left:?}"
         ),
         other => panic!("expected a bounded deadline, got {other:?}"),
     }

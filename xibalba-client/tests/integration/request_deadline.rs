@@ -8,6 +8,7 @@
 
 use std::io::Write;
 use std::net::TcpListener;
+use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -156,6 +157,58 @@ fn redirect_hops_share_one_total_rather_than_earning_one_each() {
         elapsed < Duration::from_secs(2),
         "the shared total must stop the chain promptly, took {elapsed:?}"
     );
+}
+
+/// A peer that accepts the connection and never reads fills the socket
+/// buffers, blocking the request write. Before the total deadline reached
+/// the write path, only `write_timeout`/`head_silence` bounded this, and
+/// both are configured huge here so the total is the only thing that can
+/// end it.
+#[test]
+fn a_blocked_upload_hits_the_total_deadline_rather_than_hanging_on_the_silence_budgets() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (stop, park) = StopSignal::new();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        // Never read: the kernel buffers fill and the client's write blocks.
+        park.wait();
+        drop(stream);
+    });
+
+    let config = Config {
+        write_timeout: Some(Duration::from_millis(20)),
+        head_silence: Duration::from_mins(10),
+        stream_silence: Duration::from_mins(10),
+        request_deadline: Some(Duration::from_millis(300)),
+        ..Config::default()
+    };
+    let mut client = TestClient::with_config(port, config);
+
+    // Far larger than any socket buffer, so the write must block partway.
+    let body = vec![b'x'; 8 * 1024 * 1024];
+    let start = std::time::Instant::now();
+    let err = client
+        .request(Method::Post, b"/upload", None, Some(&body))
+        .expect_err("a peer that never reads must not stall past the total deadline");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        err,
+        Error::Connection(ConnectionError::RequestDeadlineExceeded),
+        "a blocked upload must be typed as the total deadline, got {err:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "the deadline should be honoured, not tripped instantly: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the total must cut the upload at its deadline, took {elapsed:?}"
+    );
+
+    drop(stop);
+    server.join().unwrap();
 }
 
 /// The same trickle with no total configured must end in the server's

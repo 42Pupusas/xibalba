@@ -67,6 +67,22 @@ impl Deadline {
         matches!(self.time_left(), TimeLeft::Expired)
     }
 
+    /// Whichever of two deadlines expires first.
+    ///
+    /// An unbounded deadline never wins this comparison: any bounded
+    /// deadline is sooner than one that never expires.
+    #[must_use]
+    pub fn sooner(a: Self, b: Self) -> Self {
+        match (a.expires_at, b.expires_at) {
+            (Some(x), Some(y)) => Self {
+                expires_at: Some(x.min(y)),
+            },
+            (Some(_), None) => a,
+            (None, Some(_)) => b,
+            (None, None) => Self::never(),
+        }
+    }
+
     /// # Errors
     /// Returns [`ConnectionError::ConnectDeadlineExceeded`] once the deadline
     /// has passed, for a connector to return before starting further work.
@@ -168,6 +184,29 @@ mod tests {
         assert_eq!(
             error,
             Error::Connection(ConnectionError::ConnectDeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn sooner_picks_the_nearer_of_two_bounded_deadlines() {
+        let near = Deadline::after(Duration::from_millis(50));
+        let far = Deadline::after(Duration::from_secs(30));
+        assert_eq!(Deadline::sooner(near, far), near);
+        assert_eq!(Deadline::sooner(far, near), near);
+    }
+
+    #[test]
+    fn sooner_prefers_a_bounded_deadline_over_an_unbounded_one() {
+        let bounded = Deadline::after(Duration::from_secs(5));
+        assert_eq!(Deadline::sooner(bounded, Deadline::never()), bounded);
+        assert_eq!(Deadline::sooner(Deadline::never(), bounded), bounded);
+    }
+
+    #[test]
+    fn sooner_of_two_unbounded_deadlines_is_unbounded() {
+        assert_eq!(
+            Deadline::sooner(Deadline::never(), Deadline::never()),
+            Deadline::never()
         );
     }
 

@@ -154,14 +154,30 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     /// Reconnect to the current host if a previous streaming response
     /// was dropped before its body was fully consumed.
     pub(crate) fn ensure_clean(&mut self) -> Result<(), Error> {
+        self.ensure_clean_with_deadline(RequestDeadline::NONE)
+    }
+
+    pub(crate) fn ensure_clean_with_deadline(
+        &mut self,
+        deadline: RequestDeadline,
+    ) -> Result<(), Error> {
         if !self.dirty {
             return Ok(());
         }
-        self.reconnect_same_host()
+        self.reconnect_same_host_with_deadline(deadline)
     }
 
-    pub(crate) fn reconnect(&mut self, url: &Url<'_>) -> Result<(), Error> {
-        self.stream = C::connect(url, &self.tls_config, self.config.connect_deadline())?;
+    pub(crate) fn reconnect_with_deadline(
+        &mut self,
+        url: &Url<'_>,
+        deadline: RequestDeadline,
+    ) -> Result<(), Error> {
+        deadline.check()?;
+        self.stream = C::connect(
+            url,
+            &self.tls_config,
+            deadline.connect_deadline(self.config.connect_deadline()),
+        )?;
         self.origin = Origin::from_url(url);
         self.apply_timeouts()?;
         self.dirty = false;
@@ -170,9 +186,12 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
 
     /// Reconnect to the current host (used to recover a stale
     /// keep-alive connection without re-parsing a URL).
-    fn reconnect_same_host(&mut self) -> Result<(), Error> {
+    fn reconnect_same_host_with_deadline(
+        &mut self,
+        deadline: RequestDeadline,
+    ) -> Result<(), Error> {
         let origin = self.origin.clone();
-        self.reconnect(&origin.root_url())
+        self.reconnect_with_deadline(&origin.root_url(), deadline)
     }
 
     /// Mark the live connection unusable after a response head could not be
@@ -247,7 +266,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
                         "request cancelled",
                     )));
                 }
-                self.reconnect_same_host()?;
+                self.reconnect_same_host_with_deadline(deadline)?;
                 // The retry shares the caller's total rather than earning a
                 // fresh one: a deadline spent on the failed attempt is spent.
                 self.send_head_once(params, deadline, &mut interrupt)
@@ -328,20 +347,20 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         // its handshake inside this write, where it blocks on the peer's
         // records and expires on the socket's *receive* timeout.
         let inline = params.body.is_some_and(|d| self.inline_body_fits(d.len()));
-        let mut budget = WriteBudget::new(self.config.head_silence);
+        let mut budget = WriteBudget::with_deadline(self.config.head_silence, deadline);
         let mut wire = InterruptibleStream::new(&mut self.stream, interrupt);
         match params.body {
             Some(data) if inline => {
                 self.write_buf.extend_from_slice(data);
-                budget.write_all(&mut wire, &self.write_buf)?;
+                budget.write_all_proto(&mut wire, &self.write_buf)?;
             }
             Some(data) => {
-                budget.write_all(&mut wire, &self.write_buf)?;
-                budget.write_all(&mut wire, data)?;
+                budget.write_all_proto(&mut wire, &self.write_buf)?;
+                budget.write_all_proto(&mut wire, data)?;
             }
-            None => budget.write_all(&mut wire, &self.write_buf)?,
+            None => budget.write_all_proto(&mut wire, &self.write_buf)?,
         }
-        budget.flush(&mut wire)?;
+        budget.flush_proto(&mut wire)?;
 
         // A rejected head (notably HeadTooLarge) may already have consumed a
         // prefix of the response, so the poison above stands on every error
@@ -400,7 +419,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         // connection unusable. Checking only once per caller request would
         // skip the check between redirect hops, where the previous hop's
         // close-delimited or over-long body can have spent the connection.
-        self.ensure_clean()?;
+        self.ensure_clean_with_deadline(deadline)?;
         let (head_data, framing, tail_offset) =
             self.send_head_interruptible(params, deadline, NeverCancelled)?;
         let reuse = head_data.connection_reuse(params.requests_close());
@@ -434,8 +453,8 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         &mut self,
         params: &RequestParams<'_>,
     ) -> Result<StreamingResponse<'_, C::Stream>, Error> {
-        self.ensure_clean()?;
         let deadline = RequestDeadline::after(self.config.request_deadline);
+        self.ensure_clean_with_deadline(deadline)?;
         let (head_data, framing, tail_offset) =
             self.send_head_interruptible(params, deadline, NeverCancelled)?;
         let reuse = head_data.connection_reuse(params.requests_close());
@@ -491,7 +510,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             if let Hop::Reconnect(target) =
                 state.advance(&self.origin, response.status, &location)?
             {
-                self.reconnect(&Url::parse(&target)?)?;
+                self.reconnect_with_deadline(&Url::parse(&target)?, deadline)?;
             }
         }
     }

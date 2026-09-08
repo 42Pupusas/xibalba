@@ -54,12 +54,35 @@ impl RequestDeadline {
         std::io::Error::new(std::io::ErrorKind::TimedOut, RequestDeadlineExceeded)
     }
 
-    /// Refuse work once the total has passed, before anything further is
-    /// started.
+    /// The deadline a reconnect's [`Connector::connect`](crate::connector::Connector::connect)
+    /// should receive: whichever of the remaining total and `fallback`
+    /// (the per-connect `connect_timeout` budget) runs out first.
     ///
-    /// # Errors
-    /// Returns [`ConnectionError::RequestDeadlineExceeded`] once the total
-    /// for the operation has passed.
+    /// Neither bound alone is enough. The remaining total by itself would let
+    /// a reconnect against a blackholed address, deep into a generous total,
+    /// wait out the whole remainder instead of the shorter per-connect
+    /// ceiling the caller configured; `fallback` alone would let a reconnect
+    /// spend a fresh `connect_timeout` on every hop regardless of how much of
+    /// the total is left. Taking the sooner of the two keeps both promises.
+    pub(crate) fn connect_deadline(
+        &self,
+        fallback: crate::deadline::Deadline,
+    ) -> crate::deadline::Deadline {
+        let Some(expires_at) = self.0 else {
+            return fallback;
+        };
+        let remaining =
+            crate::deadline::Deadline::after(expires_at.saturating_duration_since(Instant::now()));
+        crate::deadline::Deadline::sooner(remaining, fallback)
+    }
+
+    pub(crate) fn check_io(&self) -> std::io::Result<()> {
+        if self.expired() {
+            return Err(Self::error());
+        }
+        Ok(())
+    }
+
     pub(crate) fn check(&self) -> Result<(), Error> {
         if self.expired() {
             return Err(xibalba_proto::error::ConnectionError::RequestDeadlineExceeded.into());
