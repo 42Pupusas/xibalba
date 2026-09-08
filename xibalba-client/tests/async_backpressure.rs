@@ -225,11 +225,66 @@ fn cancel_returns_while_a_full_response_ring_is_undrained() {
         "cancel with a full response ring",
         move || {
             client.cancel().expect("cancel reaches the reader");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while client.outstanding() != 0 && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            assert_eq!(
+                client.outstanding(),
+                0,
+                "cancellation must release admission"
+            );
             client
         },
     );
 
     drop(handle);
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn repeated_cancellation_does_not_saturate_the_control_ring() {
+    let server = FloodServer::spawn(512);
+    let client = server.client();
+
+    let mut handle = client
+        .submit(Method::Get, b"/flood".to_vec(), None, None, vec![])
+        .expect("submit succeeds");
+    assert!(
+        matches!(handle.next_block(), Some(Chunk::Head { status: 200, .. })),
+        "the head must arrive before the ring fills"
+    );
+    server.wait_until_ring_is_saturated();
+
+    let canceller = thread::spawn(move || {
+        for _ in 0..256 {
+            handle
+                .cancel()
+                .expect("repeated cancellation reaches the reader");
+        }
+    });
+
+    Watchdog::run(
+        Duration::from_secs(10),
+        "repeated cancellation with a full response ring",
+        move || {
+            canceller
+                .join()
+                .expect("the cancellation producer must not remain blocked");
+        },
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.outstanding() != 0 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(
+        client.outstanding(),
+        0,
+        "repeated cancellation must release the request admission slot"
+    );
+
     drop(client);
     server.shutdown();
 }

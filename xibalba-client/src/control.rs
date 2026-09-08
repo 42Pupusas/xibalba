@@ -44,6 +44,7 @@ pub(crate) struct AsyncRequest {
     /// reader can stop producing instead of waiting for capacity that
     /// nobody will free.
     pub(crate) consumer_alive: Arc<AtomicBool>,
+    pub(crate) cancelled: Arc<AtomicBool>,
     /// Identifies this request on the shared control ring so a cancel
     /// can name it precisely.
     pub(crate) ticket: u64,
@@ -94,14 +95,20 @@ pub(crate) struct ControlQueue {
     rx: MpscConsumer<Control>,
     pending: VecDeque<AsyncRequest>,
     shutting_down: Arc<AtomicBool>,
+    cancel_any: Arc<AtomicBool>,
 }
 
 impl ControlQueue {
-    pub(crate) const fn new(rx: MpscConsumer<Control>, shutting_down: Arc<AtomicBool>) -> Self {
+    pub(crate) const fn new(
+        rx: MpscConsumer<Control>,
+        shutting_down: Arc<AtomicBool>,
+        cancel_any: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             rx,
             pending: VecDeque::new(),
             shutting_down,
+            cancel_any,
         }
     }
 
@@ -115,6 +122,10 @@ impl ControlQueue {
         Arc::clone(&self.shutting_down)
     }
 
+    pub(crate) fn cancel_any_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel_any)
+    }
+
     /// The next request to serve, or `None` once the reader should stop.
     ///
     /// Requests displaced into `pending` come first, so submission order
@@ -126,10 +137,14 @@ impl ControlQueue {
                 return None;
             }
             if let Some(request) = self.pending.pop_front() {
+                self.cancel_any.store(false, Ordering::Release);
                 return Some(request);
             }
             match self.rx.pop_block()? {
-                Control::Request(request) => return Some(request),
+                Control::Request(request) => {
+                    self.cancel_any.store(false, Ordering::Release);
+                    return Some(request);
+                }
                 Control::Cancel(_) => {}
             }
         }
@@ -154,6 +169,9 @@ impl ControlQueue {
             }
             match self.rx.pop() {
                 Some(Control::Cancel(ticket)) => {
+                    if ticket == CANCEL_ANY {
+                        self.cancel_any.store(true, Ordering::Release);
+                    }
                     if current.is_some_and(|c| ticket == CANCEL_ANY || ticket == c) {
                         cancelled = true;
                     } else if ticket != CANCEL_ANY {
@@ -181,6 +199,8 @@ impl ControlQueue {
         ChunkSink::new(
             &request.chunk_tx,
             &request.consumer_alive,
+            &request.cancelled,
+            &self.cancel_any,
             &self.shutting_down,
         )
         .send_terminal(Chunk::Aborted);

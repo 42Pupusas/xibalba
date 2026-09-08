@@ -63,7 +63,14 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
         deadline: RequestDeadline,
         shutdown: &AtomicBool,
     ) -> Option<ResponseStart> {
-        let sink = ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutdown);
+        let cancel_any = self.queue.cancel_any_flag();
+        let sink = ChunkSink::new(
+            &request.chunk_tx,
+            &request.consumer_alive,
+            &request.cancelled,
+            &cancel_any,
+            shutdown,
+        );
 
         // A cancel can queue directly behind this request while it waits for
         // an earlier response. Match it to this request before reconnecting or
@@ -146,7 +153,14 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
         deadline: RequestDeadline,
         shutdown: &AtomicBool,
     ) {
-        let sink = ChunkSink::new(&request.chunk_tx, &request.consumer_alive, shutdown);
+        let cancel_any = self.queue.cancel_any_flag();
+        let sink = ChunkSink::new(
+            &request.chunk_tx,
+            &request.consumer_alive,
+            &request.cancelled,
+            &cancel_any,
+            shutdown,
+        );
         let ResponseStart {
             head_data,
             framing,

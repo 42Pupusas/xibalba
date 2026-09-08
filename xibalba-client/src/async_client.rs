@@ -133,6 +133,7 @@ pub struct StreamHandle {
     /// Set by the reader once this request leaves the queue and reaches
     /// the socket. See [`has_started`](Self::has_started).
     started: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl StreamHandle {
@@ -169,9 +170,9 @@ impl StreamHandle {
     /// Returns `Error::Connection` if the reader thread has already
     /// exited.
     pub fn cancel(&self) -> Result<(), Error> {
-        self.control_tx
-            .push_block(Control::Cancel(self.ticket))
-            .map_err(|_| Error::Connection(ConnectionError::Other("reader is gone".into())))
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.control_tx.push(Control::Cancel(self.ticket));
+        Ok(())
     }
 
     /// Whether the reader has begun processing this request.
@@ -234,6 +235,7 @@ pub struct AsyncClient<const MAX_HEAD_SIZE: usize = DEFAULT_MAX_HEAD_SIZE> {
     /// shutdown, so `drop` cannot block for `stream_silence` behind a
     /// stalled in-flight response.
     shutting_down: Arc<AtomicBool>,
+    cancel_any: Arc<AtomicBool>,
     /// Bounds requests submitted but not yet finished. The reader drains the
     /// control ring into an unbounded pending queue, so ring capacity alone
     /// does not limit how many requests (and their buffers) can pile up.
@@ -266,7 +268,12 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             mpsc::RingBuffer::<Control>::new(Capacity::at_least(CONTROL_RING_CAP)).split();
 
         let shutting_down = Arc::new(AtomicBool::new(false));
-        let queue = ControlQueue::new(control_rx, Arc::clone(&shutting_down));
+        let cancel_any = Arc::new(AtomicBool::new(false));
+        let queue = ControlQueue::new(
+            control_rx,
+            Arc::clone(&shutting_down),
+            Arc::clone(&cancel_any),
+        );
         let join = thread::Builder::new()
             .name("xibalba-reader".to_owned())
             .spawn(move || {
@@ -283,6 +290,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             join: Some(join),
             next_ticket: AtomicU64::new(0),
             shutting_down,
+            cancel_any,
             admission: Arc::new(Admission::new(DEFAULT_MAX_OUTSTANDING)),
         })
     }
@@ -324,6 +332,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             spsc::RingBuffer::<Chunk>::new(Capacity::at_least(CHUNK_RING_CAP)).split();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let (guard, consumer_alive) = ConsumerGuard::new();
         let request = AsyncRequest {
             method,
@@ -333,6 +342,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             headers,
             chunk_tx,
             consumer_alive,
+            cancelled: Arc::clone(&cancelled),
             ticket,
             started: Arc::clone(&started),
             _permit: permit,
@@ -352,6 +362,7 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
             control_tx: control_tx.clone(),
             ticket,
             started,
+            cancelled,
         })
     }
 
@@ -363,9 +374,9 @@ impl<const MAX_HEAD_SIZE: usize> AsyncClient<MAX_HEAD_SIZE> {
     /// Returns `Error::Connection` if the reader thread has already
     /// exited.
     pub fn cancel(&self) -> Result<(), Error> {
-        self.control()?
-            .push_block(Control::Cancel(CANCEL_ANY))
-            .map_err(|_| Error::Connection(ConnectionError::ReaderGone))
+        self.cancel_any.store(true, Ordering::Release);
+        let _ = self.control()?.push(Control::Cancel(CANCEL_ANY));
+        Ok(())
     }
 }
 

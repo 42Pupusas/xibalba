@@ -89,6 +89,8 @@ impl ChunkStream {
 pub(crate) struct ChunkSink<'a> {
     tx: &'a Producer<Chunk>,
     consumer_alive: &'a AtomicBool,
+    cancelled: &'a AtomicBool,
+    cancel_any: &'a AtomicBool,
     shutting_down: &'a AtomicBool,
 }
 
@@ -96,11 +98,15 @@ impl<'a> ChunkSink<'a> {
     pub(crate) const fn new(
         tx: &'a Producer<Chunk>,
         consumer_alive: &'a AtomicBool,
+        cancelled: &'a AtomicBool,
+        cancel_any: &'a AtomicBool,
         shutting_down: &'a AtomicBool,
     ) -> Self {
         Self {
             tx,
             consumer_alive,
+            cancelled,
+            cancel_any,
             shutting_down,
         }
     }
@@ -118,9 +124,14 @@ impl<'a> ChunkSink<'a> {
     /// request, so reporting a dropped consumer instead would be true but
     /// less useful, and the two race by nature — `Drop` sets the flag and
     /// drops handles.
-    pub(crate) fn blocked_reason(&self) -> Option<Undelivered> {
+    pub(crate) fn blocked_reason(&self, observe_cancel: bool) -> Option<Undelivered> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Some(Undelivered::ShuttingDown);
+        }
+        if observe_cancel
+            && (self.cancelled.load(Ordering::Acquire) || self.cancel_any.load(Ordering::Acquire))
+        {
+            return Some(Undelivered::ConsumerGone);
         }
         if !self.consumer_alive.load(Ordering::Acquire) {
             return Some(Undelivered::ConsumerGone);
@@ -135,10 +146,14 @@ impl<'a> ChunkSink<'a> {
     /// Returns [`Undelivered::ConsumerGone`] when the handle was dropped and
     /// [`Undelivered::ShuttingDown`] when shutdown began before a slot freed.
     pub(crate) fn send(&self, chunk: Chunk) -> Result<(), Undelivered> {
+        self.send_inner(chunk, true)
+    }
+
+    fn send_inner(&self, chunk: Chunk, observe_cancel: bool) -> Result<(), Undelivered> {
         let mut pending = chunk;
         let mut spins = 0u32;
         loop {
-            if let Some(reason) = self.blocked_reason() {
+            if let Some(reason) = self.blocked_reason(observe_cancel) {
                 return Err(reason);
             }
             match self.tx.push(pending) {
@@ -161,6 +176,6 @@ impl<'a> ChunkSink<'a> {
     /// Deliver a terminal chunk, where failure is not actionable: the caller
     /// is either gone or shutting down.
     pub(crate) fn send_terminal(&self, chunk: Chunk) {
-        let _ = self.send(chunk);
+        let _ = self.send_inner(chunk, false);
     }
 }
