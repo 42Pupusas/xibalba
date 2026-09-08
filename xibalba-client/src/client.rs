@@ -354,7 +354,6 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             deadline,
             params.method,
         )?;
-        self.mark_reusable();
         Ok(parts)
     }
 
@@ -385,8 +384,9 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             deadline,
         );
         let data = collector.read(&mut self.stream, framing, &self.head_buf[tail_offset..]);
-        if data.is_err() || !collector.is_reusable() {
-            self.discard_partial_response();
+        match &data {
+            Ok(_) if collector.is_reusable() => self.mark_reusable(),
+            _ => self.discard_partial_response(),
         }
         data
     }
@@ -403,7 +403,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         self.ensure_clean()?;
         let (head_data, framing, tail_offset) =
             self.send_head_interruptible(params, deadline, NeverCancelled)?;
-        let reuse = head_data.connection_reuse();
+        let reuse = head_data.connection_reuse(params.requests_close());
         deadline.check()?;
         let body_data = self.read_full_body(&framing, tail_offset, deadline)?;
         if !reuse.is_keep() {
@@ -438,7 +438,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
         let deadline = RequestDeadline::after(self.config.request_deadline);
         let (head_data, framing, tail_offset) =
             self.send_head_interruptible(params, deadline, NeverCancelled)?;
-        let reuse = head_data.connection_reuse();
+        let reuse = head_data.connection_reuse(params.requests_close());
 
         let tail = self.head_buf[tail_offset..].to_vec();
         self.dirty = true;

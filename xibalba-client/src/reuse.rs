@@ -82,8 +82,12 @@ impl ConnectionReuse {
     pub(crate) fn evaluate<'a>(
         version: Version,
         status: StatusCode,
+        request_closes: bool,
         headers: impl Iterator<Item = (&'a [u8], &'a [u8])>,
     ) -> Self {
+        if request_closes {
+            return Self::Close;
+        }
         // 101 hands the socket to another protocol; whatever follows is not
         // an HTTP response, so the connection can never be reused here.
         if status == StatusCode::SWITCHING_PROTOCOLS {
@@ -122,7 +126,15 @@ mod tests {
         status: StatusCode,
         headers: &[(&[u8], &[u8])],
     ) -> ConnectionReuse {
-        ConnectionReuse::evaluate(version, status, headers.iter().copied())
+        ConnectionReuse::evaluate(version, status, false, headers.iter().copied())
+    }
+
+    #[test]
+    fn request_close_ends_the_connection() {
+        assert_eq!(
+            ConnectionReuse::evaluate(Version::Http11, StatusCode::OK, true, std::iter::empty()),
+            ConnectionReuse::Close
+        );
     }
 
     #[test]

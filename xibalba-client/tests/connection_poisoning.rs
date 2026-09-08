@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 
 use xibalba_client::Deadline;
-use xibalba_client::client::Client;
+use xibalba_client::client::{Client, Config};
 use xibalba_client::connector::{Connector, SetReadTimeout};
 use xibalba_client::proto::error::Error;
 use xibalba_client::proto::url::Url;
@@ -225,7 +225,11 @@ impl Connector for ScriptedConnector {
 
 impl ScriptedConnector {
     fn client() -> Client<Self> {
-        Client::<Self>::connect_default(b"http://scripted.test/", ())
+        Self::client_with(Config::default())
+    }
+
+    fn client_with(config: Config) -> Client<Self> {
+        Client::<Self>::connect(b"http://scripted.test/", (), config)
             .expect("scripted connect always succeeds")
     }
 }

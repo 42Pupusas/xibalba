@@ -103,8 +103,13 @@ impl HeadData {
 
     /// Whether the connection that carried this response may serve another
     /// request once the body has been consumed.
-    pub(crate) fn connection_reuse(&self) -> crate::reuse::ConnectionReuse {
-        crate::reuse::ConnectionReuse::evaluate(self.version, self.status, self.headers())
+    pub(crate) fn connection_reuse(&self, request_closes: bool) -> crate::reuse::ConnectionReuse {
+        crate::reuse::ConnectionReuse::evaluate(
+            self.version,
+            self.status,
+            request_closes,
+            self.headers(),
+        )
     }
 
     /// Every header, in the order received.

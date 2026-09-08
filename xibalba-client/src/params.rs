@@ -1,3 +1,4 @@
+use xibalba_proto::bytes::ByteSliceExt;
 use xibalba_proto::error::{Error, SerializeError};
 use xibalba_proto::method::Method;
 
@@ -42,6 +43,12 @@ impl RequestParams<'_> {
     /// both funnel request headers through this check: a builder cannot
     /// carry the error through its infallible chain, so it surfaces at
     /// the fallible boundary instead.
+    pub(crate) fn requests_close(&self) -> bool {
+        self.extra_headers.iter().any(|(name, value)| {
+            name.ascii_eq_ignore_case(b"Connection") && value.contains_token_ignore_case(b"close")
+        })
+    }
+
     pub(crate) fn validate_extra_headers(
         extra_headers: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), SerializeError> {

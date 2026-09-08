@@ -153,7 +153,10 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> ReaderWorker<C, MAX_HEAD_SIZE> {
             tail_offset,
         } = start;
         let status = head_data.status().as_u16();
-        let reuse = head_data.connection_reuse();
+        let reuse = head_data.connection_reuse(request.headers.iter().any(|(name, value)| {
+            use xibalba_proto::bytes::ByteSliceExt;
+            name.ascii_eq_ignore_case(b"Connection") && value.contains_token_ignore_case(b"close")
+        }));
         let headers: Vec<(Vec<u8>, Vec<u8>)> = head_data
             .headers()
             .map(|(n, v)| (n.to_vec(), v.to_vec()))
