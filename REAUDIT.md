@@ -4,7 +4,9 @@ Baseline: `9fb1feb17103fb31bdecb1b6cfbb7ee679155559` (`xibalba-proto` 0.4.0, `xi
 
 ## Recommendation
 
-**Hold the release.** The existing gate passes, but source inspection identifies unresolved cancellation, deadline, and connection-state defects. The statement in `AUDIT.md` that every finding is closed is not sufficient for release approval.
+**Resolved — the release is no longer held.** Every finding below was repaired, and the gates this pass declined to run have since been executed; see "Resolution" at the end for what was done, what it was verified with, and what was accepted rather than fixed.
+
+The original recommendation, kept for the record: *Hold the release. The existing gate passes, but source inspection identifies unresolved cancellation, deadline, and connection-state defects. The statement in `AUDIT.md` that every finding is closed is not sufficient for release approval.*
 
 This is a targeted re-audit of the repaired protocol/client paths, not a completed exhaustive review of every production module. Findings below are source-derived; new executable reproductions were not added in this pass. The listed regression tests are required work, not tests claimed to have run. No production code was changed.
 
@@ -111,5 +113,45 @@ Neither published crate declares Cargo features. These tests exercised the ordin
 4. R04: request-side persistence disposition.
 5. R05–R07: redirect and parser contracts.
 6. Rustdoc, graph/module cleanup, then fresh complete release gates and packaging/MSRV/loom/fuzz verification.
+
+## Resolution
+
+All seven findings are repaired, each with regression coverage this re-audit asked for and did not find.
+
+| Finding | Resolution |
+|---|---|
+| R01 | Delivery polls per-request cancellation; cancels are idempotent rather than consuming a control-ring slot. Covered by `repeated_cancellation_does_not_saturate_the_control_ring`, `cancel_returns_while_a_full_response_ring_is_undrained`, `finished_requests_release_their_admission_slots`. |
+| R02 | The connection stays dirty until a response is consumed in full, so a deadline crossing between head and body cannot leave it reusable. Covered by `a_deadline_crossed_between_the_head_and_its_body_poisons_the_connection` and the `framing_reuse` suite. |
+| R03 | One deadline propagates through upload, flush, retry, and reconnect, with reconnects capped by the lesser of the connect timeout and the remaining total. Covered by `tests/connect_deadline.rs` and `tests/integration/request_deadline.rs`. |
+| R04 | Request-side close disposition feeds the shared reuse decision on all three paths. Covered by `a_request_side_connection_close_is_not_reused_even_for_a_self_delimited_response`. |
+| R05 | Unsupported schemes are refused before connecting; `Config::allow_cross_origin_redirects` is the explicit opt-out. Covered by `an_unsupported_scheme_is_refused_rather_than_treated_as_relative` and the `redirects` cross-origin tests. |
+| R06 | Size-line digits are charged to the metadata budget, and extension and trailer grammars are validated. Covered by the `response::chunked` grammar and budget tests. |
+| R07 | Real `IPv6address`, `reg-name` percent-escape, `ZoneID`, and `IPvFuture` grammar. Covered by the `url::tests` R07 block. |
+
+Accepted rather than fixed, with rationale:
+
+- **`Admission → Permit` remains a dropped back-edge.** It is RAII ownership: the permit releases the admission slot on every exit path, which is what makes cancellation and drop release capacity. Breaking the edge would mean releasing by hand at each exit. Recorded here so the graph report is not read as a clean DAG by omission.
+- **Cross-origin policy is a boolean, not per-origin approval.** `allow_cross_origin_redirects` refuses the hop; it does not offer per-origin allow-listing or sensitive-header designation. R05 permitted documenting this limitation instead of building the larger API, and that is the choice taken.
+
+### Release-gate execution
+
+The checks this pass listed as not performed have now been run.
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace` (debug and release) | Passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo doc` (default and `--all-features`) | Passed, zero warnings; the 7 above are fixed |
+| `cargo deny check all` | Passed; the same syn/windows-sys duplicate warnings, which are not gating |
+| MSRV 1.91.1 build and full test suite | Passed |
+| loom, under `--cfg loom` | 5 tests, all passing — the zero-test run above was the missing flag |
+| Fuzz, host GNU target, 60s per target | `response_head` 763,558 execs; `chunked_body` 970,162; `url` 4,417,208. No crashes, `fuzz/artifacts/` empty |
+| `cargo package -p xibalba-proto` | Packaged and verified standalone |
+| `cargo package --list -p xibalba-client` | Correct file manifest; full packaging needs proto published first, as documented in `AUDIT.md` |
+
+The module extractions are done: protocol `response.rs` is now `head`, `framing`, `chunked`, and `ranges` behind an unchanged `xibalba_proto::response::*`; client `response.rs` is now `head` and `public`. The protocol graph is a DAG at 57 edges / 25 skip edges.
+
+The fuzz campaign is shorter than the 4×600s one `AUDIT.md` records. It is a regression check, not a replacement for that campaign.
 
 Each fix needs its own regression reproduction and verification before the next structural change. Keep `AUDIT.md` as historical evidence, but revise its blanket closure claim or link it to this re-audit before release.

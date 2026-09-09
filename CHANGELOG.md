@@ -3,13 +3,13 @@
 Notable changes per release. Versions follow [semver](https://semver.org);
 pre-1.0, a minor bump may break API.
 
-## [Unreleased]
-
-`xibalba-proto` 0.3.0 · `xibalba-client` 0.4.0
+## xibalba-proto 0.4.0 · xibalba-client 0.5.0
 
 The first release after a security and correctness audit of the protocol
-layer. It closes request-smuggling and header-injection gaps, makes several
-hangs surface as errors, and speeds up header parsing. Both crates break API.
+layer, and after the re-audit that followed it. It closes request-smuggling
+and header-injection gaps, bounds cancellation and deadlines so neither can
+be outlasted by a slow peer, makes several hangs surface as errors, and
+speeds up header parsing. Both crates break API.
 
 `xibalba-iouring` is not published; it is a workspace-internal experiment.
 
@@ -51,7 +51,26 @@ These compile without error and return different results. Check them first.
   written will now see bytes. Found by fuzzing.
 - **Chunk extensions and trailers are bounded and validated.** Metadata past
   `MAX_CHUNK_EXTENSION`/`MAX_TRAILER_SECTION`, or containing C0 controls or
-  DEL, now fails with `ParseError::InvalidChunkMetadata`.
+  DEL, now fails with `ParseError::InvalidChunkMetadata`. The size line's own
+  digits are charged against the same bound, so a chunk size padded with
+  leading zeros can no longer buy unbounded input, and the extension and
+  trailer grammars are checked rather than only scanned for terminators: a
+  bare `;`, an extension value with no name, an unterminated quoted value,
+  and a trailer line without a colon are each rejected.
+- **Host validation follows the RFC 3986 grammar, not a character class.**
+  An IPv6 literal is parsed as `IPv6address` — group count, at most one `::`
+  standing for at least one elided group, an optional embedded `IPv4address`
+  tail, and an optional `ZoneID` — so `http://[:]/` and `http://[1:2:3]/`
+  are refused where a hex-and-colon check accepted them. A `reg-name` must
+  carry well-formed percent escapes, so `http://bad%zz/` is refused rather
+  than read as three literal bytes, and an `IPvFuture` suffix is held to its
+  own byte set. Hosts that previously parsed and now fail were never valid.
+- **A request-side `Connection: close` is honoured for reuse.** Reuse was
+  decided from the response alone, so a self-delimited HTTP/1.1 reply
+  without a matching close header left the connection live and the client
+  could send again on a connection it had announced it would not reuse.
+  The request's disposition now feeds the same decision on the buffered,
+  streaming, and background-reader paths.
 - **Undecodable transfer codings are refused instead of framed.**
   `Transfer-Encoding: gzip` and `gzip, chunked` previously produced a body —
   the latter dechunked but still compressed, with nothing marking it as
@@ -127,6 +146,17 @@ These compile without error and return different results. Check them first.
 - `StreamHandle::into_consumer` is now `into_stream`, returning a
   `ChunkStream`. The bare ring consumer bypassed the liveness guard that lets
   the reader stop producing when a caller drops its handle.
+- `Config` gains `allow_cross_origin_redirects` (default `true`, preserving
+  the previous behaviour). Set it to `false` to refuse any redirect leaving
+  the request's origin instead of following a server-supplied `Location`
+  there. Credential headers are still stripped on a cross-origin hop when it
+  is allowed, but a custom bearer scheme this client cannot recognise as a
+  credential is forwarded and a 307/308 still replays the body — the flag is
+  how a caller whose headers or body must not reach an unnamed host opts out.
+  `Config` is a plain struct, so this field is a break for an exhaustive
+  literal; `..Config::default()` is unaffected.
+- New variants: `ConnectionError::{UnsupportedRedirectScheme,
+  CrossOriginRedirectRefused}`.
 - New variants: `ConnectionError::{TooManyRequests, InsecureRedirect}`,
   `ParseError::{InvalidChunkMetadata, InvalidReasonPhrase,
   InvalidTransferEncoding, UnsupportedTransferCoding}`.
@@ -206,6 +236,16 @@ These compile without error and return different results. Check them first.
   terminator — another smuggling difference between intermediaries.
 - Refuse to reuse a connection after a partial or oversized response head,
   which could otherwise desync a keep-alive session.
+- Refuse to reuse a connection whose response body was never read. A request
+  deadline expiring between the response head and its body previously left
+  the connection clean with the body still on the wire, so the next request
+  could parse the old body's bytes as its own response. The connection stays
+  dirty until the response is consumed in full.
+- Refuse a redirect to a scheme the client cannot follow. `Location:
+  ftp://other/file` and `mailto:user@example.com` were resolved as
+  same-origin paths, turning an off-origin reference into a request to the
+  current host; both now fail with `UnsupportedRedirectScheme` before any
+  connection is made.
 
 ### Fixed
 
@@ -216,6 +256,17 @@ These compile without error and return different results. Check them first.
 - Duplicate request headers report an error rather than panicking.
 - Error-body drains and queued async requests are cancellable; a queued
   request can no longer reach the wire after cancellation.
+- Cancellation no longer depends on the control queue having room. Response
+  delivery polls the request's own cancellation, so a retained, undrained
+  stream can no longer hold the reader in `ChunkSink::send` after a cancel;
+  the admission permit is released and later requests proceed. Repeated
+  cancels are idempotent rather than each occupying another ring slot.
+- The total request deadline bounds uploads, flush retries, and reconnects,
+  not just the stages before the first write. A slow-but-progressing upload
+  and a stalled write are both cut at the total instead of running to the
+  silence budget, and a reconnect is capped by whichever of the connect
+  timeout and the remaining total is shorter. Redirect hops share one total
+  rather than earning a fresh one per hop.
 - Redirect targets and methods follow RFC 9110.
 - An infinite read timeout is rejected: silence budgets and async cancellation
   both need a finite one to regain control.
