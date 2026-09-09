@@ -147,21 +147,136 @@ impl<'a> Url<'a> {
         if inner[0] == b'v' || inner[0] == b'V' {
             return Self::validate_ipvfuture(inner);
         }
-        // A zone ID is separated by a percent-encoded '%' ("%25"); only the
-        // address part is subject to the IPv6 character set.
-        let address = inner
+        // A zone ID is separated by a percent-encoded '%' ("%25", RFC 6874);
+        // only the address part is subject to IPv6address's own grammar.
+        let (address, zone) = inner
             .windows(3)
             .position(|w| w == b"%25")
-            .map_or(inner, |pos| &inner[..pos]);
-        if address.is_empty() || !address.contains(&b':') {
-            return Err(UrlError::InvalidByte(1).into());
-        }
-        for (i, &b) in address.iter().enumerate() {
-            if !b.is_ascii_hexdigit() && b != b':' && b != b'.' {
-                return Err(UrlError::InvalidByte(i + 1).into());
-            }
+            .map_or((inner, None), |pos| {
+                (&inner[..pos], Some(&inner[pos + 3..]))
+            });
+        Self::validate_ipv6_address(address)?;
+        if let Some(zone) = zone {
+            Self::validate_zone_id(zone)?;
         }
         Ok(())
+    }
+
+    /// `IPv6address` (RFC 3986 §3.2.2), the full production rather than a
+    /// character-class approximation: a fixed count of 16-bit `h16` groups
+    /// (or fewer with one `::` standing in for the run of zero groups it
+    /// elides), the last two of which may instead be an embedded
+    /// `IPv4address` (`ls32`). A character-class check alone accepts
+    /// `[:]` and `[1:2:3]`, neither of which names an address; counting
+    /// groups and requiring exactly one `::` when the count is short is
+    /// what a real parser of the production does.
+    fn validate_ipv6_address(address: &[u8]) -> Result<(), Error> {
+        let err = || Error::from(UrlError::InvalidByte(1));
+        if address.is_empty() {
+            return Err(err());
+        }
+
+        let double_colon = address.windows(2).position(|w| w == b"::");
+        // At most one "::" may appear; a second occurrence is invalid, which
+        // `windows(2)` finding a *further* one after the first would show as
+        // three colons in a row or two separate "::" runs. Reject either by
+        // checking there is no second match past the first.
+        if let Some(first) = double_colon
+            && address[first + 2..].windows(2).any(|w| w == b"::")
+        {
+            return Err(err());
+        }
+
+        let (left, right, elided) = double_colon.map_or_else(
+            || (address, &b""[..], false),
+            |pos| (&address[..pos], &address[pos + 2..], true),
+        );
+
+        let left_groups = Self::split_h16_groups(left)?;
+        let (right_groups, right_has_embedded_v4) = Self::split_h16_groups_allowing_v4(right)?;
+
+        let right_weight = right_groups.len() + usize::from(right_has_embedded_v4);
+        let total = left_groups.len() + right_weight;
+
+        if elided {
+            // "::" must stand for at least one elided group, or the address
+            // could have been written without it.
+            if total >= 8 {
+                return Err(err());
+            }
+        } else if total != 8 {
+            return Err(err());
+        }
+        Ok(())
+    }
+
+    /// Split `part` on `:` into `h16` groups (1-4 hex digits each),
+    /// rejecting anything that is not a plain hex group — used for the side
+    /// of a `::` that cannot embed an `IPv4address`.
+    fn split_h16_groups(part: &[u8]) -> Result<Vec<&[u8]>, Error> {
+        Self::h16_groups(part, false).map(|(groups, _)| groups)
+    }
+
+    /// As [`Self::split_h16_groups`], but the final group may instead be a
+    /// dotted-decimal `IPv4address` (`ls32`), as `2001:db8::a.b.c.d`
+    /// permits. Returns whether that embedded form was used, since it
+    /// counts as two `h16` groups' worth of address space.
+    fn split_h16_groups_allowing_v4(part: &[u8]) -> Result<(Vec<&[u8]>, bool), Error> {
+        Self::h16_groups(part, true)
+    }
+
+    fn h16_groups(part: &[u8], allow_trailing_v4: bool) -> Result<(Vec<&[u8]>, bool), Error> {
+        let err = || Error::from(UrlError::InvalidByte(1));
+        if part.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let raw_groups: Vec<&[u8]> = part.split(|&b| b == b':').collect();
+        if raw_groups.iter().any(|g| g.is_empty()) {
+            // A leading/trailing/doubled ':' outside the one "::" already
+            // consumed is not a valid group boundary.
+            return Err(err());
+        }
+        let last = raw_groups.last().copied().unwrap_or(b"");
+        if allow_trailing_v4 && Self::is_ipv4_address(last) {
+            return Ok((raw_groups[..raw_groups.len() - 1].to_vec(), true));
+        }
+        for group in &raw_groups {
+            if group.is_empty() || group.len() > 4 || !group.iter().all(u8::is_ascii_hexdigit) {
+                return Err(err());
+            }
+        }
+        Ok((raw_groups, false))
+    }
+
+    /// `IPv4address = dec-octet "." dec-octet "." dec-octet "." dec-octet`,
+    /// each octet `0`-`255` with no extraneous leading zero.
+    fn is_ipv4_address(bytes: &[u8]) -> bool {
+        let octets: Vec<&[u8]> = bytes.split(|&b| b == b'.').collect();
+        octets.len() == 4
+            && octets.iter().all(|octet| {
+                !octet.is_empty()
+                    && octet.len() <= 3
+                    && octet.iter().all(u8::is_ascii_digit)
+                    && (octet.len() == 1 || octet[0] != b'0')
+                    && octet
+                        .iter()
+                        .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'))
+                        <= 255
+            })
+    }
+
+    /// `ZoneID = 1*( unreserved / pct-encoded )` (RFC 6874). Interfaces
+    /// names are typically plain `unreserved` bytes (`eth0`, `en0`); percent
+    /// escapes are permitted but, like a reg-name's, must be well-formed.
+    fn validate_zone_id(zone: &[u8]) -> Result<(), Error> {
+        if zone.is_empty() {
+            return Err(UrlError::InvalidByte(1).into());
+        }
+        Self::validate_pct_encoded_unreserved(zone, Self::is_zone_id_byte)
+    }
+
+    const fn is_zone_id_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
     }
 
     /// `IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )`
@@ -175,20 +290,96 @@ impl<'a> Url<'a> {
         if version.is_empty() || rest.is_empty() || !version.iter().all(u8::is_ascii_hexdigit) {
             return Err(UrlError::InvalidByte(1).into());
         }
+        let is_future_byte = |b: u8| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b':'
+                )
+        };
+        if !rest.iter().all(|&b| is_future_byte(b)) {
+            return Err(UrlError::InvalidByte(1).into());
+        }
         Ok(())
     }
 
-    /// Check an unbracketed host is a `reg-name`: no colons (the port
-    /// delimiter has already been split off) and no brackets, which belong
-    /// only to an IP-literal.
-    fn validate_reg_name(host: &[u8]) -> Result<(), Error> {
-        if let Some(pos) = host
-            .iter()
-            .position(|&b| b == b':' || b == b'[' || b == b']')
-        {
-            return Err(UrlError::InvalidByte(pos).into());
+    /// Validate a byte sequence built from `unreserved` bytes (accepted by
+    /// `plain`) and well-formed `pct-encoded` (`%` `HEXDIG` `HEXDIG`)
+    /// triples, per RFC 3986 §2.1. Shared by reg-name and zone-ID
+    /// validation, which differ only in which unescaped bytes they accept.
+    fn validate_pct_encoded_unreserved(
+        bytes: &[u8],
+        plain: impl Fn(u8) -> bool,
+    ) -> Result<(), Error> {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'%' {
+                let hi = bytes.get(i + 1).copied();
+                let lo = bytes.get(i + 2).copied();
+                if !hi.is_some_and(|h| h.is_ascii_hexdigit())
+                    || !lo.is_some_and(|l| l.is_ascii_hexdigit())
+                {
+                    return Err(UrlError::InvalidByte(i).into());
+                }
+                i += 3;
+            } else if plain(b) {
+                i += 1;
+            } else {
+                return Err(UrlError::InvalidByte(i).into());
+            }
         }
         Ok(())
+    }
+
+    /// Check an unbracketed host is a `reg-name = *( unreserved /
+    /// pct-encoded / sub-delims )` (RFC 3986 §3.2.2): well-formed percent
+    /// escapes, and no bytes reserved for an `IP-literal` or the port
+    /// delimiter (the port has already been split off, so a colon here can
+    /// only be a second, malformed one).
+    ///
+    /// `is_host_byte` at the parse entry point already excludes CTLs, space,
+    /// and the path/query/fragment delimiters; this narrows further to what
+    /// `reg-name` itself allows, catching a `%` not followed by two hex
+    /// digits (`http://bad%zz/`) that a character-class check alone would
+    /// accept as three ordinary bytes.
+    fn validate_reg_name(host: &[u8]) -> Result<(), Error> {
+        Self::validate_pct_encoded_unreserved(host, Self::is_reg_name_byte)
+    }
+
+    const fn is_reg_name_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            )
     }
 
     /// Bytes allowed in a host: `reg-name` / `IPv4address` / bracketed
@@ -659,5 +850,121 @@ mod tests {
     #[test]
     fn scheme_with_trailing_colon_no_slashes() {
         assert!(Url::parse(b"http:host/path").is_err());
+    }
+
+    // ── R07: real IPv6/reg-name/IPvFuture grammar, not a character class ────
+
+    /// The exact case REAUDIT.md calls out: `[:]` passes a colon-and-hex
+    /// character-class check but names no address at all.
+    #[test]
+    fn ipv6_bare_colon_is_rejected() {
+        assert!(Url::parse(b"http://[:]/").is_err());
+    }
+
+    /// The other exact case: `[1:2:3]` is three groups of a syntax that
+    /// needs eight (or a `::` eliding some of them), so a character-class
+    /// check that only inspects the bytes present accepts it wrongly.
+    #[test]
+    fn ipv6_too_few_groups_without_elision_is_rejected() {
+        assert!(Url::parse(b"http://[1:2:3]/").is_err());
+    }
+
+    #[test]
+    fn ipv6_full_eight_groups_is_accepted() {
+        assert!(Url::parse(b"http://[2001:db8:0:0:0:0:0:1]/").is_ok());
+    }
+
+    #[test]
+    fn ipv6_elided_zero_run_is_accepted() {
+        for addr in ["::1", "::", "fe80::1", "2001:db8::1", "1::2:3:4:5:6:7"] {
+            let url = format!("http://[{addr}]/");
+            assert!(
+                Url::parse(url.as_bytes()).is_ok(),
+                "{addr} should be a valid elided IPv6 address"
+            );
+        }
+    }
+
+    /// `::` stands for *at least* one elided group; using it when all eight
+    /// groups are already spelled out is not a shorter way to write the
+    /// same address, it changes what the elision would mean.
+    #[test]
+    fn ipv6_double_colon_with_all_eight_groups_already_present_is_rejected() {
+        assert!(Url::parse(b"http://[1:2:3:4:5:6:7::8]/").is_err());
+    }
+
+    #[test]
+    fn ipv6_two_double_colons_is_rejected() {
+        assert!(Url::parse(b"http://[1::2::3]/").is_err());
+    }
+
+    #[test]
+    fn ipv6_group_with_too_many_hex_digits_is_rejected() {
+        assert!(Url::parse(b"http://[fffff::1]/").is_err());
+    }
+
+    #[test]
+    fn ipv6_group_with_non_hex_byte_is_rejected() {
+        assert!(Url::parse(b"http://[fg::1]/").is_err());
+    }
+
+    #[test]
+    fn ipv6_embedded_ipv4_tail_is_accepted() {
+        assert!(Url::parse(b"http://[::ffff:192.168.1.1]/").is_ok());
+        assert!(Url::parse(b"http://[2001:db8::1:192.168.1.1]/").is_ok());
+    }
+
+    #[test]
+    fn ipv6_embedded_ipv4_with_an_invalid_octet_is_rejected() {
+        assert!(Url::parse(b"http://[::ffff:192.168.1.999]/").is_err());
+        assert!(Url::parse(b"http://[::ffff:192.168.1]/").is_err());
+    }
+
+    #[test]
+    fn ipv6_valid_zone_id_is_accepted() {
+        assert!(Url::parse(b"http://[fe80::1%25eth0]/").is_ok());
+        assert!(Url::parse(b"http://[fe80::1%25en0]/").is_ok());
+    }
+
+    #[test]
+    fn ipv6_empty_zone_id_is_rejected() {
+        assert!(Url::parse(b"http://[fe80::1%25]/").is_err());
+    }
+
+    /// The exact case REAUDIT.md calls out: an invalid percent escape in an
+    /// unbracketed host must be caught, not accepted as three literal bytes.
+    #[test]
+    fn reg_name_with_an_invalid_percent_escape_is_rejected() {
+        assert!(Url::parse(b"http://bad%zz/").is_err());
+    }
+
+    #[test]
+    fn reg_name_with_a_truncated_percent_escape_is_rejected() {
+        assert!(Url::parse(b"http://bad%2/").is_err());
+        assert!(Url::parse(b"http://bad%/").is_err());
+    }
+
+    #[test]
+    fn reg_name_with_a_well_formed_percent_escape_is_accepted() {
+        assert!(Url::parse(b"http://ex%41mple.com/").is_ok());
+    }
+
+    #[test]
+    fn ipvfuture_with_valid_suffix_grammar_is_accepted() {
+        assert!(Url::parse(b"http://[v1.fe80::1]/").is_ok());
+        assert!(Url::parse(b"http://[vA.abc123:xyz]/").is_ok());
+    }
+
+    /// The suffix grammar excludes bytes such as `@`, `/`, and `"`, which
+    /// are neither `unreserved`, `sub-delims`, nor `:`.
+    #[test]
+    fn ipvfuture_with_an_invalid_suffix_byte_is_rejected() {
+        assert!(Url::parse(b"http://[v1.ab@cd]/").is_err());
+        assert!(Url::parse(b"http://[v1.a\"b]/").is_err());
+    }
+
+    #[test]
+    fn ipvfuture_with_non_hex_version_is_rejected() {
+        assert!(Url::parse(b"http://[vZ.abc]/").is_err());
     }
 }
