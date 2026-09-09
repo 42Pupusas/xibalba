@@ -10,6 +10,7 @@
 use crate::support::client::TestClient;
 use crate::support::registry::ScriptedServer;
 use crate::support::script::Script;
+use xibalba_client::proto::method::Method;
 
 /// A keep-alive exchange whose first response declares `headers`, followed by
 /// a second response on whatever connection the client chooses to use.
@@ -117,5 +118,48 @@ fn an_unambiguously_framed_response_still_reuses_its_connection() {
         server.connection(0).written().contains("GET /two"),
         "a cleanly framed response must keep its connection, or the reuse \
          assertions elsewhere prove nothing"
+    );
+}
+
+/// A caller that sends `Connection: close` has announced it will not use the
+/// socket again. The first response is unambiguously self-delimited and
+/// nothing about it forces a close, so a client deriving reuse from the
+/// response alone would happily write the second request to the same
+/// connection — this is the request-side half R04 requires: the client's own
+/// announcement must end the connection regardless of what the response says.
+#[test]
+fn a_request_side_connection_close_is_not_reused_even_for_a_self_delimited_response() {
+    let server = ScriptedServer::serving(vec![
+        Script::new()
+            .expect_request()
+            .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec())
+            .close(),
+        Script::new()
+            .expect_request()
+            .send(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond".to_vec())
+            .close(),
+    ]);
+    let mut client = TestClient::scripted(&server);
+
+    let closing = client
+        .build(Method::Get, b"/one")
+        .header(b"Connection", b"close");
+    let first = client.send(closing).expect("the first request succeeds");
+    assert_eq!(first.text().unwrap(), "hi");
+
+    let second = client
+        .get(b"/two")
+        .expect("the next request must open a new connection");
+    assert_eq!(second.text().unwrap(), "second");
+
+    assert!(
+        server.connection(1).written().contains("GET /two"),
+        "the second request must reach a fresh connection, not the one the \
+         client itself announced it would close: connection 0 saw {:?}",
+        server.connection(0).written()
+    );
+    assert!(
+        !server.connection(0).written().contains("GET /two"),
+        "the connection the client closed must never see a second request"
     );
 }

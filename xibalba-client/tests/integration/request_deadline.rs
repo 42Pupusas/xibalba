@@ -211,6 +211,74 @@ fn a_blocked_upload_hits_the_total_deadline_rather_than_hanging_on_the_silence_b
     server.join().unwrap();
 }
 
+/// A deadline that passes between a fully-read response head and the body
+/// it declared must leave the connection poisoned, exactly as a transport
+/// failure would.
+///
+/// The head here parses cleanly and the framing is unambiguous — nothing
+/// about the head read itself fails — so a client that derived reuse from
+/// head acquisition alone would consider the connection clean while its
+/// declared body still sits unread on the wire. That body is scripted to
+/// eventually deliver bytes shaped like a whole second response; if the
+/// next request reused this connection, it would parse them as its own
+/// answer instead of reconnecting.
+#[test]
+fn a_deadline_crossed_between_the_head_and_its_body_poisons_the_connection() {
+    use crate::support::registry::ScriptedServer;
+
+    const LEFTOVER: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nEVIL";
+    let server = ScriptedServer::serving(vec![
+        Script::new()
+            .expect_request()
+            .send(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    LEFTOVER.len()
+                )
+                .into_bytes(),
+            )
+            // Long enough that the request deadline below always wins the
+            // race: the body must still be unread when the deadline fires.
+            .stall(Duration::from_millis(500))
+            .send(LEFTOVER.to_vec()),
+        Script::new()
+            .expect_request()
+            .send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec()),
+    ]);
+
+    let config = Config {
+        read_timeout: Some(Duration::from_millis(5)),
+        head_silence: Duration::from_mins(10),
+        stream_silence: Duration::from_mins(10),
+        request_deadline: Some(Duration::from_millis(30)),
+        ..Config::default()
+    };
+    let mut client = TestClient::scripted_with_config(&server, config);
+
+    let err = client
+        .request(Method::Get, b"/first", None, None)
+        .expect_err("the body never arrives before the total deadline");
+    assert_eq!(
+        err,
+        Error::Connection(ConnectionError::RequestDeadlineExceeded),
+        "got {err:?}"
+    );
+
+    let second = client
+        .get(b"/second")
+        .expect("the next request must reconnect rather than wait out the stall");
+    assert_eq!(
+        second.text().unwrap(),
+        "hi",
+        "a reused connection would have served the leftover body as this \
+         response instead"
+    );
+    assert!(
+        server.connection(1).written().contains("GET /second"),
+        "the second request must reach the fresh connection scripted for it"
+    );
+}
+
 /// The same trickle with no total configured must end in the server's
 /// close, never in a deadline: the deadline must not leak into requests
 /// that did not opt into one.
