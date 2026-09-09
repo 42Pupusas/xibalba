@@ -298,13 +298,28 @@ pub const MAX_CHUNK_EXTENSION: usize = 4096;
 /// Largest trailer section, in bytes, accepted after the final chunk.
 pub const MAX_TRAILER_SECTION: usize = 8192;
 
+/// Largest chunk-size line, in hex digits, accepted before the terminating
+/// `;` or CRLF.
+///
+/// `u64::MAX` in hex is 16 digits, so digits past a small multiple of that
+/// are always leading zeros: they cannot change the decoded value, only
+/// consume input. Without a bound a peer can send zero digits forever
+/// without ever reaching a `checked_mul` overflow, since the accumulator
+/// stays at zero — the size-overflow check the digit loop already has does
+/// not reach this case at all. Kept comfortably above the existing
+/// leading-zero regression coverage (up to 512 zeros) rather than at the
+/// tightest bound that would still pass it.
+pub const MAX_CHUNK_SIZE_DIGITS: usize = 1024;
+
 /// Bounds the metadata a peer may send between body bytes.
 ///
-/// Extensions and trailers carry no payload, so a peer that streams them
-/// indefinitely keeps a request occupied without ever making progress. The
-/// budget is charged per byte and refuses the stream once exhausted.
+/// Extensions, trailers, and size-line digits carry no payload, so a peer
+/// that streams them indefinitely keeps a request occupied without ever
+/// making progress. Each budget is charged per byte and refuses the stream
+/// once exhausted.
 #[derive(Debug, Clone)]
 struct MetadataBudget {
+    size_digits: usize,
     extension: usize,
     trailer: usize,
 }
@@ -312,9 +327,17 @@ struct MetadataBudget {
 impl MetadataBudget {
     const fn new() -> Self {
         Self {
+            size_digits: 0,
             extension: 0,
             trailer: 0,
         }
+    }
+
+    /// Charge one size-line hex digit. Reset per chunk alongside the
+    /// extension budget, since each chunk states its own size.
+    const fn charge_size_digit(&mut self) -> bool {
+        self.size_digits += 1;
+        self.size_digits <= MAX_CHUNK_SIZE_DIGITS
     }
 
     /// Charge one extension byte. Reset per chunk, since each chunk is
@@ -331,6 +354,10 @@ impl MetadataBudget {
         self.trailer <= MAX_TRAILER_SECTION
     }
 
+    const fn reset_size_digits(&mut self) {
+        self.size_digits = 0;
+    }
+
     const fn reset_extension(&mut self) {
         self.extension = 0;
     }
@@ -345,6 +372,65 @@ pub struct ChunkedDecoder {
     remaining: u64,
     trailer_line_empty: bool,
     metadata: MetadataBudget,
+    ext_phase: ExtPhase,
+    trailer_phase: TrailerPhase,
+    /// `tchar`s consumed so far in the current trailer line's field-name,
+    /// so a colon with none preceding it (`:value`) can be rejected as an
+    /// empty name and a line's phase can decide, at its terminating CRLF,
+    /// whether a colon was ever reached.
+    trailer_name_len: usize,
+}
+
+/// Position within `chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "="
+/// BWS chunk-ext-val ] )`, `chunk-ext-val = token / quoted-string`
+/// (RFC 9112 §7.1.1).
+///
+/// A byte allowlist alone cannot tell `;=x` (a value with no name, which
+/// the grammar forbids) from `;a=x` (an ordinary extension): both consist
+/// entirely of bytes the allowlist accepts. The grammar requires
+/// structure the allowlist has no state to check, so this tracks where in
+/// that structure the current byte falls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtPhase {
+    /// Just consumed `;` (or the start of the first extension); a
+    /// `chunk-ext-name` of at least one `tchar` must follow, after
+    /// optional BWS.
+    BeforeName,
+    /// Reading `chunk-ext-name` (`token`): at least one `tchar` consumed.
+    Name,
+    /// BWS after the name, deciding between `=`, `;`, or the end.
+    AfterName,
+    /// BWS after `=`; a `chunk-ext-val` must follow.
+    BeforeValue,
+    /// Reading an unquoted `chunk-ext-val` (`token`).
+    ValueToken,
+    /// Inside a `quoted-string` value, after its opening `DQUOTE`.
+    ValueQuoted,
+    /// Just consumed the `\` of a `quoted-pair`; the escaped byte follows
+    /// unconditionally.
+    ValueQuotedEscaped,
+    /// BWS after a value, deciding between `;` or the end.
+    AfterValue,
+}
+
+/// Position within one `field-line = field-name ":" OWS field-value OWS`
+/// of a trailer section (RFC 9112 §7.1.2, §5).
+///
+/// Distinguishes a field-name byte from a field-value byte, which a flat
+/// allowlist cannot: the allowlist accepts every byte in `not-a-header`
+/// just as it accepts every byte in `Trailer: value`, because nothing
+/// about the bytes alone says whether a colon was ever required to
+/// appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrailerPhase {
+    /// Reading `field-name` (`token`), before the colon.
+    FieldName,
+    /// After the colon: OWS, `field-value`, OWS. Not validated further
+    /// than the existing byte allowlist — field-value's own grammar is
+    /// permissive enough that the allowlist is a reasonable
+    /// approximation, and the structural gap R06 calls out is the
+    /// missing field-name/colon check, not field-value's fine grammar.
+    AfterColon,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +478,9 @@ impl ChunkedDecoder {
             remaining: 0,
             trailer_line_empty: true,
             metadata: MetadataBudget::new(),
+            ext_phase: ExtPhase::BeforeName,
+            trailer_phase: TrailerPhase::FieldName,
+            trailer_name_len: 0,
         }
     }
 
@@ -499,6 +588,12 @@ impl ChunkedDecoder {
             match self.state {
                 ChunkedState::ReadingSize => {
                     if let Some(digit) = HexDigit::decode(b) {
+                        if !self.metadata.charge_size_digit() {
+                            return Step::Yield((
+                                DecodeResult::Error(ParseError::InvalidChunkSize),
+                                i,
+                            ));
+                        }
                         self.saw_size_digit = true;
                         self.chunk_size = match self
                             .chunk_size
@@ -513,26 +608,34 @@ impl ChunkedDecoder {
                                 ));
                             }
                         };
-                    } else if (b == b'\r' || b == b';') && self.saw_size_digit {
+                    } else if (b == b'\r' || b == b';' || b == b' ' || b == b'\t')
+                        && self.saw_size_digit
+                    {
                         if b == b'\r' {
                             self.remaining = self.chunk_size;
                             self.state = ChunkedState::ReadingSizeLf;
                         } else {
+                            // Entering `chunk-ext = *( BWS ";" BWS
+                            // chunk-ext-name ... )` at its top: `b` is
+                            // either the `;` opening the first extension or
+                            // BWS still ahead of it, so the valid
+                            // continuations here are exactly `AfterValue`'s
+                            // (BWS, `;`, or the terminating CR) — there is
+                            // no name yet to require, which is what sets
+                            // this apart from `BeforeName`.
                             self.state = ChunkedState::ReadingExtension;
+                            self.ext_phase = ExtPhase::AfterValue;
+                            if let Some(err) = self.advance_extension(b) {
+                                return Step::Yield((err, i));
+                            }
                         }
                     } else {
                         return Step::Yield((DecodeResult::Error(ParseError::InvalidChunkSize), i));
                     }
                 }
                 ChunkedState::ReadingExtension => {
-                    if b == b'\r' {
-                        self.remaining = self.chunk_size;
-                        self.state = ChunkedState::ReadingSizeLf;
-                    } else if !Self::is_metadata_byte(b) || !self.metadata.charge_extension() {
-                        return Step::Yield((
-                            DecodeResult::Error(ParseError::InvalidChunkMetadata),
-                            i,
-                        ));
+                    if let Some(err) = self.advance_extension(b) {
+                        return Step::Yield((err, i));
                     }
                 }
                 ChunkedState::ReadingSizeLf => {
@@ -604,6 +707,8 @@ impl ChunkedDecoder {
                     self.chunk_size = 0;
                     self.saw_size_digit = false;
                     self.metadata.reset_extension();
+                    self.metadata.reset_size_digits();
+                    self.ext_phase = ExtPhase::BeforeName;
                     self.state = ChunkedState::ReadingSize;
                     return Step::Advance(i + 1);
                 }
@@ -617,15 +722,37 @@ impl ChunkedDecoder {
         for (i, &b) in input.iter().enumerate() {
             match self.state {
                 ChunkedState::ReadingTrailer => {
-                    if b == b'\r' {
+                    if b == b'\r'
+                        && self.trailer_phase == TrailerPhase::FieldName
+                        && self.trailer_name_len == 0
+                    {
                         self.state = ChunkedState::ReadingTrailerLf;
-                    } else if Self::is_metadata_byte(b) && self.metadata.charge_trailer() {
-                        self.trailer_line_empty = false;
-                    } else {
+                        continue;
+                    }
+                    if !self.metadata.charge_trailer() {
                         return Step::Yield((
                             DecodeResult::Error(ParseError::InvalidChunkMetadata),
                             i,
                         ));
+                    }
+                    self.trailer_line_empty = false;
+                    match self.trailer_phase {
+                        TrailerPhase::FieldName if b == b':' && self.trailer_name_len > 0 => {
+                            self.trailer_phase = TrailerPhase::AfterColon;
+                        }
+                        TrailerPhase::FieldName if Tchar::is_valid(b) => {
+                            self.trailer_name_len += 1;
+                        }
+                        TrailerPhase::AfterColon if Self::is_metadata_byte(b) => {}
+                        TrailerPhase::AfterColon if b == b'\r' => {
+                            self.state = ChunkedState::ReadingTrailerLf;
+                        }
+                        _ => {
+                            return Step::Yield((
+                                DecodeResult::Error(ParseError::InvalidChunkMetadata),
+                                i,
+                            ));
+                        }
                     }
                 }
                 ChunkedState::ReadingTrailerLf => {
@@ -646,6 +773,8 @@ impl ChunkedDecoder {
                     }
                     self.state = ChunkedState::ReadingTrailer;
                     self.trailer_line_empty = true;
+                    self.trailer_phase = TrailerPhase::FieldName;
+                    self.trailer_name_len = 0;
                 }
                 _ => unreachable!(),
             }
@@ -661,6 +790,120 @@ impl ChunkedDecoder {
     const fn is_metadata_byte(b: u8) -> bool {
         b == b'\t' || (b >= 0x20 && b != 0x7f)
     }
+
+    /// Charge and advance one byte of `chunk-ext`, transitioning
+    /// [`ChunkedState::ReadingExtension`] back to the size-line's CRLF when
+    /// the extension ends.
+    ///
+    /// The terminating CR is not itself metadata — it belongs to the
+    /// framing every chunk pays, not to what a peer can send unboundedly —
+    /// so it is charged only when [`Self::step_extension`] says the byte
+    /// was consumed *as* extension content, not when it ends the line.
+    fn advance_extension(&mut self, b: u8) -> Option<DecodeResult> {
+        match self.step_extension(b) {
+            ExtStep::Continue => {
+                if self.metadata.charge_extension() {
+                    None
+                } else {
+                    Some(DecodeResult::Error(ParseError::InvalidChunkMetadata))
+                }
+            }
+            ExtStep::EndOfLine => {
+                self.remaining = self.chunk_size;
+                self.state = ChunkedState::ReadingSizeLf;
+                None
+            }
+            ExtStep::Invalid => Some(DecodeResult::Error(ParseError::InvalidChunkMetadata)),
+        }
+    }
+
+    /// Advance [`Self::ext_phase`] by one byte of `chunk-ext = *( BWS ";"
+    /// BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )` (RFC 9112
+    /// §7.1.1), given that a `;` has already been consumed to reach
+    /// [`ChunkedState::ReadingExtension`].
+    ///
+    /// `BWS` ("bad whitespace", RFC 9110 §5.6.3) is SP/HTAB tolerated around
+    /// `;` and `=` for compatibility with existing senders; it is not
+    /// permitted anywhere else the plain grammar does not name it.
+    fn step_extension(&mut self, b: u8) -> ExtStep {
+        let is_bws = |b: u8| b == b' ' || b == b'\t';
+        // `BeforeName`/`BeforeValue` accept BWS without changing phase
+        // (there is more BWS to come); `Name`/`AfterName`/`ValueToken`/
+        // `AfterValue` accept it *into* `AfterName`/`AfterValue`, marking
+        // that a token has ended even though more BWS may follow. Grouped
+        // by the byte they react to rather than by phase, since several
+        // phases share both the byte and the resulting transition.
+        match self.ext_phase {
+            ExtPhase::BeforeName | ExtPhase::BeforeValue if is_bws(b) => ExtStep::Continue,
+            ExtPhase::Name | ExtPhase::AfterName | ExtPhase::ValueToken | ExtPhase::AfterValue
+                if is_bws(b) =>
+            {
+                self.ext_phase = match self.ext_phase {
+                    ExtPhase::ValueToken | ExtPhase::AfterValue => ExtPhase::AfterValue,
+                    _ => ExtPhase::AfterName,
+                };
+                ExtStep::Continue
+            }
+            ExtPhase::BeforeName if Tchar::is_valid(b) => {
+                self.ext_phase = ExtPhase::Name;
+                ExtStep::Continue
+            }
+            ExtPhase::Name if Tchar::is_valid(b) => ExtStep::Continue,
+            ExtPhase::Name | ExtPhase::AfterName if b == b'=' => {
+                self.ext_phase = ExtPhase::BeforeValue;
+                ExtStep::Continue
+            }
+            ExtPhase::Name | ExtPhase::AfterName | ExtPhase::ValueToken | ExtPhase::AfterValue
+                if b == b';' =>
+            {
+                self.ext_phase = ExtPhase::BeforeName;
+                ExtStep::Continue
+            }
+            ExtPhase::Name | ExtPhase::AfterName | ExtPhase::ValueToken | ExtPhase::AfterValue
+                if b == b'\r' =>
+            {
+                ExtStep::EndOfLine
+            }
+            ExtPhase::BeforeValue if b == b'"' => {
+                self.ext_phase = ExtPhase::ValueQuoted;
+                ExtStep::Continue
+            }
+            ExtPhase::BeforeValue | ExtPhase::ValueToken if Tchar::is_valid(b) => {
+                self.ext_phase = ExtPhase::ValueToken;
+                ExtStep::Continue
+            }
+            // quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+            // (RFC 9110 §5.6.4). qdtext excludes DQUOTE and "\"; a bare CR
+            // or LF inside the quotes is likewise excluded by
+            // `is_metadata_byte`, so a peer cannot use a quoted value to
+            // smuggle a line ending past this state machine.
+            ExtPhase::ValueQuoted if b == b'\\' => {
+                self.ext_phase = ExtPhase::ValueQuotedEscaped;
+                ExtStep::Continue
+            }
+            ExtPhase::ValueQuoted if b == b'"' => {
+                self.ext_phase = ExtPhase::AfterValue;
+                ExtStep::Continue
+            }
+            ExtPhase::ValueQuoted if Self::is_metadata_byte(b) => ExtStep::Continue,
+            ExtPhase::ValueQuotedEscaped if Self::is_metadata_byte(b) => {
+                self.ext_phase = ExtPhase::ValueQuoted;
+                ExtStep::Continue
+            }
+            _ => ExtStep::Invalid,
+        }
+    }
+}
+
+/// What one byte of [`ChunkedDecoder::step_extension`] decided.
+enum ExtStep {
+    /// Still inside the extension; not yet the terminating CR.
+    Continue,
+    /// The byte was the CR that ends `chunk-ext`, consistent with the
+    /// grammar reached so far.
+    EndOfLine,
+    /// The byte does not fit the grammar at the current phase.
+    Invalid,
 }
 
 enum Step {
@@ -1237,6 +1480,170 @@ mod tests {
         let mut decoder = ChunkedDecoder::new();
         assert_eq!(
             drive(&mut decoder, b"0\r\nTrailer: a\nb\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    // ── R06: chunk-ext / trailer grammar, not just a byte allowlist ──────────
+
+    /// `1;=\r\na\r\n0\r\n\r\n`: an extension value with no name. The byte
+    /// allowlist alone accepts every byte here; only the grammar's
+    /// requirement of a `chunk-ext-name` before `=` catches it.
+    #[test]
+    fn a_chunk_extension_value_without_a_name_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"1;=\r\na\r\n0\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    /// `0\r\nnot-a-header\r\n\r\n`: a trailer line with no colon. The byte
+    /// allowlist accepts `not-a-header` outright; only requiring a colon
+    /// before the field-value grammar catches it.
+    #[test]
+    fn a_trailer_line_without_a_colon_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"0\r\nnot-a-header\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    /// A colon with nothing before it is an empty field-name, which
+    /// `field-name = token` (at least one `tchar`) forbids just as it
+    /// forbids a missing colon.
+    #[test]
+    fn a_trailer_line_with_an_empty_field_name_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"0\r\n: value\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    /// A bare `;` opening an extension with nothing after it is not a
+    /// `chunk-ext-name` (which needs at least one `tchar`) followed by the
+    /// terminating CRLF — the extension is unterminated when the CR arrives
+    /// straight after `;`.
+    #[test]
+    fn a_bare_semicolon_with_no_extension_name_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"1;\r\na\r\n0\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    /// The ordinary form the grammar exists to accept: a named extension
+    /// with an unquoted token value.
+    #[test]
+    fn a_well_formed_chunk_extension_with_a_token_value_is_accepted() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;ext=value\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Data(5)
+        );
+    }
+
+    /// `chunk-ext-name` alone, with no `= chunk-ext-val`, is valid: the
+    /// value is optional.
+    #[test]
+    fn a_chunk_extension_with_no_value_is_accepted() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;ext\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Data(5)
+        );
+    }
+
+    /// Multiple extensions on one chunk, name-only and name=value mixed.
+    #[test]
+    fn multiple_chunk_extensions_on_one_chunk_are_accepted() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;a;b=c;d=\"e\"\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Data(5)
+        );
+    }
+
+    /// A quoted value may contain a `;` and a `=` without those bytes being
+    /// mistaken for extension structure — they are `qdtext` inside the
+    /// quotes, not delimiters.
+    #[test]
+    fn a_quoted_extension_value_may_contain_delimiter_bytes() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;ext=\"a;b=c\"\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Data(5)
+        );
+    }
+
+    /// `quoted-pair` lets a quoted value escape its own closing quote; the
+    /// escaped `"` must not end the string early.
+    #[test]
+    fn a_quoted_extension_value_may_escape_a_quote() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;ext=\"a\\\"b\"\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Data(5)
+        );
+    }
+
+    /// An unterminated quoted value — a CR arrives before the closing quote
+    /// — is invalid rather than treated as ending the extension.
+    #[test]
+    fn an_unterminated_quoted_extension_value_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"5;ext=\"unterminated\r\nhello\r\n0\r\n\r\n"),
+            DecodeResult::Error(ParseError::InvalidChunkMetadata)
+        );
+    }
+
+    /// RFC 9112 §7.1.1 reintroduces BWS (bad whitespace) around `;` and `=`
+    /// for compatibility with existing senders.
+    #[test]
+    fn whitespace_around_extension_delimiters_is_tolerated() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(
+                &mut decoder,
+                b"5 ; ext = value ; other\r\nhello\r\n0\r\n\r\n"
+            ),
+            DecodeResult::Data(5)
+        );
+    }
+
+    /// The ordinary trailer form: field-name, colon, OWS, value.
+    #[test]
+    fn a_well_formed_trailer_field_is_accepted() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"0\r\nX-Checksum: abc123\r\n\r\n"),
+            DecodeResult::Done
+        );
+    }
+
+    /// A trailer value may itself be empty (`field-value` permits zero
+    /// octets), so a bare `Name:` line must not be rejected as if it had no
+    /// colon at all.
+    #[test]
+    fn a_trailer_field_with_an_empty_value_is_accepted() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"0\r\nX-Empty:\r\n\r\n"),
+            DecodeResult::Done
+        );
+    }
+
+    /// A field-name byte the token grammar forbids (here, a space) must be
+    /// rejected even though it would pass the old byte allowlist.
+    #[test]
+    fn a_trailer_field_name_with_a_non_token_byte_is_rejected() {
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(
+            drive(&mut decoder, b"0\r\nBad Name: value\r\n\r\n"),
             DecodeResult::Error(ParseError::InvalidChunkMetadata)
         );
     }
@@ -2061,6 +2468,57 @@ mod tests {
             HeaderRange::build_ranges(&headers, src).unwrap_err(),
             Error::Parse(ParseError::TooManyHeaders)
         );
+    }
+
+    /// Leading-zero digits are not charged for free forever: past
+    /// `MAX_CHUNK_SIZE_DIGITS` they can only be padding, and the decoder
+    /// must refuse rather than keep consuming input without ever reaching
+    /// a chunk boundary.
+    #[test]
+    fn chunk_size_digits_past_the_bound_are_rejected() {
+        let input = vec![b'0'; MAX_CHUNK_SIZE_DIGITS + 1];
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 64];
+        let (result, _) = decoder.decode(&input, &mut output);
+        assert_eq!(result, DecodeResult::Error(ParseError::InvalidChunkSize));
+    }
+
+    /// The converse: a size line at exactly the bound must still decode, so
+    /// the limit is not off by one against ordinary large-but-finite input.
+    #[test]
+    fn chunk_size_digits_at_the_bound_are_accepted() {
+        let mut input = vec![b'0'; MAX_CHUNK_SIZE_DIGITS - 1];
+        input.extend_from_slice(b"7\r\nabcdefg\r\n0\r\n\r\n");
+        let mut decoder = ChunkedDecoder::new();
+        assert_eq!(drive(&mut decoder, &input), DecodeResult::Data(7));
+    }
+
+    /// The digit budget is per chunk, like the extension budget: a long
+    /// stream of ordinarily-padded chunk sizes must not accumulate into a
+    /// spurious refusal.
+    #[test]
+    fn chunk_size_digit_budget_resets_between_chunks() {
+        let mut input = Vec::new();
+        for _ in 0..8 {
+            input.extend(std::iter::repeat_n(b'0', MAX_CHUNK_SIZE_DIGITS - 1));
+            input.extend_from_slice(b"1\r\na\r\n");
+        }
+        input.extend_from_slice(b"0\r\n\r\n");
+
+        let mut decoder = ChunkedDecoder::new();
+        let mut output = [0u8; 256];
+        let mut total = Vec::new();
+        let mut pos = 0;
+        loop {
+            let (result, consumed) = decoder.decode(&input[pos..], &mut output);
+            pos += consumed;
+            match result {
+                DecodeResult::Data(n) => total.extend_from_slice(&output[..n]),
+                DecodeResult::Done => break,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert_eq!(total, b"aaaaaaaa");
     }
 
     #[test]
