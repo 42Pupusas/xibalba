@@ -17,8 +17,8 @@
 //! # Topology
 //!
 //! - `mpsc::RingBuffer<Control>`: caller → reader. Carries new requests
-//!   and cancel signals; owned on the reader side by
-//!   [`ControlQueue`](crate::control::ControlQueue).
+//!   and cancel signals; owned on the reader side by the internal
+//!   `ControlQueue`.
 //! - `spsc::RingBuffer<Chunk>`: per-request, reader → caller. The
 //!   reader pushes a single [`Chunk::Head`] first, then zero or more
 //!   [`Chunk::Body`] chunks, then exactly one terminator:

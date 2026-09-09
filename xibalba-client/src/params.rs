@@ -77,9 +77,11 @@ impl RequestParams<'_> {
 
 /// Collects request parameters for deferred execution.
 ///
-/// Created by [`Client::build`]; consumed by [`Client::send`] or
-/// [`Client::send_streaming`].  The builder borrows only the request
-/// data (path, headers, body), never the client.
+/// Created by [`Client::build`](crate::client::Client::build); consumed by
+/// [`Client::send`](crate::client::Client::send) or
+/// [`Client::send_streaming`](crate::client::Client::send_streaming).  The
+/// builder borrows only the request data (path, headers, body), never the
+/// client.
 #[derive(Debug)]
 pub struct RequestBuilder<'a> {
     method: Method,

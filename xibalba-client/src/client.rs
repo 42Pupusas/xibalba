@@ -74,7 +74,7 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
     }
 
     /// Start building a request.  Chain `.header()`, `.body()`,
-    /// `.query()`, then call [`RequestBuilder::send`] or
+    /// `.query()`, then call [`Client::send`] or
     /// [`Client::send_streaming`].
     #[must_use]
     pub const fn build<'a>(&self, method: Method, path: &'a [u8]) -> RequestBuilder<'a> {
