@@ -152,7 +152,7 @@ jobs:
       # libc, so a host defaulting to musl fails to build the target at all.
       - name: fuzz ${{ matrix.target }}
         run: >
-          cargo fuzz run ${{ matrix.target }}
+          cargo +nightly fuzz run ${{ matrix.target }}
           --target x86_64-unknown-linux-gnu
           -- -max_total_time=60 -timeout=10
 
