@@ -64,6 +64,18 @@ pub enum ConnectionError {
     /// it would move the request, and any credentials it carries, onto an
     /// unprotected connection.
     InsecureRedirect,
+    /// A `Location` names a URI scheme this client cannot follow: neither
+    /// `http`/`https` nor a same-origin reference. Resolving it as a
+    /// relative path would silently reinterpret `ftp://host/x` or
+    /// `mailto:user@host` as a same-origin request instead of refusing it,
+    /// so the redirect is rejected before any connection is made.
+    UnsupportedRedirectScheme,
+    /// A redirect left the origin the request was sent to, and the client's
+    /// configuration refused to follow it there. The caller opted out of
+    /// automatic cross-origin hops rather than accepting `Location` on
+    /// faith; the redirect can still be followed manually by reading it off
+    /// the response.
+    CrossOriginRedirectRefused,
     /// Too many requests are already in flight. Backpressure rather than a
     /// transport failure: the request was not sent, and submitting again
     /// once an earlier response finishes will succeed.
@@ -193,6 +205,12 @@ impl fmt::Display for ConnectionError {
             Self::ReaderGone => f.write_str("background reader thread has exited"),
             Self::TooManyRequests => f.write_str("too many requests are already in flight"),
             Self::InsecureRedirect => f.write_str("redirect downgrades https to http"),
+            Self::UnsupportedRedirectScheme => {
+                f.write_str("redirect location names a scheme this client cannot follow")
+            }
+            Self::CrossOriginRedirectRefused => f.write_str(
+                "redirect left the request's origin and cross-origin redirects are refused",
+            ),
             Self::TunnelingNotSupported => {
                 f.write_str("CONNECT tunnelling is not supported by this client")
             }

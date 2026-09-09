@@ -147,6 +147,15 @@ impl RedirectState {
         if Self::has_absolute_scheme(without_fragment) {
             return self.apply_absolute_location(from, without_fragment);
         }
+        // A scheme this client does not speak (`ftp:`, `mailto:`, `data:`, …)
+        // must be refused, not folded into a same-origin path. Below this
+        // point everything is either `//authority...` or a relative
+        // reference (RFC 3986 §4.2); a reference with any other named scheme
+        // is absolute and out of scope, and treating it as relative would
+        // silently reroute it onto the current origin instead of refusing it.
+        if Self::has_named_scheme(without_fragment) {
+            return Err(ConnectionError::UnsupportedRedirectScheme.into());
+        }
         if without_fragment.starts_with(b"//") {
             let mut absolute = from.scheme_bytes().to_vec();
             absolute.push(b':');
@@ -216,6 +225,39 @@ impl RedirectState {
                 (scheme.ascii_eq_ignore_case(b"http") || scheme.ascii_eq_ignore_case(b"https"))
                     && location[colon..].starts_with(b"://")
             })
+    }
+
+    /// Whether `location` opens with a scheme name other than `http`/`https`.
+    ///
+    /// RFC 3986 §4.2: a relative-path reference's first segment may not
+    /// contain a colon, because a parser could not otherwise tell it apart
+    /// from a scheme name (`this:that` looks exactly like `scheme:rest`). A
+    /// colon appearing after the first `/` is inside a path segment and
+    /// cannot be a scheme delimiter; before it, the bytes preceding the
+    /// colon must additionally satisfy the scheme grammar itself
+    /// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`) or they are not a
+    /// scheme either, just a segment that happens to contain a colon.
+    fn has_named_scheme(location: &[u8]) -> bool {
+        let end = location
+            .iter()
+            .position(|&b| b == b'/' || b == b'?')
+            .unwrap_or(location.len());
+        let Some(colon) = location[..end].iter().position(|&b| b == b':') else {
+            return false;
+        };
+        Self::is_scheme_token(&location[..colon])
+    }
+
+    /// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 §3.1).
+    fn is_scheme_token(bytes: &[u8]) -> bool {
+        let is_scheme_alpha = |b: u8| b.is_ascii_alphabetic();
+        let is_scheme_tail = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.');
+        match bytes.split_first() {
+            Some((&first, rest)) => {
+                is_scheme_alpha(first) && rest.iter().all(|&b| is_scheme_tail(b))
+            }
+            None => false,
+        }
     }
 
     fn resolve_relative_path(&self, relative: &[u8]) -> Vec<u8> {
@@ -384,6 +426,77 @@ mod tests {
             "200 is the answer, not a hop"
         );
         assert!(RedirectState::is_followed_status(StatusCode::FOUND));
+    }
+
+    /// RFC 3986 §4.2: a scheme this client cannot follow must be refused, not
+    /// silently reinterpreted as a same-origin path. Folding it in would
+    /// mean `ftp://attacker.example/x` gets requested from the current
+    /// origin instead of being rejected.
+    #[test]
+    fn an_unsupported_scheme_is_refused_rather_than_treated_as_relative() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        let error = state
+            .advance(
+                &origin(b"https://api.example/"),
+                StatusCode::FOUND,
+                b"ftp://other.example/file",
+            )
+            .expect_err("ftp is not a scheme this client speaks");
+        assert_eq!(
+            error,
+            Error::Connection(ConnectionError::UnsupportedRedirectScheme)
+        );
+    }
+
+    /// A scheme without an authority (`mailto:`, `data:`, …) must be refused
+    /// the same way: it still names a scheme this client cannot follow.
+    #[test]
+    fn a_schemed_reference_without_a_double_slash_is_still_refused() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        let error = state
+            .advance(
+                &origin(b"https://api.example/"),
+                StatusCode::FOUND,
+                b"mailto:user@example.com",
+            )
+            .expect_err("mailto is not a scheme this client speaks");
+        assert_eq!(
+            error,
+            Error::Connection(ConnectionError::UnsupportedRedirectScheme)
+        );
+    }
+
+    /// A colon inside a path segment (after the first `/`) is not a scheme
+    /// delimiter and must resolve as an ordinary relative path.
+    #[test]
+    fn a_colon_inside_a_path_segment_is_not_mistaken_for_a_scheme() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        let hop = state
+            .advance(
+                &origin(b"https://api.example/"),
+                StatusCode::FOUND,
+                b"/path/a:b",
+            )
+            .expect("a colon past the first slash is just a path byte");
+        assert_eq!(hop, Hop::SameOrigin);
+        assert_eq!(state.path, b"/path/a:b");
+    }
+
+    /// A relative reference whose first segment contains a colon but does not
+    /// satisfy the scheme grammar (leading digit) is a path, not a scheme.
+    #[test]
+    fn a_leading_segment_with_a_colon_but_no_scheme_grammar_is_a_relative_path() {
+        let mut state = RedirectState::new(&params_with(&[]));
+        state.path = b"/dir/".to_vec();
+        let hop = state
+            .advance(
+                &origin(b"https://api.example/dir/"),
+                StatusCode::FOUND,
+                b"1:not-a-scheme",
+            )
+            .expect("a leading digit cannot start a scheme");
+        assert_eq!(hop, Hop::SameOrigin);
+        assert_eq!(state.path, b"/dir/1:not-a-scheme".to_vec());
     }
 
     #[test]

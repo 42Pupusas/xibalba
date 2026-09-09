@@ -246,3 +246,54 @@ fn redirect_307_preserves_method_and_body() {
     assert_eq!(resp.text().unwrap(), "preserved");
     server.join().unwrap();
 }
+
+/// `allow_cross_origin_redirects: false` must refuse the hop before it is
+/// ever dialled, not merely fail once connected: the target here has no
+/// script registered, so a dial attempt would panic the connector rather
+/// than surface `CrossOriginRedirectRefused`.
+#[test]
+fn cross_origin_redirects_can_be_refused_before_they_are_dialled() {
+    use crate::support::registry::ScriptedServer;
+    use crate::support::script::Script;
+
+    let origin = ScriptedServer::serving_one(Script::new().expect_request().send(
+        b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: http://elsewhere.example/target\r\n\r\n".to_vec(),
+    ));
+
+    let config = Config {
+        allow_cross_origin_redirects: false,
+        ..Config::default()
+    };
+    let mut client = TestClient::scripted_with_config(&origin, config);
+
+    let error = client
+        .get(b"/start")
+        .expect_err("a cross-origin hop must be refused, not followed");
+    assert_eq!(
+        error,
+        Error::Connection(ConnectionError::CrossOriginRedirectRefused)
+    );
+}
+
+/// The converse of the refusal: a same-origin redirect is unaffected by
+/// `allow_cross_origin_redirects`, so the flag cannot be mistaken for a
+/// blanket "never redirect".
+#[test]
+fn same_origin_redirects_are_unaffected_by_the_cross_origin_refusal() {
+    let (port, server) = TestServer::redirect(
+        301,
+        "/final",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone",
+    );
+    let config = Config {
+        allow_cross_origin_redirects: false,
+        ..Config::default()
+    };
+    let mut client = TestClient::with_config(port, config);
+
+    let resp = client
+        .get(b"/start")
+        .expect("a same-origin redirect must still be followed");
+    assert_eq!(resp.text().unwrap(), "done");
+    server.join().unwrap();
+}

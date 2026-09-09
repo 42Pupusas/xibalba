@@ -510,6 +510,12 @@ impl<C: Connector, const MAX_HEAD_SIZE: usize> Client<C, MAX_HEAD_SIZE> {
             if let Hop::Reconnect(target) =
                 state.advance(&self.origin, response.status, &location)?
             {
+                // The hop is reported, not yet dialled: a caller that
+                // refused cross-origin redirects must see the refusal
+                // before a connection to the new origin is even attempted.
+                if !self.config.allow_cross_origin_redirects {
+                    return Err(ConnectionError::CrossOriginRedirectRefused.into());
+                }
                 self.reconnect_with_deadline(&Url::parse(&target)?, deadline)?;
             }
         }

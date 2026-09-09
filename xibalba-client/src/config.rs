@@ -52,6 +52,25 @@ pub struct Config {
     pub connect_timeout: Option<Duration>,
     pub max_response_body: usize,
     pub max_redirects: u8,
+    /// Whether a redirect may take the request to a different origin than
+    /// the one it was sent to.
+    ///
+    /// A `Location` header is server-controlled input: following it
+    /// automatically means the server a caller trusted enough to contact
+    /// decides where the request — and any header or body it carries — goes
+    /// next. `false` refuses any redirect whose origin differs from the
+    /// request's, surfacing
+    /// [`CrossOriginRedirectRefused`](xibalba_proto::error::ConnectionError::CrossOriginRedirectRefused)
+    /// instead of dialling it; a same-origin redirect is unaffected.
+    ///
+    /// `true` (the default) preserves the previous behaviour: credential
+    /// headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Cookie2`)
+    /// are still stripped crossing an origin, but any other header a caller
+    /// attached — including a custom bearer scheme this client does not
+    /// recognise as a credential — is forwarded, and a 307/308 still
+    /// replays the body. Set this to `false` for a request whose headers or
+    /// body must never reach a host the caller did not name.
+    pub allow_cross_origin_redirects: bool,
     /// Total wall-clock silence tolerated across dispatching a request and
     /// waiting for its response head.
     ///
@@ -151,6 +170,7 @@ impl Default for Config {
             connect_timeout: Some(Duration::from_secs(30)),
             max_response_body: 10 * 1024 * 1024,
             max_redirects: 10,
+            allow_cross_origin_redirects: true,
             head_silence: Duration::from_mins(2),
             stream_silence: Duration::from_mins(5),
             request_deadline: None,
