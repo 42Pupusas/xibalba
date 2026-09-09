@@ -192,11 +192,16 @@ impl<'a> Url<'a> {
             |pos| (&address[..pos], &address[pos + 2..], true),
         );
 
-        let left_groups = Self::split_h16_groups(left)?;
+        let (left_groups, left_has_embedded_v4) = if elided {
+            (Self::split_h16_groups(left)?, false)
+        } else {
+            Self::split_h16_groups_allowing_v4(left)?
+        };
         let (right_groups, right_has_embedded_v4) = Self::split_h16_groups_allowing_v4(right)?;
 
-        let right_weight = right_groups.len() + usize::from(right_has_embedded_v4);
-        let total = left_groups.len() + right_weight;
+        let left_weight = left_groups.len() + 2 * usize::from(left_has_embedded_v4);
+        let right_weight = right_groups.len() + 2 * usize::from(right_has_embedded_v4);
+        let total = left_weight + right_weight;
 
         if elided {
             // "::" must stand for at least one elided group, or the address
@@ -236,16 +241,21 @@ impl<'a> Url<'a> {
             // consumed is not a valid group boundary.
             return Err(err());
         }
-        let last = raw_groups.last().copied().unwrap_or(b"");
-        if allow_trailing_v4 && Self::is_ipv4_address(last) {
-            return Ok((raw_groups[..raw_groups.len() - 1].to_vec(), true));
-        }
-        for group in &raw_groups {
+        let has_trailing_v4 = allow_trailing_v4
+            && raw_groups
+                .last()
+                .is_some_and(|group| Self::is_ipv4_address(group));
+        let h16_groups = if has_trailing_v4 {
+            &raw_groups[..raw_groups.len() - 1]
+        } else {
+            &raw_groups[..]
+        };
+        for group in h16_groups {
             if group.is_empty() || group.len() > 4 || !group.iter().all(u8::is_ascii_hexdigit) {
                 return Err(err());
             }
         }
-        Ok((raw_groups, false))
+        Ok((h16_groups.to_vec(), has_trailing_v4))
     }
 
     /// `IPv4address = dec-octet "." dec-octet "." dec-octet "." dec-octet`,
@@ -912,6 +922,18 @@ mod tests {
     fn ipv6_embedded_ipv4_tail_is_accepted() {
         assert!(Url::parse(b"http://[::ffff:192.168.1.1]/").is_ok());
         assert!(Url::parse(b"http://[2001:db8::1:192.168.1.1]/").is_ok());
+        assert!(Url::parse(b"http://[1:2:3:4:5:6:192.168.1.1]/").is_ok());
+    }
+
+    #[test]
+    fn ipv6_embedded_ipv4_tail_validates_preceding_groups() {
+        assert!(Url::parse(b"http://[::gggg:192.168.1.1]/").is_err());
+        assert!(Url::parse(b"http://[::fffff:192.168.1.1]/").is_err());
+    }
+
+    #[test]
+    fn ipv6_embedded_ipv4_tail_counts_as_two_groups() {
+        assert!(Url::parse(b"http://[1:2:3:4:5:6::192.168.1.1]/").is_err());
     }
 
     #[test]

@@ -4,7 +4,7 @@ Baseline: `9fb1feb17103fb31bdecb1b6cfbb7ee679155559` (`xibalba-proto` 0.4.0, `xi
 
 ## Recommendation
 
-**Resolved — the release is no longer held.** Every finding below was repaired, and the gates this pass declined to run have since been executed; see "Resolution" at the end for what was done, what it was verified with, and what was accepted rather than fixed.
+**R07 repaired; publication remains held pending the release gate.** The final pre-publish check of `f80fa3d` found three IPv6 validation defects using a temporary Rust differential probe against `std::net::Ipv6Addr`. They are repaired below with permanent regression tests. The updated commit still needs the remaining release checks and publication ref updates.
 
 The original recommendation, kept for the record: *Hold the release. The existing gate passes, but source inspection identifies unresolved cancellation, deadline, and connection-state defects. The statement in `AUDIT.md` that every finding is closed is not sufficient for release approval.*
 
@@ -116,7 +116,7 @@ Neither published crate declares Cargo features. These tests exercised the ordin
 
 ## Resolution
 
-All seven findings are repaired, each with regression coverage this re-audit asked for and did not find.
+The earlier repair pass reported all seven findings repaired. The final review below found R07 incomplete; the subsequent repair now closes F01–F03.
 
 | Finding | Resolution |
 |---|---|
@@ -153,5 +153,37 @@ The checks this pass listed as not performed have now been run.
 The module extractions are done: protocol `response.rs` is now `head`, `framing`, `chunked`, and `ranges` behind an unchanged `xibalba_proto::response::*`; client `response.rs` is now `head` and `public`. The protocol graph is a DAG at 57 edges / 25 skip edges.
 
 The fuzz campaign is shorter than the 4×600s one `AUDIT.md` records. It is a regression check, not a replacement for that campaign.
+
+## Final pre-publish review
+
+Target: `f80fa3deb79f85adfbaaa29417436948e9de9d91`. Publication is held pending repair and renewed release verification.
+
+### F01 — P2: embedded IPv4 bypasses preceding h16 validation
+
+In `xibalba-proto/src/url.rs`, `h16_groups` returns early when the final component is IPv4, before validating the preceding components. `http://[::gggg:192.168.1.1]/` and `http://[::fffff:192.168.1.1]/` are accepted despite invalid hexadecimal groups. No destination bypass exploit was demonstrated.
+
+### F02 — P2: embedded IPv4 counts as one group rather than two
+
+`h16_groups` removes the IPv4 component from the returned vector. `validate_ipv6_address` then adds only one to its length, although IPv4 occupies two h16 groups. `http://[1:2:3:4:5:6::192.168.1.1]/` is accepted even though its eight explicit groups leave no room for the required nonempty `::` compression.
+
+### F03 — P2: valid uncompressed embedded IPv4 is rejected
+
+Without `::`, `validate_ipv6_address` sends the complete address through the h16-only left-side parser. `http://[1:2:3:4:5:6:192.168.1.1]/` is valid but rejected.
+
+All four examples were executed in a temporary extension of `ipv6_embedded_ipv4_tail_is_accepted`, comparing `Url::parse` acceptance with `std::net::Ipv6Addr`. The test failed with all four mismatches. The temporary probe was removed after execution; production code was unchanged at that point.
+
+### Repair and verification
+
+`h16_groups` now validates every preceding h16 group before accepting an IPv4 tail, counts the tail as two h16 groups, and permits the valid uncompressed form by allowing the tail on the non-elided side. Permanent tests cover valid compressed and uncompressed tails, malformed preceding groups, and the group-count boundary. The URL test suite passes 67 tests; the workspace all-feature suite passes 273 protocol tests and all other targets; workspace Clippy with warnings denied and `cargo fmt --all -- --check` pass.
+
+The rustfmt CI failure had a separate cause: `rust-toolchain.toml` pinned Rust 1.95 without requesting the `rustfmt` component. It now requests both `rustfmt` and `clippy`, matching the CI commands.
+
+Checks before the repair:
+
+- `cargo test --workspace --all-features --quiet`: passed, but existing coverage missed these defects.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed with the temporary probe present.
+- `origin/mera` pointed at `f80fa3d`; both remote release tags still peeled to `9fb1feb`. No refs were changed by that review.
+
+The repaired tree now has fresh focused and workspace debug verification. Release-profile tests, MSRV, loom, fuzz, packaging, dependency checks, and rustdoc remain to be rerun before publication. Earlier results must not be represented as fresh results from the repaired commit.
 
 Each fix needs its own regression reproduction and verification before the next structural change. Keep `AUDIT.md` as historical evidence, but revise its blanket closure claim or link it to this re-audit before release.
