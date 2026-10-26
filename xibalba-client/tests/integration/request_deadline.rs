@@ -41,7 +41,7 @@ impl TrickleServer {
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n")
                 .unwrap();
-            let byte = [b'.'];
+            let byte = *b".";
             let mut sent = 0usize;
             loop {
                 if self.total_bytes.is_some_and(|total| sent >= total) {

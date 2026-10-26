@@ -42,7 +42,7 @@ fn get_no_body_204() {
         resp.status,
         xibalba_client::proto::status::StatusCode::NO_CONTENT
     );
-    assert!(resp.text().unwrap().is_empty());
+    assert_eq!(resp.text().unwrap(), "");
     server.join().unwrap();
 }
 

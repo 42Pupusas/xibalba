@@ -25,12 +25,17 @@ use std::net::ToSocketAddrs;
 use std::thread::JoinHandle;
 
 use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::mpsc::{self, Producer as MpscProducer, RingBuffer as MpscRingBuffer};
+use quetzalcoatl::mpsc::{
+    self, Consumer as MpscConsumer, Producer as MpscProducer, RingBuffer as MpscRingBuffer,
+};
 use quetzalcoatl::spmc::{
     Consumer as SpmcConsumer, Producer as SpmcProducer, RingBuffer as SpmcRingBuffer,
 };
-use ququmatz::types::{MsgFlags, SockAddrIn, TimeoutFlags, Timespec};
-use ququmatz::{Completer, ProvidedBufferRing, RawFd, Sqe, Submitter};
+use ququmatz::owned::{
+    Event, OwnedCompleter, OwnedSubmitter, Pending, Prepared, Receipt, StableBuffer,
+};
+use ququmatz::types::{CqeFlags, MsgFlags, SockAddrIn, TimeoutFlags, Timespec};
+use ququmatz::{BufferConsumer, RawFd, Sqe};
 
 use xibalba_proto::error::{ConnectionError, Error};
 use xibalba_proto::header::{Header, HeaderName};
@@ -50,8 +55,8 @@ const PBUF_BGID: u16 = 0;
 const BLOCK_SIZE: usize = 8192;
 const MAX_RESPONSE_HEAD: usize = 64 * 1024;
 const SHUTDOWN_UD: u64 = u64::MAX;
-// Second-highest value — cannot collide with recv (bit63=0), send (bit63=1 and not MAX), or SHUTDOWN.
 const TIMEOUT_UD: u64 = u64::MAX - 1;
+const TIMEOUT_REMOVE_UD: u64 = u64::MAX - 2;
 
 // ── public types ──────────────────────────────────────────────────────────────
 
@@ -122,17 +127,17 @@ pub enum ConnResult {
     Timeout,
 }
 
-// ── send SQE user_data encoding ───────────────────────────────────────────────
+// ── user_data encoding ────────────────────────────────────────────────────────
 //
-// Recv SQEs:  bit63=0, bits62-32=fd, bits31-0=conn_id
-// Send SQEs:  bit63=1, bits62-32=conn_id, bits31-0=request_seq (per-conn u32)
-// SHUTDOWN:   all bits set
+// Owned SQEs (sends): bit63=0, the ring's monotonic request id
+// Recv SQEs:          bit63=1, bits62-32=fd, bits31-0=conn_id
+// SHUTDOWN, TIMEOUT, TIMEOUT_REMOVE: the top three values
 //
 // The complete thread sees the send CQE first (TCP send happens before the
-// response arrives), extracts conn_id and request_seq, and enqueues the pair
+// response arrives), redeems the send's ticket, and enqueues its request id
 // into the connection's pending queue.  The recv CQEs then find the id waiting.
 
-const SEND_UD_FLAG: u64 = 1 << 63;
+const RECV_UD_FLAG: u64 = 1 << 63;
 
 #[derive(Clone, Copy)]
 struct UserData(u64);
@@ -140,33 +145,51 @@ struct UserData(u64);
 impl UserData {
     #[allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
     const fn recv(fd: usize, conn_id: u32) -> Self {
-        Self((fd as u64) << 32 | (conn_id as u64 & 0xffff_ffff))
+        Self(RECV_UD_FLAG | ((fd as u64) & 0x7fff_ffff) << 32 | conn_id as u64)
     }
 
-    #[allow(clippy::cast_lossless)]
-    const fn send(conn_id: u32, seq: u32) -> Self {
-        Self(SEND_UD_FLAG | (conn_id as u64) << 32 | seq as u64)
-    }
-
-    const fn is_send(self) -> bool {
-        self.0 & SEND_UD_FLAG != 0 && self.0 != SHUTDOWN_UD
+    const fn is_recv(self) -> bool {
+        self.0 & RECV_UD_FLAG != 0
     }
 
     const fn fd(self) -> usize {
-        (self.0 >> 32) as usize
+        ((self.0 >> 32) & 0x7fff_ffff) as usize
     }
 
     const fn conn_id(self) -> u32 {
         (self.0 & 0xffff_ffff) as u32
     }
+}
 
-    const fn send_conn_id(self) -> u32 {
-        ((self.0 >> 32) & 0x7fff_ffff) as u32
+// ── send ownership ────────────────────────────────────────────────────────────
+
+/// A serialized request. The bytes live behind the `Box`, so moving the
+/// owner (into a ticket, across threads) never moves what the kernel reads.
+struct SendBuf(Box<[u8]>);
+
+// SAFETY: a `Box<[u8]>`'s heap allocation keeps its address when the box
+// moves and stays allocated until `SendBuf` drops. `SendBuf` is its only
+// owner and hands out no reference to it.
+unsafe impl StableBuffer for SendBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
     }
 
-    const fn send_seq(self) -> u32 {
-        (self.0 & 0xffff_ffff) as u32
+    fn stable_len(&self) -> usize {
+        self.0.len()
     }
+}
+
+/// Caller → complete thread: a submitted send and whose request it carries.
+///
+/// The ticket owns the buffer while the kernel reads it. Only the receipt
+/// for this send's CQE can redeem it, so the buffer is freed exactly when
+/// the kernel is done; a ticket that is never redeemed leaks its buffer
+/// rather than freeing it under the kernel.
+struct SendTicket {
+    pending: Pending<SendBuf>,
+    conn_id: u32,
+    request_id: RequestId,
 }
 
 impl From<UserData> for u64 {
@@ -405,7 +428,6 @@ struct CallerConn<const MAX_REQ: usize> {
     /// Set by `handle_error`; cleared and acted on by the next `request()` call.
     needs_reconnect: bool,
     url: Vec<u8>,
-    send_buf: Box<[u8; MAX_REQ]>,
 }
 
 // ── pool ──────────────────────────────────────────────────────────────────────
@@ -416,8 +438,14 @@ pub struct Pool<
     const BUF_SIZE: u32 = 8192,
     const MAX_REQ: usize = 8192,
 > {
-    sub: Submitter,
+    sub: OwnedSubmitter,
     conns: HashMap<u32, CallerConn<MAX_REQ>>,
+    /// Carries each send's ticket to the complete thread, which holds it
+    /// until the send's receipt arrives.
+    ticket_tx: MpscProducer<SendTicket>,
+    /// Read by the kernel when a `recv_timeout` SQE is submitted, which may
+    /// be after that call returns if its own submit failed.
+    timeout_ts: Box<Timespec>,
     free_ids: BTreeSet<u32>,
     next_conn_id: u32,
     response_rx: SpmcConsumer<ConnResult>,
@@ -436,7 +464,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     for Pool<RING, BUFS, BUF_SIZE, MAX_REQ>
 {
     fn drop(&mut self) {
-        let _ = self.sub.push_nop(SHUTDOWN_UD);
+        let _ = self.sub.raw().push_nop(SHUTDOWN_UD);
         let _ = self.sub.submit();
         if let Some(h) = self.complete_thread.take() {
             let _ = h.join();
@@ -450,7 +478,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
     /// # Errors
     /// Returns an error if the `io_uring` instance or provided-buffer ring cannot be set up.
     pub fn new() -> Result<Self, Error> {
-        let mut ring = ququmatz::IoUring::builder(RING).build().map_err(|e| {
+        let mut ring = ququmatz::IoUring::new(RING).map_err(|e| {
             Error::Connection(ConnectionError::Other(format!("io_uring setup: {e}")))
         })?;
 
@@ -462,19 +490,26 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                 )))
             })?;
 
-        let (submitter, completer) = ring.split();
+        let (submitter, completer) = ring.split_owned().map_err(|(_, e)| {
+            Error::Connection(ConnectionError::Other(format!("io_uring split: {e}")))
+        })?;
 
         let (response_tx, response_rx) =
             SpmcRingBuffer::<ConnResult>::new(Capacity::exact(128)).split();
         let (rearm_tx, rearm_rx) = MpscRingBuffer::<RearmMsg>::new(Capacity::exact(32)).split();
+        let (ticket_tx, ticket_rx) =
+            MpscRingBuffer::<SendTicket>::new(Capacity::exact(RING as usize)).split();
 
+        let pbuf = BufferConsumer::new(pbuf);
         let complete_thread = std::thread::spawn(move || {
-            complete_loop(completer, pbuf, &response_tx, &rearm_tx);
+            complete_loop(completer, &pbuf, ticket_rx, &response_tx, &rearm_tx);
         });
 
         Ok(Self {
             sub: submitter,
             conns: HashMap::new(),
+            ticket_tx,
+            timeout_ts: Box::new(Timespec::from_millis(0)),
             free_ids: BTreeSet::new(),
             next_conn_id: 0,
             response_rx,
@@ -505,7 +540,6 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                 recv_armed: false,
                 needs_reconnect: false,
                 url: url.to_vec(),
-                send_buf: Box::new([0u8; MAX_REQ]),
             },
         );
 
@@ -598,37 +632,44 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             version: Version::Http11,
             headers: &headers,
         };
-        let len = req.serialize_to_buf(c.send_buf.as_mut()).map_err(|_| {
+        let too_large = || {
             Error::Connection(ConnectionError::Other(format!(
                 "request exceeds MAX_REQ ({MAX_REQ} bytes); increase the MAX_REQ const generic"
             )))
-        })?;
+        };
+        let len = req.serialized_len();
+        if len > MAX_REQ {
+            return Err(too_large());
+        }
+        let mut send_buf = vec![0u8; len].into_boxed_slice();
+        req.serialize_to_buf(&mut send_buf)
+            .map_err(|_| too_large())?;
 
         let seq = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = RequestId::from(seq);
 
         let raw_fd = RawFd::from_raw(c.fd);
-        let send = Sqe::send(raw_fd, &c.send_buf[..len], MsgFlags::default())
-            .user_data(UserData::send(conn.conn_id, seq).into());
-        self.sub.push(send).map_err(|e| {
-            Error::Connection(ConnectionError::Other(format!("SQ full (send): {e}")))
-        })?;
+        let (fd, recv_armed) = (c.fd, c.recv_armed);
+        self.push_send(raw_fd, SendBuf(send_buf), conn.conn_id, request_id)?;
 
-        if !c.recv_armed {
+        if !recv_armed {
             let recv = Sqe::recv_multishot(raw_fd, MsgFlags::default())
                 .buffer_select(PBUF_BGID)
-                .user_data(UserData::recv(c.fd, conn.conn_id).into());
-            self.sub.push(recv).map_err(|e| {
+                .user_data(UserData::recv(fd, conn.conn_id).into());
+            self.sub.raw().push(recv).map_err(|e| {
                 Error::Connection(ConnectionError::Other(format!("SQ full (recv): {e}")))
             })?;
-            c.recv_armed = true;
+            if let Some(c) = self.conns.get_mut(&conn.conn_id) {
+                c.recv_armed = true;
+            }
         }
 
         self.sub
             .submit()
             .map_err(|e| Error::Connection(ConnectionError::Other(format!("submit: {e}"))))?;
 
-        Ok(RequestId::from(seq))
+        Ok(request_id)
     }
 
     /// # Errors
@@ -716,11 +757,15 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             return Ok(Some(r));
         }
 
-        let ts = Timespec::from_millis(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
-        let tsqe = Sqe::timeout(&ts, 0, TimeoutFlags::default()).user_data(TIMEOUT_UD);
+        *self.timeout_ts =
+            Timespec::from_millis(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+        // SAFETY: `timeout_ts` is boxed and owned by the pool, so it outlives
+        // every submission of this SQE.
+        let tsqe = unsafe { Sqe::timeout(&self.timeout_ts, 0, TimeoutFlags::default()) }
+            .user_data(TIMEOUT_UD);
         // If the SQ is full we can't submit the timeout — fall back to a
         // non-blocking poll so we don't block forever.
-        if self.sub.push(tsqe).is_err() {
+        if self.sub.raw().push(tsqe).is_err() {
             return Ok(self.poll(id));
         }
         let _ = self.sub.submit();
@@ -741,9 +786,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                     let r = self.handle_error(request_id, conn, errno);
                     let rid = result_id(&r);
                     if rid == id {
-                        let cancel = Sqe::timeout_remove(TIMEOUT_UD);
-                        let _ = self.sub.push(cancel);
-                        let _ = self.sub.submit();
+                        self.cancel_timeout();
                         return Ok(Some(r));
                     }
                     self.stash.insert(rid, r);
@@ -755,17 +798,13 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
                 } => {
                     let result = self.handle_protocol_error(request_id, conn, error);
                     if request_id == id {
-                        let cancel = Sqe::timeout_remove(TIMEOUT_UD);
-                        let _ = self.sub.push(cancel);
-                        let _ = self.sub.submit();
+                        self.cancel_timeout();
                         return Ok(Some(result));
                     }
                     self.stash.insert(request_id, result);
                 }
                 ConnResult::Response(ref resp) if resp.request_id == id => {
-                    let cancel = Sqe::timeout_remove(TIMEOUT_UD);
-                    let _ = self.sub.push(cancel);
-                    let _ = self.sub.submit();
+                    self.cancel_timeout();
                     return Ok(Some(r));
                 }
                 ConnResult::Response(resp) => {
@@ -792,6 +831,44 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             conn,
             error,
         }
+    }
+
+    /// Queue a send whose buffer the complete thread releases once the
+    /// kernel reports the send finished.
+    fn push_send(
+        &mut self,
+        fd: RawFd,
+        buf: SendBuf,
+        conn_id: u32,
+        request_id: RequestId,
+    ) -> Result<(), Error> {
+        // A blocking socket makes the kernel's write a send in practice.
+        let pending = self
+            .sub
+            .push(Prepared::write(fd, buf, 0))
+            .map_err(|(_, e)| {
+                Error::Connection(ConnectionError::Other(format!("SQ full (send): {e}")))
+            })?;
+        // Queued before `submit`, so the ticket reaches the complete thread
+        // no later than it could need it. The ring holds RING tickets and
+        // the SQ at most RING sends, so this only blocks while the complete
+        // thread catches up.
+        let ticket = SendTicket {
+            pending,
+            conn_id,
+            request_id,
+        };
+        self.ticket_tx.push_block(ticket).map_err(|_| {
+            Error::Connection(ConnectionError::Other(
+                "complete thread exited unexpectedly".into(),
+            ))
+        })
+    }
+
+    fn cancel_timeout(&mut self) {
+        let cancel = Sqe::timeout_remove(TIMEOUT_UD).user_data(TIMEOUT_REMOVE_UD);
+        let _ = self.sub.raw().push(cancel);
+        let _ = self.sub.submit();
     }
 
     fn handle_error(&mut self, request_id: RequestId, conn: ConnHandle, errno: i32) -> ConnResult {
@@ -840,7 +917,7 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
             let recv = Sqe::recv_multishot(raw_fd, MsgFlags::default())
                 .buffer_select(PBUF_BGID)
                 .user_data(UserData::recv(msg.fd, msg.conn_id).into());
-            if self.sub.push(recv).is_err() {
+            if self.sub.raw().push(recv).is_err() {
                 break; // SQ full — leave msg at the front, retry next time
             }
             let msg = self.pending_rearms.pop_front().unwrap();
@@ -857,55 +934,61 @@ impl<const RING: u32, const BUFS: u32, const BUF_SIZE: u32, const MAX_REQ: usize
 // ── complete thread ────────────────────────────────────────────────────────────
 
 fn complete_loop(
-    mut cmp: Completer,
-    mut pbuf: ProvidedBufferRing,
+    mut cmp: OwnedCompleter,
+    pbuf: &BufferConsumer,
+    mut ticket_rx: MpscConsumer<SendTicket>,
     response_tx: &SpmcProducer<ConnResult>,
     rearm_tx: &MpscProducer<RearmMsg>,
 ) {
     let mut conns: HashMap<u32, ConnData> = HashMap::new();
+    // Tickets for sends the kernel may still be reading, keyed by the
+    // `user_data` their CQE will carry.
+    let mut tickets: HashMap<u64, SendTicket> = HashMap::new();
 
     loop {
         let _ = cmp.wait(1);
 
-        while let Some(cqe) = cmp.complete() {
-            if cqe.user_data == SHUTDOWN_UD {
+        while let Some(event) = cmp.reap_event() {
+            let user_data = event.id().raw();
+            let result = event.raw_result();
+            let flags = event.flags();
+
+            if user_data == SHUTDOWN_UD {
+                cmp.sync();
                 return;
             }
 
-            if cqe.user_data == TIMEOUT_UD {
+            if user_data == TIMEOUT_UD {
                 // Timeout fired before a response arrived; wake the caller.
                 let _ = response_tx.push_block(ConnResult::Timeout);
                 continue;
             }
 
-            // Send CQE: carries the request_id; enqueue it for the connection.
-            if UserData::from(cqe.user_data).is_send() {
-                if cqe.result >= 0 {
-                    let ud = UserData::from(cqe.user_data);
-                    let conn_id = ud.send_conn_id();
-                    let seq = ud.send_seq();
-                    let conn = conns
-                        .entry(conn_id)
-                        .or_insert_with(|| ConnData::new(conn_id));
-                    conn.pending_ids.push_back(RequestId::from(seq));
-                    // Drain any bytes that arrived before this send CQE.
-                    // fd is not available in the send CQE branch (different ud encoding);
-                    // pass 0 — rearm is only triggered on !more which can't happen here.
-                    if !conn.recv_buf.is_empty() {
-                        let buf = std::mem::take(&mut conn.recv_buf);
-                        drain_recv_buf(conn, &buf, response_tx);
-                    }
-                }
-                // Send errors are ignored — the recv path will surface them.
+            if user_data == TIMEOUT_REMOVE_UD {
                 continue;
             }
 
-            let ud = UserData::from(cqe.user_data);
+            // Send CQE: redeem its ticket, freeing the buffer the kernel no
+            // longer reads, and enqueue its request id for the connection.
+            if !UserData(user_data).is_recv() {
+                let Event::Complete(receipt) = event else {
+                    continue;
+                };
+                while let Some(t) = ticket_rx.pop() {
+                    tickets.insert(t.pending.id().raw(), t);
+                }
+                if let Some(ticket) = tickets.remove(&user_data) {
+                    on_send_complete(ticket, receipt, &mut conns, response_tx);
+                }
+                continue;
+            }
+
+            let ud = UserData(user_data);
             let conn_id = ud.conn_id();
             let fd = ud.fd();
 
             // Negative result → I/O error; zero with no buffer → EOF (UntilClose).
-            if cqe.result < 0 {
+            if result < 0 {
                 let conn = conns
                     .entry(conn_id)
                     .or_insert_with(|| ConnData::new(conn_id));
@@ -915,16 +998,16 @@ fn complete_loop(
                 let _ = response_tx.push_block(ConnResult::Error {
                     request_id,
                     conn: ConnHandle { conn_id, fd },
-                    errno: -cqe.result,
+                    errno: -result,
                 });
                 continue;
             }
 
             #[allow(clippy::cast_sign_loss)]
-            let n = cqe.result as usize;
+            let n = result as usize;
 
             // result == 0 with no buffer_id means EOF on the socket.
-            if n == 0 && cqe.buffer_id().is_none() {
+            if n == 0 && flags.buffer_id().is_none() {
                 let conn = conns
                     .entry(conn_id)
                     .or_insert_with(|| ConnData::new(conn_id));
@@ -932,9 +1015,9 @@ fn complete_loop(
                 continue;
             }
 
-            let (bid, data) = match cqe.buffer_id() {
+            let (bid, data) = match flags.buffer_id() {
                 #[allow(clippy::cast_possible_truncation)]
-                Some(bid) => match pbuf.buffer_pinned(bid, n as u32) {
+                Some(bid) => match pbuf.buffer(bid, n as u32) {
                     Some(slice) => (bid, slice),
                     None => continue,
                 },
@@ -946,7 +1029,7 @@ fn complete_loop(
                 .or_insert_with(|| ConnData::new(conn_id));
             conn.fd = fd;
 
-            let more = cqe.flags.contains(ququmatz::types::CqeFlags::MORE);
+            let more = flags.contains(CqeFlags::MORE);
 
             if conn.pending_ids.is_empty() {
                 // Send CQE hasn't arrived yet — buffer raw bytes until it does.
@@ -965,6 +1048,40 @@ fn complete_loop(
                 let _ = rearm_tx.push_block(RearmMsg { conn_id, fd });
             }
         }
+        cmp.sync();
+    }
+}
+
+/// A send finished: release its buffer, and on success queue its request id
+/// so the response bytes that follow have a request to belong to.
+fn on_send_complete(
+    ticket: SendTicket,
+    receipt: Receipt,
+    conns: &mut HashMap<u32, ConnData>,
+    response_tx: &SpmcProducer<ConnResult>,
+) {
+    let SendTicket {
+        pending,
+        conn_id,
+        request_id,
+    } = ticket;
+    // The receipt was reaped for this ticket's own id on this ring, so it
+    // always matches; a mismatch leaves the buffer leaked, never freed.
+    let Ok(done) = pending.redeem(receipt) else {
+        return;
+    };
+    // Send errors are ignored — the recv path will surface them.
+    if done.raw_result() < 0 {
+        return;
+    }
+    let conn = conns
+        .entry(conn_id)
+        .or_insert_with(|| ConnData::new(conn_id));
+    conn.pending_ids.push_back(request_id);
+    // Drain any bytes that arrived before this send CQE.
+    if !conn.recv_buf.is_empty() {
+        let buf = std::mem::take(&mut conn.recv_buf);
+        drain_recv_buf(conn, &buf, response_tx);
     }
 }
 

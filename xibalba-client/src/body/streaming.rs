@@ -110,7 +110,7 @@ impl<'a, S: Read> StreamingBody<'a, S> {
             return Ok(true);
         }
         self.raw.resize(HEAD_BUF_SIZE, 0);
-        let n = self.budget.read(&mut self.stream, &mut self.raw)?;
+        let n = self.budget.read(&mut *self.stream, &mut self.raw)?;
         self.raw.truncate(n);
         self.raw_pos = 0;
         Ok(n > 0)

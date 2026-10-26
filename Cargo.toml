@@ -32,14 +32,11 @@ default-members = [
 resolver = "3"
 
 # The supported floor, inherited by every member so the number exists once.
-# Measured, not guessed: `xibalba-client` cannot go below this, because
-# `Duration::from_mins` stabilised in 1.91. `xibalba-proto` compiles on 1.88
-# (its own floor is let-chains in `request.rs`) and is held here anyway, so
-# the workspace states one number rather than a per-crate matrix. Lowering
-# proto later is compatible; raising either is a breaking change for
-# consumers, so `msrv.rs` fails when a manifest drifts from this.
+# Policy is to track the latest stable release, so the resolver can pick the
+# newest dependency versions. `msrv.rs` fails when a manifest or CI drifts
+# from this.
 [workspace.package]
-rust-version = "1.91"
+rust-version = "1.99"
 edition = "2024"
 
 [workspace.dependencies]
@@ -48,7 +45,7 @@ xibalba-client = { path = "xibalba-client", version = "0.5.0" }
 xibalba-iouring = { path = "xibalba-iouring", version = "0.1.0" }
 xibalba-fuzz = { path = "xibalba-fuzz", version = "0.1.0" }
 quetzalcoatl = "0.15.0"
-ququmatz = "0.15.1"
+ququmatz = "0.17.0"
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

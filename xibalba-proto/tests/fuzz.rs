@@ -38,7 +38,7 @@ impl Prng {
         (self.next_u64() & 0xffff_ffff) as usize % modulus
     }
 
-    fn byte_from(&mut self, alphabet: &[u8]) -> u8 {
+    const fn byte_from(&mut self, alphabet: &[u8]) -> u8 {
         alphabet[self.index(alphabet.len())]
     }
 

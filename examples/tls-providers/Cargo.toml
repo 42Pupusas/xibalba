@@ -4,7 +4,7 @@ version = "0.1.0"
 # Excluded from the workspace (see the root manifest), so these cannot be
 # inherited and are restated to match the floor they were held to before.
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.99"
 publish = false
 description = "Benchmarks + adversarial tests comparing rustls crypto providers (ring, aws-lc-rs, rustcrypto)"
 autobins = false
